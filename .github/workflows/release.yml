@@ -44,11 +44,37 @@ jobs:
           RELEASE_TAG: ${{ steps.release-tag.outputs.tag }}
         shell: bash
         run: |
+          cat > release_notes.md <<EOF
+          Automated build for ${RELEASE_TAG}.
+
+          ## Assets
+
+          - vlan-server-linux-x86_64
+          - vlan-server-linux-arm64
+          - vlan-cli-linux-x86_64
+          - vlan-cli-linux-arm64
+          - vlan-cli-windows-x86_64.exe
+          - LICENSE.txt
+          - NOTICE.txt
+
+          ## Qt GUI Client
+
+          The Qt GUI client is not built by this workflow. To build it locally, use Qt 5.9.9 Open Source from the official Qt archive:
+
+          - Qt 5.9.9 Open Source archive: https://download.qt.io/archive/qt/5.9/5.9.9/
+          - Windows installer: https://download.qt.io/archive/qt/5.9/5.9.9/qt-opensource-windows-x86-5.9.9.exe
+          EOF
+
           if ! gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" > /dev/null 2>&1; then
             gh release create "$RELEASE_TAG" \
               --repo "$GITHUB_REPOSITORY" \
               --title "$RELEASE_TAG" \
-              --notes "Automated build for $RELEASE_TAG."
+              --notes-file release_notes.md
+          else
+            gh release edit "$RELEASE_TAG" \
+              --repo "$GITHUB_REPOSITORY" \
+              --title "$RELEASE_TAG" \
+              --notes-file release_notes.md
           fi
 
           cp LICENSE LICENSE.txt
