@@ -24,6 +24,7 @@ jobs:
 
       - name: Upload server artifact
         uses: actions/upload-artifact@v4
+        continue-on-error: true
         with:
           name: vlan-server-linux
           path: server/vlan-server
@@ -43,6 +44,7 @@ jobs:
 
       - name: Upload CLI Linux artifact
         uses: actions/upload-artifact@v4
+        continue-on-error: true
         with:
           name: vlan-cli-linux
           path: client-cli/linux/vlan-cli
@@ -70,6 +72,7 @@ jobs:
 
       - name: Upload CLI Windows artifact
         uses: actions/upload-artifact@v4
+        continue-on-error: true
         with:
           name: vlan-cli-windows
           path: client-cli/windows/vlan-cli.exe

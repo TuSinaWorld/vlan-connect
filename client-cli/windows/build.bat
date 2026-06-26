@@ -11,7 +11,7 @@ set MONO=..\..\3rdparty\monocypher
 set CM256=..\..\3rdparty\cm256cc
 
 set INCLUDES=/I%SRC% /I%COMMON% /I%KCP% /I%MONO% /I%CM256%
-set CFLAGS=/nologo /O2 /EHsc /std:c++14 /W3 /DWIN32_LEAN_AND_MEAN /DUSE_SSSE3 %INCLUDES%
+set CFLAGS=/nologo /O2 /EHsc /std:c++14 /W3 /DWIN32_LEAN_AND_MEAN /DNOMINMAX /Dcm256cc_STATIC /D_CRT_SECURE_NO_WARNINGS /D_WINSOCK_DEPRECATED_NO_WARNINGS /DUSE_SSSE3 %INCLUDES%
 set CFLAGS_C=/nologo /O2 /W3 %INCLUDES%
 
 echo Compiling C sources...
