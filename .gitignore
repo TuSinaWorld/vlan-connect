@@ -1,0 +1,38 @@
+# Local backups created before automated edits
+/back/
+
+# Editor and local planning metadata
+/.cursor/
+
+# Visual Studio / Qt generated state
+/client/.qmake.stash
+/client/.vs/
+/client/*.VC.db
+/client/*.VC.db.temp
+/client/*.VC.opendb.temp
+/client/GeneratedFiles/
+
+# Build outputs
+/client/debug/
+/client/release/
+/client-cli/linux/vlan-cli
+/client-cli/windows/vlan-cli.exe
+/server/vlan-server
+
+# Object files and build logs
+*.obj
+*.o
+*.pdb
+*.ilk
+*.tlog
+*.lastbuildstate
+*.log
+*.idb
+*.ipch
+*.suo
+*.user
+
+# Unrelated or redistributable runtime binaries should not be committed
+/notepad++.exe
+/Unlock.exe
+/3rdparty/wintun/*.dll

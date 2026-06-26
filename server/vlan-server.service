@@ -1,0 +1,20 @@
+﻿[Unit]
+Description=VLan Server - Virtual LAN P2P Network Service
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/vlan-server -p 11510 -l /var/log/vlan-server.log -L 10
+Restart=on-failure
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+LimitNOFILE=65535
+KillSignal=SIGTERM
+TimeoutStopSec=10
+
+[Install]
+WantedBy=multi-user.target
+
+#example.invalid:11510

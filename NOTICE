@@ -1,0 +1,97 @@
+VLan Third-Party Notices
+========================
+
+This file summarizes third-party components included in, referenced by, or
+required to build and run VLan. The GPLv3 license text for VLan is provided in
+the root LICENSE file. Third-party components remain under their own licenses.
+
+Project
+-------
+
+VLan
+  License: GNU General Public License version 3.0 only (GPL-3.0-only)
+  License text: LICENSE
+
+Third-party components included in source form
+----------------------------------------------
+
+KCP
+  Path: 3rdparty/kcp
+  Purpose: Reliable UDP transport protocol implementation.
+  License: MIT License.
+  Copyright: Copyright (c) 2017 Lin Wei (skywind3000 at gmail.com).
+  Notes: The KCP source in this repository is distributed as part of the GPLv3
+  combined work. Its original MIT license notice must be preserved.
+
+Monocypher
+  Path: 3rdparty/monocypher
+  Purpose: Cryptographic primitives used for key derivation, authentication,
+  and authenticated encryption.
+  License: BSD-2-Clause OR CC0-1.0.
+  Copyright: Copyright (c) 2017-2020 Loup Vaillant.
+  Notes: The complete license notices and disclaimers are preserved in
+  monocypher.c and monocypher.h.
+
+cm256cc
+  Path: 3rdparty/cm256cc
+  Purpose: Forward error correction (FEC) for selected UDP transport modes.
+  License: GPLv3 for the cm256cc export header included in this repository;
+  individual source files also contain BSD-style notices from their authors.
+  Copyright:
+    Copyright (C) 2018 Edouard Griffiths, F4EXB.
+    Copyright (c) 2016 Edouard M. Griffiths.
+    Copyright (c) 2015 Christopher A. Taylor.
+  Notes: Because GPLv3-licensed cm256cc material is included, the combined
+  VLan project is distributed under GPLv3.
+
+Wintun header
+  Path: 3rdparty/wintun/wintun.h
+  Purpose: Windows TUN adapter API declarations used by the Windows client.
+  License: GPL-2.0 OR MIT; VLan uses the MIT option for this header.
+  Copyright: Copyright (C) 2018-2021 WireGuard LLC.
+  Notes: The prebuilt wintun.dll binary is not included in this source tree.
+  If a binary release bundles wintun.dll, include the official Wintun binary
+  license notice supplied in the Wintun ZIP package by WireGuard LLC.
+
+External build/runtime dependencies
+-----------------------------------
+
+Qt 5.9.9
+  Purpose: GUI, widgets, event loop, and network framework for the Windows GUI
+  client.
+  License: Qt open-source editions are available under GPL/LGPL terms depending
+  on the module and distribution, or under a commercial Qt license.
+  Notes: Qt is not vendored in this repository. Binary distributors must comply
+  with the Qt license they use, including any notice, license text, source,
+  relinking, or replacement requirements.
+
+MIT License text for MIT-licensed components
+--------------------------------------------
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
+Distribution notes
+------------------
+
+Source distributions should include LICENSE, NOTICE, and all third-party source
+license headers already present in the source tree.
+
+Binary distributions should include LICENSE, NOTICE, and license files/notices
+for bundled third-party binaries or dynamic libraries, including Qt and Wintun
+where applicable.
