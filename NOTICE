@@ -61,9 +61,17 @@ Qt 5.9.9
   client.
   License: Qt open-source editions are available under GPL/LGPL terms depending
   on the module and distribution, or under a commercial Qt license.
-  Notes: Qt is not vendored in this repository. Binary distributors must comply
-  with the Qt license they use, including any notice, license text, source,
-  relinking, or replacement requirements.
+  Source: Official Qt 5.9.9 archive:
+    https://download.qt.io/archive/qt/5.9/5.9.9/
+  Source packages:
+    https://download.qt.io/archive/qt/5.9/5.9.9/single/qt-everywhere-opensource-src-5.9.9.zip
+    https://download.qt.io/archive/qt/5.9/5.9.9/single/qt-everywhere-opensource-src-5.9.9.tar.xz
+  Installer: Qt 5.9.9 Open Source Windows installer:
+    https://download.qt.io/archive/qt/5.9/5.9.9/qt-opensource-windows-x86-5.9.9.exe
+  Notes: Qt is not vendored in this repository. If a Windows GUI client binary
+  is distributed with Qt runtime libraries, the binary package should preserve
+  the applicable Qt license texts and notices, keep this NOTICE file available
+  to recipients, and provide the Qt 5.9.9 source location above.
 
 MIT License text for MIT-licensed components
 --------------------------------------------

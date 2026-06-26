@@ -57,11 +57,17 @@ jobs:
           - LICENSE.txt
           - NOTICE.txt
 
-          ## Qt GUI Client
+          ## Qt GUI Client and Qt Source
 
-          The Qt GUI client is not built by this workflow. To build it locally, use Qt 5.9.9 Open Source from the official Qt archive:
+          Qt GUI client binaries may be uploaded manually by the project author.
+          If a Qt GUI client binary is distributed, keep the project LICENSE.txt
+          and NOTICE.txt with the package and preserve the applicable Qt license
+          notices. The Qt 5.9.9 Open Source package and corresponding source code
+          are available from the official Qt archive:
 
           - Qt 5.9.9 Open Source archive: https://download.qt.io/archive/qt/5.9/5.9.9/
+          - Qt 5.9.9 source code (zip): https://download.qt.io/archive/qt/5.9/5.9.9/single/qt-everywhere-opensource-src-5.9.9.zip
+          - Qt 5.9.9 source code (tar.xz): https://download.qt.io/archive/qt/5.9/5.9.9/single/qt-everywhere-opensource-src-5.9.9.tar.xz
           - Windows installer: https://download.qt.io/archive/qt/5.9/5.9.9/qt-opensource-windows-x86-5.9.9.exe
           EOF
 
