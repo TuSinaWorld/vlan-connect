@@ -58,9 +58,17 @@ jobs:
             --clobber
 
   server-linux:
-    name: Server Linux
-    runs-on: ubuntu-latest
+    name: Server Linux ${{ matrix.arch }}
+    runs-on: ${{ matrix.runner }}
     needs: create-release
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86_64
+            runner: ubuntu-24.04
+          - arch: arm64
+            runner: ubuntu-24.04-arm
 
     steps:
       - name: Checkout
@@ -76,17 +84,26 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           RELEASE_TAG: ${{ needs.create-release.outputs.tag }}
+          ARCH: ${{ matrix.arch }}
         shell: bash
         run: |
-          cp server/vlan-server server/vlan-server-linux-x86_64
-          gh release upload "$RELEASE_TAG" server/vlan-server-linux-x86_64 \
+          cp server/vlan-server "server/vlan-server-linux-${ARCH}"
+          gh release upload "$RELEASE_TAG" "server/vlan-server-linux-${ARCH}" \
             --repo "$GITHUB_REPOSITORY" \
             --clobber
 
   cli-linux:
-    name: CLI Linux
-    runs-on: ubuntu-latest
+    name: CLI Linux ${{ matrix.arch }}
+    runs-on: ${{ matrix.runner }}
     needs: create-release
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86_64
+            runner: ubuntu-24.04
+          - arch: arm64
+            runner: ubuntu-24.04-arm
 
     steps:
       - name: Checkout
@@ -102,10 +119,11 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           RELEASE_TAG: ${{ needs.create-release.outputs.tag }}
+          ARCH: ${{ matrix.arch }}
         shell: bash
         run: |
-          cp client-cli/linux/vlan-cli client-cli/linux/vlan-cli-linux-x86_64
-          gh release upload "$RELEASE_TAG" client-cli/linux/vlan-cli-linux-x86_64 \
+          cp client-cli/linux/vlan-cli "client-cli/linux/vlan-cli-linux-${ARCH}"
+          gh release upload "$RELEASE_TAG" "client-cli/linux/vlan-cli-linux-${ARCH}" \
             --repo "$GITHUB_REPOSITORY" \
             --clobber
 
