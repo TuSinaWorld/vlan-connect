@@ -1,0 +1,76 @@
+name: Build
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  server-linux:
+    name: Server Linux
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Build server
+        run: make
+        working-directory: server
+
+      - name: Upload server artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: vlan-server-linux
+          path: server/vlan-server
+          if-no-files-found: error
+
+  cli-linux:
+    name: CLI Linux
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Build CLI
+        run: make
+        working-directory: client-cli/linux
+
+      - name: Upload CLI Linux artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: vlan-cli-linux
+          path: client-cli/linux/vlan-cli
+          if-no-files-found: error
+
+  cli-windows:
+    name: CLI Windows
+    runs-on: windows-2022
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Build CLI
+        shell: cmd
+        working-directory: client-cli/windows
+        run: |
+          for /f "usebackq tokens=*" %%i in (`vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath`) do set VSINSTALL=%%i
+          if "%VSINSTALL%"=="" (
+            echo Visual Studio C++ tools not found.
+            exit /b 1
+          )
+          call "%VSINSTALL%\VC\Auxiliary\Build\vcvars64.bat"
+          call build.bat
+
+      - name: Upload CLI Windows artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: vlan-cli-windows
+          path: client-cli/windows/vlan-cli.exe
+          if-no-files-found: error
