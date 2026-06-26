@@ -47,7 +47,7 @@ jobs:
           cat > release_notes.md <<EOF
           Automated build for ${RELEASE_TAG}.
 
-          Assets
+          ## Assets
 
           vlan-server-linux-x86_64
           vlan-server-linux-arm64
@@ -58,7 +58,7 @@ jobs:
           LICENSE.txt
           NOTICE.txt
 
-          Qt GUI Client and Qt Source
+          ## Qt GUI Client and Qt Source
 
           This software uses a Qt project, and according to the license requirements,
           the Qt source code address should be provided.The Qt 5.9.9 Open Source
