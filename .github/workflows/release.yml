@@ -67,10 +67,8 @@ jobs:
         include:
           - arch: x86_64
             runner: ubuntu-24.04
-            simd_flags: default
           - arch: arm64
             runner: ubuntu-24.04-arm
-            simd_flags: none
 
     steps:
       - name: Checkout
@@ -104,10 +102,8 @@ jobs:
         include:
           - arch: x86_64
             runner: ubuntu-24.04
-            simd_flags: default
           - arch: arm64
             runner: ubuntu-24.04-arm
-            simd_flags: none
 
     steps:
       - name: Checkout
@@ -116,12 +112,7 @@ jobs:
           ref: ${{ needs.create-release.outputs.tag }}
 
       - name: Build CLI
-        run: |
-          if [ "${{ matrix.simd_flags }}" = "none" ]; then
-            make SIMD_FLAGS=
-          else
-            make
-          fi
+        run: make
         working-directory: client-cli/linux
 
       - name: Upload CLI Linux binary
