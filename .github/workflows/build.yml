@@ -23,8 +23,8 @@ jobs:
         working-directory: server
 
       - name: Upload server artifact
+        if: ${{ vars.UPLOAD_BUILD_ARTIFACTS == 'true' }}
         uses: actions/upload-artifact@v4
-        continue-on-error: true
         with:
           name: vlan-server-linux
           path: server/vlan-server
@@ -43,8 +43,8 @@ jobs:
         working-directory: client-cli/linux
 
       - name: Upload CLI Linux artifact
+        if: ${{ vars.UPLOAD_BUILD_ARTIFACTS == 'true' }}
         uses: actions/upload-artifact@v4
-        continue-on-error: true
         with:
           name: vlan-cli-linux
           path: client-cli/linux/vlan-cli
@@ -71,8 +71,8 @@ jobs:
           call build.bat
 
       - name: Upload CLI Windows artifact
+        if: ${{ vars.UPLOAD_BUILD_ARTIFACTS == 'true' }}
         uses: actions/upload-artifact@v4
-        continue-on-error: true
         with:
           name: vlan-cli-windows
           path: client-cli/windows/vlan-cli.exe
