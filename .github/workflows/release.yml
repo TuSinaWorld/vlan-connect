@@ -14,6 +14,10 @@ on:
 permissions:
   contents: write
 
+env:
+  WINTUN_URL: https://www.wintun.net/builds/wintun-0.14.1.zip
+  WINTUN_AMD64_SHA256: E5DA8447DC2C320EDC0FC52FA01885C103DE8C118481F683643CACC3220DAFCE
+
 jobs:
   create-release:
     name: Create Release
@@ -44,16 +48,19 @@ jobs:
           RELEASE_TAG: ${{ steps.release-tag.outputs.tag }}
         shell: bash
         run: |
+          set -euo pipefail
+
           cat > release_notes.md <<EOF
           Automated build for ${RELEASE_TAG}.
 
           ## Assets
 
-          vlan-server-linux-x86_64
-          vlan-server-linux-arm64
-          vlan-cli-linux-x86_64
-          vlan-cli-linux-arm64
-          vlan-cli-windows-x86_64.exe
+          vlan-connect-source-${RELEASE_TAG}.tar.gz
+          vlan-server-linux-x86_64.tar.gz
+          vlan-server-linux-arm64.tar.gz
+          vlan-cli-linux-x86_64.tar.gz
+          vlan-cli-linux-arm64.tar.gz
+          vlan-cli-windows-x86_64.zip
           vlan.with.Qt-windows-x64.zip
           LICENSE.txt
           NOTICE.txt
@@ -82,9 +89,26 @@ jobs:
               --notes-file release_notes.md
           fi
 
+      - name: Upload release license and source assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ steps.release-tag.outputs.tag }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
           cp LICENSE LICENSE.txt
           cp NOTICE NOTICE.txt
-          gh release upload "$RELEASE_TAG" LICENSE.txt NOTICE.txt \
+          git archive \
+            --format=tar.gz \
+            --prefix="vlan-connect-${RELEASE_TAG}/" \
+            -o "vlan-connect-source-${RELEASE_TAG}.tar.gz" \
+            HEAD
+
+          gh release upload "$RELEASE_TAG" \
+            LICENSE.txt \
+            NOTICE.txt \
+            "vlan-connect-source-${RELEASE_TAG}.tar.gz" \
             --repo "$GITHUB_REPOSITORY" \
             --clobber
 
@@ -111,15 +135,62 @@ jobs:
         run: make
         working-directory: server
 
-      - name: Upload server binary
+      - name: Package and upload server
         env:
           GH_TOKEN: ${{ github.token }}
           RELEASE_TAG: ${{ needs.create-release.outputs.tag }}
           ARCH: ${{ matrix.arch }}
         shell: bash
         run: |
-          cp server/vlan-server "server/vlan-server-linux-${ARCH}"
-          gh release upload "$RELEASE_TAG" "server/vlan-server-linux-${ARCH}" \
+          set -euo pipefail
+
+          package="vlan-server-linux-${ARCH}"
+          stage="dist/${package}"
+          rm -rf "$stage" "${package}.tar.gz"
+          mkdir -p "$stage/licenses/kcp" "$stage/licenses/monocypher"
+
+          cp server/vlan-server "$stage/vlan-server"
+          cp LICENSE "$stage/LICENSE.txt"
+          cp NOTICE "$stage/NOTICE.txt"
+          cp 3rdparty/kcp/README.md "$stage/licenses/kcp/README.md"
+          cp 3rdparty/monocypher/monocypher.h "$stage/licenses/monocypher/monocypher.h"
+
+          cat > "$stage/SOURCE.txt" <<EOF
+          VLan server binary release
+
+          Release tag: ${RELEASE_TAG}
+          Repository: https://github.com/${GITHUB_REPOSITORY}
+          Source tag: https://github.com/${GITHUB_REPOSITORY}/tree/${RELEASE_TAG}
+          Corresponding source archive asset: vlan-connect-source-${RELEASE_TAG}.tar.gz
+
+          This binary package was built from the source identified above.
+          EOF
+
+          cat > "$stage/THIRD-PARTY-LICENSES.txt" <<EOF
+          VLan server third-party license notices
+
+          This package contains the VLan server binary and license notices for
+          bundled third-party source components.
+
+          VLan
+            License: GPL-3.0-only
+            License text: LICENSE.txt
+
+          KCP
+            License: MIT
+            Notice file: licenses/kcp/README.md
+            MIT license text: NOTICE.txt
+
+          Monocypher
+            License: BSD-2-Clause OR CC0-1.0
+            License notice: licenses/monocypher/monocypher.h
+
+          Complete corresponding source is provided by the release asset:
+          vlan-connect-source-${RELEASE_TAG}.tar.gz
+          EOF
+
+          tar -C dist -czf "${package}.tar.gz" "$package"
+          gh release upload "$RELEASE_TAG" "${package}.tar.gz" \
             --repo "$GITHUB_REPOSITORY" \
             --clobber
 
@@ -146,15 +217,67 @@ jobs:
         run: make
         working-directory: client-cli/linux
 
-      - name: Upload CLI Linux binary
+      - name: Package and upload CLI Linux
         env:
           GH_TOKEN: ${{ github.token }}
           RELEASE_TAG: ${{ needs.create-release.outputs.tag }}
           ARCH: ${{ matrix.arch }}
         shell: bash
         run: |
-          cp client-cli/linux/vlan-cli "client-cli/linux/vlan-cli-linux-${ARCH}"
-          gh release upload "$RELEASE_TAG" "client-cli/linux/vlan-cli-linux-${ARCH}" \
+          set -euo pipefail
+
+          package="vlan-cli-linux-${ARCH}"
+          stage="dist/${package}"
+          rm -rf "$stage" "${package}.tar.gz"
+          mkdir -p "$stage/licenses/kcp" "$stage/licenses/monocypher" "$stage/licenses/cm256cc"
+
+          cp client-cli/linux/vlan-cli "$stage/vlan-cli"
+          cp LICENSE "$stage/LICENSE.txt"
+          cp NOTICE "$stage/NOTICE.txt"
+          cp 3rdparty/kcp/README.md "$stage/licenses/kcp/README.md"
+          cp 3rdparty/monocypher/monocypher.h "$stage/licenses/monocypher/monocypher.h"
+          cp 3rdparty/cm256cc/* "$stage/licenses/cm256cc/"
+
+          cat > "$stage/SOURCE.txt" <<EOF
+          VLan CLI Linux binary release
+
+          Release tag: ${RELEASE_TAG}
+          Repository: https://github.com/${GITHUB_REPOSITORY}
+          Source tag: https://github.com/${GITHUB_REPOSITORY}/tree/${RELEASE_TAG}
+          Corresponding source archive asset: vlan-connect-source-${RELEASE_TAG}.tar.gz
+
+          This binary package was built from the source identified above.
+          EOF
+
+          cat > "$stage/THIRD-PARTY-LICENSES.txt" <<EOF
+          VLan CLI Linux third-party license notices
+
+          This package contains the VLan CLI binary and license notices for
+          bundled third-party source components.
+
+          VLan
+            License: GPL-3.0-only
+            License text: LICENSE.txt
+
+          KCP
+            License: MIT
+            Notice file: licenses/kcp/README.md
+            MIT license text: NOTICE.txt
+
+          Monocypher
+            License: BSD-2-Clause OR CC0-1.0
+            License notice: licenses/monocypher/monocypher.h
+
+          cm256cc
+            License: GPLv3 material with BSD-style notices in individual files
+            License notices: licenses/cm256cc/
+
+          Complete corresponding source is provided by the release asset:
+          vlan-connect-source-${RELEASE_TAG}.tar.gz
+          EOF
+
+          tar -C dist -czf "${package}.tar.gz" "$package"
+          gh release upload "$RELEASE_TAG" "${package}.tar.gz" \
             --repo "$GITHUB_REPOSITORY" \
             --clobber
 
@@ -181,12 +304,103 @@ jobs:
           call "%VSINSTALL%\VC\Auxiliary\Build\vcvars64.bat"
           call build.bat
 
-      - name: Upload CLI Windows binary
+      - name: Package and upload CLI Windows
         env:
           GH_TOKEN: ${{ github.token }}
           RELEASE_TAG: ${{ needs.create-release.outputs.tag }}
-        shell: cmd
-        working-directory: client-cli/windows
+        shell: pwsh
         run: |
-          copy vlan-cli.exe vlan-cli-windows-x86_64.exe
-          gh release upload "%RELEASE_TAG%" "vlan-cli-windows-x86_64.exe" --repo "%GITHUB_REPOSITORY%" --clobber
+          $ErrorActionPreference = 'Stop'
+
+          $package = 'vlan-cli-windows-x86_64'
+          $stage = Join-Path 'dist' $package
+          $zipPath = "${package}.zip"
+          $wintunWork = Join-Path $env:RUNNER_TEMP 'wintun-package'
+          $wintunZip = Join-Path $env:RUNNER_TEMP 'wintun-0.14.1.zip'
+
+          if (Test-Path -LiteralPath $stage) {
+            Remove-Item -LiteralPath $stage -Recurse -Force
+          }
+          if (Test-Path -LiteralPath $zipPath) {
+            Remove-Item -LiteralPath $zipPath -Force
+          }
+          if (Test-Path -LiteralPath $wintunWork) {
+            Remove-Item -LiteralPath $wintunWork -Recurse -Force
+          }
+
+          New-Item -ItemType Directory -Force -Path $stage | Out-Null
+          New-Item -ItemType Directory -Force -Path (Join-Path $stage 'licenses\kcp') | Out-Null
+          New-Item -ItemType Directory -Force -Path (Join-Path $stage 'licenses\monocypher') | Out-Null
+          New-Item -ItemType Directory -Force -Path (Join-Path $stage 'licenses\cm256cc') | Out-Null
+          New-Item -ItemType Directory -Force -Path (Join-Path $stage 'licenses\wintun') | Out-Null
+
+          Copy-Item -LiteralPath 'client-cli\windows\vlan-cli.exe' -Destination (Join-Path $stage 'vlan-cli.exe')
+          Copy-Item -LiteralPath 'LICENSE' -Destination (Join-Path $stage 'LICENSE.txt')
+          Copy-Item -LiteralPath 'NOTICE' -Destination (Join-Path $stage 'NOTICE.txt')
+          Copy-Item -LiteralPath '3rdparty\kcp\README.md' -Destination (Join-Path $stage 'licenses\kcp\README.md')
+          Copy-Item -LiteralPath '3rdparty\monocypher\monocypher.h' -Destination (Join-Path $stage 'licenses\monocypher\monocypher.h')
+          Copy-Item -Path '3rdparty\cm256cc\*' -Destination (Join-Path $stage 'licenses\cm256cc') -Force
+
+          Invoke-WebRequest -Uri '${{ env.WINTUN_URL }}' -OutFile $wintunZip -UseBasicParsing
+          Expand-Archive -LiteralPath $wintunZip -DestinationPath $wintunWork -Force
+
+          $wintunDll = Join-Path $wintunWork 'wintun\bin\amd64\wintun.dll'
+          $wintunHash = (Get-FileHash -LiteralPath $wintunDll -Algorithm SHA256).Hash.ToUpperInvariant()
+          if ($wintunHash -ne '${{ env.WINTUN_AMD64_SHA256 }}') {
+            throw "Unexpected Wintun amd64 DLL SHA256: $wintunHash"
+          }
+
+          Copy-Item -LiteralPath $wintunDll -Destination (Join-Path $stage 'wintun.dll')
+          Copy-Item -LiteralPath (Join-Path $wintunWork 'wintun\LICENSE.txt') -Destination (Join-Path $stage 'licenses\wintun\LICENSE.txt')
+          Copy-Item -LiteralPath (Join-Path $wintunWork 'wintun\README.md') -Destination (Join-Path $stage 'licenses\wintun\README.md')
+          Copy-Item -LiteralPath (Join-Path $wintunWork 'wintun\include\wintun.h') -Destination (Join-Path $stage 'licenses\wintun\wintun.h')
+
+          @"
+          VLan CLI Windows binary release
+
+          Release tag: $env:RELEASE_TAG
+          Repository: https://github.com/$env:GITHUB_REPOSITORY
+          Source tag: https://github.com/$env:GITHUB_REPOSITORY/tree/$env:RELEASE_TAG
+          Corresponding source archive asset: vlan-connect-source-$env:RELEASE_TAG.tar.gz
+
+          This binary package was built from the source identified above.
+          Wintun was downloaded from the official Wintun package during release packaging.
+          Wintun URL: ${{ env.WINTUN_URL }}
+          Wintun amd64 DLL SHA256: ${{ env.WINTUN_AMD64_SHA256 }}
+          "@ | Set-Content -LiteralPath (Join-Path $stage 'SOURCE.txt') -Encoding utf8
+
+          @"
+          VLan CLI Windows third-party license notices
+
+          This package contains the VLan CLI binary, Wintun runtime DLL, and
+          license notices for bundled third-party source components.
+
+          VLan
+            License: GPL-3.0-only
+            License text: LICENSE.txt
+
+          KCP
+            License: MIT
+            Notice file: licenses/kcp/README.md
+            MIT license text: NOTICE.txt
+
+          Monocypher
+            License: BSD-2-Clause OR CC0-1.0
+            License notice: licenses/monocypher/monocypher.h
+
+          cm256cc
+            License: GPLv3 material with BSD-style notices in individual files
+            License notices: licenses/cm256cc/
+
+          Wintun
+            Purpose: Windows TUN driver runtime DLL loaded by vlan-cli.exe
+            Official package URL: ${{ env.WINTUN_URL }}
+            Bundled DLL: wintun.dll
+            Official notices: licenses/wintun/
+
+          Complete corresponding source is provided by the release asset:
+          vlan-connect-source-$env:RELEASE_TAG.tar.gz
+          "@ | Set-Content -LiteralPath (Join-Path $stage 'THIRD-PARTY-LICENSES.txt') -Encoding utf8
+
+          Compress-Archive -Path (Join-Path $stage '*') -DestinationPath $zipPath -Force
+          gh release upload "$env:RELEASE_TAG" $zipPath --repo "$env:GITHUB_REPOSITORY" --clobber

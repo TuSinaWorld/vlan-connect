@@ -176,7 +176,7 @@ MainWindow::MainWindow(QWidget* parent)
     int minH = qBound(480, (int)(avail.height() * 0.55), 700);
     setMinimumSize(minW, minH);
     int defW = qBound(minW, (int)(avail.width() * 0.72), 1100);
-    int defH = qBound(minH, (int)(avail.height() * 0.82), 880);
+    int defH = qBound(minH, (int)(avail.height() * 0.70), 700);
     resize(defW, defH);
 }
 
