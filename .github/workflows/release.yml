@@ -61,11 +61,10 @@ jobs:
           vlan-cli-linux-x86_64.tar.gz
           vlan-cli-linux-arm64.tar.gz
           vlan-cli-windows-x86_64.zip
-          vlan.with.Qt-windows-x64.zip
           LICENSE.txt
           NOTICE.txt
 
-          ## Qt GUI Client and Qt Source
+          ## Qt Source Notice
 
           This software uses a Qt project, and according to the license requirements,
           the Qt source code address should be provided.The Qt 5.9.9 Open Source
