@@ -1,4 +1,4 @@
-﻿#ifndef VLAN_CLI_APP_H
+#ifndef VLAN_CLI_APP_H
 #define VLAN_CLI_APP_H
 
 #include "cli_common.h"
@@ -8,6 +8,7 @@
 #include <atomic>
 #include <thread>
 #include <string>
+#include <set>
 
 namespace VLan {
 
@@ -28,6 +29,7 @@ public:
     ~CliApp();
 
     void setServer(const std::string& host, uint16_t port);
+    void setServerPassword(const std::string& password);
     void setPlayerName(const std::string& name);
     void setVerbose(bool v);
 
@@ -43,6 +45,7 @@ private:
     void printPeers();
 
     void doConnect();
+    void doDisconnect();
     void doCreateRoom(const std::string& args);
     void doJoinRoom(const std::string& args);
     void doLeaveRoom();
@@ -50,33 +53,45 @@ private:
     /* Signal callbacks */
     void onSignalConnected();
     void onSignalDisconnected();
-    void onLoginResponse(uint32_t peerId);
+    void onLoginResponse(uint32_t peerId, bool resumeAccepted);
     void onRoomCreated(uint32_t roomId, uint32_t virtualIP,
-                       TransportMode tmode, FecMode fmode,
+                       RoomTrafficPolicy tcpPolicy,
+                       RoomTrafficPolicy udpPolicy,
                        uint16_t mtu,
-                       bool encrypted, const uint8_t* salt,
-                       const uint8_t* sessionSeed);
+                       bool passwordProtected,
+                       const Buffer& leaseToken);
     void onJoinResponse(uint32_t roomId, uint32_t virtualIP,
-                        TransportMode tmode, FecMode fmode,
+                        RoomTrafficPolicy tcpPolicy,
+                        RoomTrafficPolicy udpPolicy,
                         uint16_t mtu,
-                        bool encrypted, const uint8_t* salt,
-                        const uint8_t* sessionSeed,
-                        const std::vector<PeerInfo>& members);
+                        bool passwordProtected,
+                        const std::vector<PeerInfo>& members,
+                        const Buffer& leaseToken);
     void onPeerJoined(PeerInfo info);
     void onPeerLeft(uint32_t peerId);
-    void onPunchNotify(uint32_t peerId, uint32_t virtualIP,
-                       NatType natType, uint32_t publicIP, uint16_t publicPort);
     void onRelayReady(uint32_t peerId);
-    void onNatDetected(NatType type, uint32_t publicIP, uint16_t publicPort);
-    void onTunnelDead(uint32_t peerId);
+    void onLogoutAck();
+    void onTransportDead(uint32_t peerId, TrafficClass cls);
 
     void setupTun();
     void teardownTun();
-    void setupRelayTunnel(uint32_t peerId);
-    void setupRawUdpRelayTunnel(uint32_t peerId);
-    void setupTcpRelayTunnel(uint32_t peerId);
-    void handleTcpRelayReceived(uint32_t srcPeerId, Buffer data);
+    void setupRelayTunnel(uint32_t peerId, TrafficClass cls);
+    void setupRawUdpRelayTunnel(uint32_t peerId, TrafficClass cls);
+    void setupTcpRelayTunnel(uint32_t peerId, TrafficClass cls);
+    void setupPolicyTunnel(uint32_t peerId, TrafficClass cls);
+    void handleTcpRelayReceived(uint32_t srcPeerId, TrafficClass cls, Buffer data);
     void handleReconnectRoomList(const std::vector<CliRoomListItem>& rooms);
+    void beginGracefulDisconnect(bool exitAfterDisconnect);
+    void finishGracefulDisconnect();
+    void clearPendingRebuild(uint32_t peerId);
+    bool takePendingRebuild(uint32_t peerId, TrafficClass cls);
+    static uint64_t transportKey(uint32_t peerId, TrafficClass cls);
+    void startResumeLeaseDeadline();
+    void expireResumeLeaseIfNeeded();
+    bool hasUsableResumeLease();
+    void rememberResumeLease(uint32_t roomId, uint32_t peerId,
+                             uint32_t virtualIP, const Buffer& token);
+    void clearResumeLease();
 
     void stdinReadLoop();
 
@@ -84,28 +99,20 @@ private:
     std::string   m_resolvedIP;
     uint16_t      m_port;
     std::string   m_playerName;
+    std::string   m_serverPassword;
 
     CliSignalClient   m_signal;
     CliDataChannel    m_dataChannel;
     CliTunnelManager  m_tunnel;
     CliTunAdapter*    m_tun;
-    CliNatDetector    m_natDetector;
-    CliHolePuncher*   m_puncher;
 
     uint32_t      m_currentRoomId;
     uint32_t      m_myVirtualIP;
-    NatType       m_myNatType;
-    TransportMode m_transportMode;
-    FecMode       m_fecMode;
+    RoomTrafficPolicy m_tcpPolicy;
+    RoomTrafficPolicy m_udpPolicy;
     uint16_t      m_roomMtu;
-    bool          m_encrypted;
+    bool          m_roomPasswordProtected;
     std::string   m_roomPassword;
-
-    uint8_t       m_intermediate[CIPHER_KEY_SIZE];
-    bool          m_hasIntermediate;
-    uint8_t       m_encryptKey[CIPHER_KEY_SIZE];
-    uint8_t       m_sessionSeed[CIPHER_SESSION_SEED_SIZE];
-    bool          m_hasCipherParams;
 
     std::atomic<bool> m_running;
     ThreadSafeQueue<std::string> m_cmdQueue;
@@ -124,15 +131,28 @@ private:
     int           m_reconnectAttempts;
     uint32_t      m_nextReconnectTime;
     bool          m_wasInRoom;
+    bool          m_pendingResumeRoom;
+    bool          m_manualDisconnecting;
+    bool          m_logoutPending;
+    bool          m_exitAfterDisconnect;
+    uint32_t      m_logoutDeadline;
+    bool          m_hasResumeLease;
+    uint32_t      m_resumeRoomId;
+    uint32_t      m_resumePeerId;
+    uint32_t      m_resumeVirtualIP;
+    uint32_t      m_resumeLeaseDeadlineMs;
+    Buffer        m_resumeToken;
 
+    uint32_t      m_savedRoomId;
     std::string   m_savedRoomName;
     uint8_t       m_savedMaxPlayers;
-    TransportMode m_savedTransportMode;
-    FecMode       m_savedFecMode;
+    RoomTrafficPolicy m_savedTcpPolicy;
+    RoomTrafficPolicy m_savedUdpPolicy;
     uint16_t      m_savedRoomMtu;
-    bool          m_savedEncrypted;
+    bool          m_savedRoomPasswordProtected;
 
     std::vector<CliRoomListItem> m_cachedRoomList;
+    std::set<uint64_t> m_pendingRebuild;
 };
 
 } // namespace VLan

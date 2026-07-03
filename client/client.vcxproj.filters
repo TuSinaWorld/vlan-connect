@@ -31,9 +31,6 @@
     </Filter>
   </ItemGroup>
   <ItemGroup>
-    <ClCompile Include="src\network\hole_puncher.cpp">
-      <Filter>Source Files</Filter>
-    </ClCompile>
     <ClCompile Include="..\3rdparty\kcp\ikcp.c">
       <Filter>Source Files</Filter>
     </ClCompile>
@@ -43,16 +40,16 @@
     <ClCompile Include="src\main.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
+    <ClCompile Include="src\ui\app_settings.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
     <ClCompile Include="src\ui\mainwindow.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
     <ClCompile Include="src\ui\modern_tray_menu.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
-    <ClCompile Include="src\network\nat_detector.cpp">
-      <Filter>Source Files</Filter>
-    </ClCompile>
-    <ClCompile Include="src\core\p2p_peer.cpp">
+    <ClCompile Include="src\core\peer_connection.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
     <ClCompile Include="src\network\room_manager.cpp">
@@ -73,6 +70,9 @@
     <ClCompile Include="src\ui\style_manager.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
+    <ClCompile Include="src\ui\ui_strings.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
     <ClCompile Include="src\ui\log_manager.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
@@ -84,10 +84,10 @@
     <ClInclude Include="..\common\byte_buffer.h">
       <Filter>Header Files</Filter>
     </ClInclude>
-    <QtMoc Include="src\network\hole_puncher.h">
-      <Filter>Header Files</Filter>
-    </QtMoc>
     <ClInclude Include="..\3rdparty\kcp\ikcp.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="src\ui\app_settings.h">
       <Filter>Header Files</Filter>
     </ClInclude>
     <QtMoc Include="src\core\kcp_tunnel.h">
@@ -102,13 +102,10 @@
     <ClInclude Include="..\common\msvc2015_compat.h">
       <Filter>Header Files</Filter>
     </ClInclude>
-    <QtMoc Include="src\network\nat_detector.h">
-      <Filter>Header Files</Filter>
-    </QtMoc>
     <ClInclude Include="..\common\net_common.h">
       <Filter>Header Files</Filter>
     </ClInclude>
-    <QtMoc Include="src\core\p2p_peer.h">
+    <QtMoc Include="src\core\peer_connection.h">
       <Filter>Header Files</Filter>
     </QtMoc>
     <ClInclude Include="..\common\protocol.h">
@@ -132,6 +129,9 @@
     <ClInclude Include="src\ui\style_manager.h">
       <Filter>Header Files</Filter>
     </ClInclude>
+    <ClInclude Include="src\ui\ui_strings.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
     <QtMoc Include="src\ui\log_manager.h">
       <Filter>Header Files</Filter>
     </QtMoc>
@@ -141,34 +141,37 @@
     <ClInclude Include="..\common\payload_cipher.h">
       <Filter>Header Files</Filter>
     </ClInclude>
+    <ClInclude Include="..\common\secure_frame.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
   </ItemGroup>
   <ItemGroup>
-    
-    
-    
-    
-    
-    
-    
-    
-    
-    
+
+
+
+
+
+
+
+
+
+
     <CustomBuild Include="debug\moc_predefs.h.cbt">
       <Filter>Generated Files</Filter>
     </CustomBuild>
     <CustomBuild Include="release\moc_predefs.h.cbt">
       <Filter>Generated Files</Filter>
     </CustomBuild>
-    
-    
-    
-    
-    
-    
-    
-    
-    
-    
+
+
+
+
+
+
+
+
+
+
   </ItemGroup>
   <ItemGroup>
     <QtRcc Include="resources\resources.qrc">

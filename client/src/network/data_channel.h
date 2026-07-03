@@ -1,4 +1,4 @@
-﻿#ifndef VLAN_DATA_CHANNEL_H
+#ifndef VLAN_DATA_CHANNEL_H
 #define VLAN_DATA_CHANNEL_H
 
 #include <QObject>
@@ -7,6 +7,7 @@
 #include <QByteArray>
 #include "protocol.h"
 #include "byte_buffer.h"
+#include "secure_frame.h"
 
 namespace VLan {
 
@@ -19,13 +20,15 @@ public:
     void connectToServer(const QString& host, quint16 port, uint32_t peerId);
     void disconnect();
     bool isConnected() const;
+    void setSecureSession(uint32_t sessionId, const QByteArray& master);
 
-    void sendRelayData(uint32_t srcPeerId, uint32_t dstPeerId, const QByteArray& data);
+    void sendRelayData(uint32_t srcPeerId, uint32_t dstPeerId,
+                       TrafficClass cls, const QByteArray& data);
 
 signals:
     void connected();
     void disconnected();
-    void relayDataReceived(uint32_t srcPeerId, QByteArray data);
+    void relayDataReceived(uint32_t srcPeerId, TrafficClass cls, QByteArray data);
 
 private slots:
     void onSocketConnected();
@@ -51,6 +54,10 @@ private:
     uint32_t    m_peerId;
     bool        m_established;
     uint32_t    m_lastRecvTime;
+    bool        m_secureEnabled;
+    uint32_t    m_secureSessionId;
+    QByteArray  m_secureMaster;
+    SecureFrameCipher m_cipher;
 };
 
 } // namespace VLan

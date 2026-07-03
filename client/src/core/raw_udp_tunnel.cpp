@@ -1,4 +1,4 @@
-﻿#include "raw_udp_tunnel.h"
+#include "raw_udp_tunnel.h"
 #include "fec_codec.h"
 #include "net_common.h"
 #include "payload_cipher.h"
@@ -16,13 +16,17 @@ RawUdpTunnel::RawUdpTunnel(QUdpSocket* socket,
                              const QHostAddress& peerAddr, quint16 peerPort,
                              FecMode fecMode,
                              uint16_t mtu,
+                             TrafficClass trafficClass,
+                             bool secureFrames,
                              QObject* parent)
     : QObject(parent),
       m_socket(socket), m_peerAddr(peerAddr), m_peerPort(peerPort),
       m_relayMode(false), m_relaySrcPeerId(0), m_relayDstPeerId(0),
+      m_trafficClass(trafficClass),
       m_nextMsgId(0), m_dead(false),
       m_fecMode(fecMode), m_fecEncoder(nullptr), m_fecDecoder(nullptr),
       m_roomMtu(normalizeRoomMtu(mtu)),
+      m_secureFrames(secureFrames),
       m_rttMs(-1)
 {
     uint32_t now = currentTimeMs();
@@ -97,6 +101,7 @@ void RawUdpTunnel::sendRawPacket(const QByteArray& payload) {
     if (m_relayMode) {
         UdpRelayHeader hdr;
         hdr.type      = UDP_RAW_RELAY_DATA;
+        hdr.trafficClass = static_cast<uint8_t>(m_trafficClass);
         hdr.srcPeerId = htonl(m_relaySrcPeerId);
         hdr.dstPeerId = htonl(m_relayDstPeerId);
 
@@ -109,7 +114,10 @@ void RawUdpTunnel::sendRawPacket(const QByteArray& payload) {
         pkt.append(payload);
     }
 
-    m_socket->writeDatagram(pkt, m_peerAddr, m_peerPort);
+    if (m_datagramSender)
+        m_datagramSender(pkt, m_peerAddr, m_peerPort);
+    else
+        m_socket->writeDatagram(pkt, m_peerAddr, m_peerPort);
     m_lastSendTime = currentTimeMs();
 }
 
@@ -268,7 +276,9 @@ void RawUdpTunnel::cleanupStaleEntries() {
 }
 
 int RawUdpTunnel::maxFragmentPayload() const {
-    int payload = static_cast<int>(normalizeRoomMtu(m_roomMtu)) + CIPHER_OVERHEAD;
+    int payload = transportPayloadBudget(m_roomMtu, MODE_RELAY_RAW_UDP,
+                                         m_fecMode != FEC_NONE,
+                                         m_secureFrames);
     if (payload > RAW_UDP_MAX_FRAG_PAYLOAD)
         payload = RAW_UDP_MAX_FRAG_PAYLOAD;
     return payload;

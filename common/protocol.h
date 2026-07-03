@@ -1,12 +1,16 @@
-﻿#ifndef VLAN_PROTOCOL_H
+#ifndef VLAN_PROTOCOL_H
 #define VLAN_PROTOCOL_H
 
 #include <cstdint>
 #include <string>
+#ifdef QT_CORE_LIB
+#include <QString>
+#include <QStringList>
+#endif
 
 namespace VLan {
 
-static const uint16_t DEFAULT_PORT            = 11510;  // TCP signal + UDP STUN/relay
+static const uint16_t DEFAULT_PORT            = 11510;  // TCP signal + UDP relay
 
 static const uint32_t VNET_SUBNET    = 0x0A0A0000; // 10.10.0.0
 static const uint32_t VNET_MASK      = 0xFFFFFF00; // 255.255.255.0
@@ -14,8 +18,6 @@ static const uint32_t VNET_BROADCAST = 0x0A0A00FF; // 10.10.0.255
 static const uint32_t VNET_GATEWAY   = 0x0A0A0001; // 10.10.0.1
 
 static const int KEEPALIVE_INTERVAL_MS      = 15000;
-static const int PUNCH_TIMEOUT_MS           = 5000;
-static const int PUNCH_RETRY_INTERVAL       = 200;
 static const int RECONNECT_INTERVAL_MS      = 3000;
 static const int HEARTBEAT_TIMEOUT_MS       = 45000;
 static const int KCP_KEEPALIVE_INTERVAL_MS  = 5000;
@@ -37,6 +39,10 @@ static const int MAX_PLAYER_NAME_LEN    = 63;
 static const int MIN_ROOM_PASSWORD_LEN  = 6;
 static const int MAX_ROOM_PASSWORD_LEN  = 63;
 static const int MAX_PLAYERS            = 8;
+static const int RECONNECT_TOKEN_SIZE   = 32;
+static const int RECONNECT_LEASE_TIMEOUT_SEC = 120;
+static const uint8_t VNET_FIRST_HOST_SUFFIX = 2;
+static const uint8_t VNET_LAST_HOST_SUFFIX  = 254;
 
 static const size_t MAX_TCP_SEND_BUF    = 2 * 1024 * 1024;   // 2 MB per client
 static const size_t MAX_TCP_MSG_PAYLOAD = 65000;              // sanity cap
@@ -45,26 +51,14 @@ static const int TCP_RELAY_DEAD_MS      = 30000;              // peer-level time
 static const int TCP_RECV_TIMEOUT_MS    = 45000;              // client-side no-recv
 
 static const uint32_t PROTOCOL_MAGIC    = 0x564C414E; // "VLAN"
-static const uint16_t PROTOCOL_VERSION  = 2;
-
-enum NatType : uint8_t {
-    NAT_UNKNOWN         = 0,
-    NAT_OPEN            = 1,
-    NAT_FULL_CONE       = 2,
-    NAT_RESTRICTED      = 3,
-    NAT_PORT_RESTRICTED = 4,
-    NAT_SYMMETRIC       = 5
-};
+static const uint16_t PROTOCOL_VERSION  = 5;
 
 enum UdpPacketType : uint8_t {
     UDP_KCP_DATA      = 0x01,
     UDP_RELAY_DATA    = 0x02,
-    UDP_STUN_REQUEST  = 0x03,
-    UDP_STUN_RESPONSE = 0x04,
-    UDP_PUNCH         = 0x05,
-    UDP_PUNCH_ACK     = 0x06,
     UDP_KEEPALIVE         = 0x07,
-    UDP_RAW_RELAY_DATA    = 0x08
+    UDP_RAW_RELAY_DATA    = 0x08,
+    UDP_ENCRYPTED         = 0x09
 };
 
 enum TcpMsgType : uint8_t {
@@ -78,16 +72,22 @@ enum TcpMsgType : uint8_t {
     MSG_LEAVE_ROOM     = 0x08,
     MSG_ROOM_CREATED   = 0x09,
     MSG_JOIN_RESP      = 0x0A,
-    MSG_NAT_REPORT     = 0x0B,
-    MSG_PUNCH_NOTIFY   = 0x0C,
-    MSG_PUNCH_RESULT   = 0x0D,
     MSG_REQUEST_RELAY  = 0x0E,
     MSG_RELAY_READY    = 0x0F,
     MSG_LIST_ROOMS     = 0x10,
     MSG_ROOM_LIST      = 0x11,
+    MSG_ROOM_LIST_PUSH = 0x12,
+    MSG_RESUME_ROOM    = 0x13,
+    MSG_LOGOUT         = 0x14,
+    MSG_LOGOUT_ACK     = 0x15,
     MSG_TCP_RELAY_DATA      = 0x20,
     MSG_DATA_CHANNEL_INIT   = 0x21,
     MSG_DATA_CHANNEL_ACK    = 0x22,
+    MSG_CLIENT_HELLO    = 0x30,
+    MSG_SERVER_HELLO    = 0x31,
+    MSG_SERVER_AUTH     = 0x32,
+    MSG_SERVER_AUTH_OK  = 0x33,
+    MSG_ENCRYPTED       = 0x34,
     MSG_AUTH_CHALLENGE  = 0xE0,
     MSG_AUTH_RESPONSE   = 0xE1,
     MSG_PING           = 0xF0,
@@ -97,10 +97,19 @@ enum TcpMsgType : uint8_t {
 
 enum TransportType : uint8_t {
     TRANSPORT_NONE          = 0,
-    TRANSPORT_P2P_KCP       = 1,
     TRANSPORT_RELAY_KCP     = 2,
     TRANSPORT_RELAY_TCP     = 3,
     TRANSPORT_RELAY_RAW_UDP = 4
+};
+
+enum TrafficClass : uint8_t {
+    TRAFFIC_TCP = 1,
+    TRAFFIC_UDP = 2
+};
+
+enum KcpProfile : uint8_t {
+    KCP_PROFILE_REALTIME = 0,
+    KCP_PROFILE_BULK     = 1
 };
 
 #pragma pack(push, 1)
@@ -111,28 +120,9 @@ struct UdpHeader {
 
 struct UdpRelayHeader {
     uint8_t  type;       // UDP_RELAY_DATA
+    uint8_t  trafficClass;
     uint32_t srcPeerId;
     uint32_t dstPeerId;
-};
-
-struct StunRequest {
-    uint8_t  type;       // UDP_STUN_REQUEST
-    uint32_t token;
-    uint16_t localPort;
-    uint32_t peerId;     // so server can associate UDP addr with peer
-};
-
-struct StunResponse {
-    uint8_t  type;       // UDP_STUN_RESPONSE
-    uint32_t token;
-    uint32_t observedIP;
-    uint16_t observedPort;
-};
-
-struct PunchPacket {
-    uint8_t  type;       // UDP_PUNCH or UDP_PUNCH_ACK
-    uint32_t peerId;
-    uint32_t token;
 };
 
 struct TcpMsgHeader {
@@ -157,7 +147,6 @@ struct FecHeader {
 #pragma pack(pop)
 
 enum TransportMode : uint8_t {
-    MODE_P2P_ONLY       = 1,
     MODE_RELAY_KCP      = 2,
     MODE_RELAY_TCP      = 3,
     MODE_RELAY_RAW_UDP  = 4
@@ -171,11 +160,6 @@ enum FecMode : uint8_t {
     FEC_70     = 4,   // ~70% redundancy  (10 data + 7 parity)
     FEC_100    = 5,   // ~100% redundancy (10 data + 10 parity)
     FEC_200    = 6    // ~200% redundancy (10 data + 20 parity)
-};
-
-enum EncryptMode : uint8_t {
-    ENCRYPT_NONE    = 0,
-    ENCRYPT_PAYLOAD = 1   // XChaCha20-Poly1305 on IP payload only
 };
 
 static const int FEC_GROUP_SIZE       = 10;
@@ -217,8 +201,7 @@ inline uint8_t normalizeMaxPlayers(int value) {
 }
 
 inline bool isValidTransportModeValue(uint8_t raw) {
-    return raw == MODE_P2P_ONLY ||
-           raw == MODE_RELAY_KCP ||
+    return raw == MODE_RELAY_KCP ||
            raw == MODE_RELAY_TCP ||
            raw == MODE_RELAY_RAW_UDP;
 }
@@ -243,9 +226,20 @@ inline FecMode normalizeFecMode(uint8_t raw, TransportMode mode) {
     FecMode fec = isValidFecModeValue(raw)
         ? static_cast<FecMode>(raw)
         : FEC_NONE;
-    if (mode == MODE_RELAY_TCP || mode == MODE_P2P_ONLY)
+    if (mode == MODE_RELAY_TCP)
         return FEC_NONE;
     return fec;
+}
+
+inline bool isValidKcpProfileValue(uint8_t raw) {
+    return raw == KCP_PROFILE_REALTIME ||
+           raw == KCP_PROFILE_BULK;
+}
+
+inline KcpProfile normalizeKcpProfile(uint8_t raw) {
+    return isValidKcpProfileValue(raw)
+        ? static_cast<KcpProfile>(raw)
+        : KCP_PROFILE_REALTIME;
 }
 
 inline bool isValidRoomMtuValue(int mtu) {
@@ -260,16 +254,73 @@ inline uint16_t normalizeRoomMtu(int mtu) {
         : static_cast<uint16_t>(ROOM_MTU_DEFAULT);
 }
 
-inline int kcpMtuFromRoomMtu(int roomMtu) {
-    return static_cast<int>(normalizeRoomMtu(roomMtu));
+inline int transportPayloadBudget(int roomMtu,
+                                  TransportMode mode,
+                                  bool fecEnabled,
+                                  bool encrypted)
+{
+    int budget = static_cast<int>(normalizeRoomMtu(roomMtu));
+    budget -= static_cast<int>(sizeof(UdpRelayHeader));
+    if (fecEnabled) budget -= static_cast<int>(sizeof(FecHeader));
+    if (encrypted) budget -= 1 + 4 + 8 + 16; // UDP_ENCRYPTED + session + counter + MAC
+    if (mode == MODE_RELAY_RAW_UDP)
+        budget -= static_cast<int>(sizeof(FragHeader));
+    if (budget < 256) budget = 256;
+    if (budget > RAW_UDP_MAX_FRAG_PAYLOAD) budget = RAW_UDP_MAX_FRAG_PAYLOAD;
+    return budget;
+}
+
+inline int kcpMtuFromRoomMtu(int roomMtu,
+                             bool fecEnabled = false,
+                             bool encrypted = false) {
+    return transportPayloadBudget(roomMtu, MODE_RELAY_KCP, fecEnabled, encrypted);
+}
+
+struct RoomTrafficPolicy {
+    TransportMode transportMode;
+    FecMode       fecMode;
+    KcpProfile    kcpProfile;
+
+    RoomTrafficPolicy()
+        : transportMode(MODE_RELAY_KCP),
+          fecMode(FEC_NONE),
+          kcpProfile(KCP_PROFILE_REALTIME) {}
+};
+
+inline RoomTrafficPolicy makeDefaultTcpPolicy() {
+    RoomTrafficPolicy p;
+    p.transportMode = MODE_RELAY_RAW_UDP;
+    p.fecMode = FEC_NONE;
+    p.kcpProfile = KCP_PROFILE_REALTIME;
+    return p;
+}
+
+inline RoomTrafficPolicy makeDefaultUdpPolicy() {
+    RoomTrafficPolicy p;
+    p.transportMode = MODE_RELAY_KCP;
+    p.fecMode = FEC_NONE;
+    p.kcpProfile = KCP_PROFILE_REALTIME;
+    return p;
+}
+
+inline RoomTrafficPolicy normalizeTrafficPolicy(uint8_t transport,
+                                                uint8_t fec,
+                                                uint8_t profile,
+                                                const RoomTrafficPolicy& fallback)
+{
+    RoomTrafficPolicy p = fallback;
+    if (isValidTransportModeValue(transport))
+        p.transportMode = static_cast<TransportMode>(transport);
+    p.fecMode = normalizeFecMode(fec, p.transportMode);
+    p.kcpProfile = normalizeKcpProfile(profile);
+    if (p.transportMode == MODE_RELAY_TCP)
+        p.fecMode = FEC_NONE;
+    return p;
 }
 
 struct PeerInfo {
     uint32_t      peerId;
     uint32_t      virtualIP;
-    uint32_t      publicIP;
-    uint16_t      publicPort;
-    NatType       natType;
     TransportType transport;
     std::string   name;
 };
@@ -279,21 +330,28 @@ struct RoomListItem {
     char          roomName[MAX_ROOM_NAME_LEN + 1];
     uint8_t       playerCount;
     uint8_t       maxPlayers;
-    TransportMode transportMode;
-    FecMode       fecMode;
-    uint8_t       encrypted;
+    RoomTrafficPolicy tcpPolicy;
+    RoomTrafficPolicy udpPolicy;
+    uint8_t       passwordProtected;
     uint16_t      mtu;
 };
 
-inline const char* natTypeName(NatType t) {
-    switch (t) {
-    case NAT_OPEN:            return "Open";
-    case NAT_FULL_CONE:       return "Full Cone";
-    case NAT_RESTRICTED:      return "Restricted";
-    case NAT_PORT_RESTRICTED: return "Port Restricted";
-    case NAT_SYMMETRIC:       return "Symmetric";
-    default:                  return "Unknown";
-    }
+inline const RoomTrafficPolicy& policyForTraffic(const RoomTrafficPolicy& tcpPolicy,
+                                                 const RoomTrafficPolicy& udpPolicy,
+                                                 TrafficClass cls)
+{
+    return cls == TRAFFIC_TCP ? tcpPolicy : udpPolicy;
+}
+
+inline TrafficClass trafficClassFromIpPacket(const uint8_t* ipPacket, size_t len)
+{
+    if (len < 20) return TRAFFIC_UDP;
+    uint8_t version = (ipPacket[0] >> 4) & 0x0F;
+    if (version != 4) return TRAFFIC_UDP;
+    uint8_t ihl = (ipPacket[0] & 0x0F) * 4;
+    if (ihl < 20 || len < ihl) return TRAFFIC_UDP;
+    uint8_t proto = ipPacket[9];
+    return proto == 6 ? TRAFFIC_TCP : TRAFFIC_UDP;
 }
 
 inline int fecParityCount(FecMode mode, int dataCount) {
@@ -322,7 +380,6 @@ inline const char* fecModeName(FecMode m) {
 
 inline const char* transportName(TransportType t) {
     switch (t) {
-    case TRANSPORT_P2P_KCP:       return "P2P (KCP)";
     case TRANSPORT_RELAY_KCP:     return "Relay (KCP)";
     case TRANSPORT_RELAY_TCP:     return "Relay (TCP)";
     case TRANSPORT_RELAY_RAW_UDP: return "Relay (Raw UDP)";
@@ -331,9 +388,6 @@ inline const char* transportName(TransportType t) {
 }
 
 #ifdef QT_CORE_LIB
-#include <QString>
-#include <QStringList>
-
 inline QString virtualIPToString(uint32_t ip) {
     return QString("%1.%2.%3.%4")
         .arg((ip >> 24) & 0xFF)

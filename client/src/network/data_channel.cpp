@@ -1,4 +1,4 @@
-﻿#include "data_channel.h"
+#include "data_channel.h"
 #include "net_common.h"
 #include "../ui/log_manager.h"
 
@@ -6,7 +6,8 @@ namespace VLan {
 
 DataChannel::DataChannel(QObject* parent)
     : QObject(parent), m_port(0), m_peerId(0),
-      m_established(false), m_lastRecvTime(0)
+      m_established(false), m_lastRecvTime(0),
+      m_secureEnabled(false), m_secureSessionId(0)
 {
     m_socket = new QTcpSocket(this);
     connect(m_socket, &QTcpSocket::connected,    this, &DataChannel::onSocketConnected);
@@ -46,6 +47,9 @@ void DataChannel::disconnect() {
     m_keepaliveTimer->stop();
     m_reconnectTimer->stop();
     m_established = false;
+    m_peerId = 0;
+    m_port = 0;
+    m_recvBuf.clear();
     if (m_socket->state() != QAbstractSocket::UnconnectedState)
         m_socket->abort();
 }
@@ -55,8 +59,16 @@ bool DataChannel::isConnected() const {
            m_socket->state() == QAbstractSocket::ConnectedState;
 }
 
+void DataChannel::setSecureSession(uint32_t sessionId, const QByteArray& master) {
+    m_secureSessionId = sessionId;
+    m_secureMaster = master;
+    m_secureEnabled = (sessionId != 0 && master.size() == 32);
+    if (m_secureEnabled)
+        m_cipher.init(reinterpret_cast<const uint8_t*>(m_secureMaster.constData()), true, "data");
+}
+
 void DataChannel::sendRelayData(uint32_t srcPeerId, uint32_t dstPeerId,
-                                 const QByteArray& data)
+                                TrafficClass cls, const QByteArray& data)
 {
     if (!isConnected()) return;
     if (g_verboseLog)
@@ -64,6 +76,7 @@ void DataChannel::sendRelayData(uint32_t srcPeerId, uint32_t dstPeerId,
     ByteBuffer bb;
     bb.writeU32(srcPeerId);
     bb.writeU32(dstPeerId);
+    bb.writeU8(static_cast<uint8_t>(cls));
     bb.writeBytes(data.constData(), data.size());
     sendMsg(MSG_TCP_RELAY_DATA, bb);
 }
@@ -72,7 +85,18 @@ void DataChannel::onSocketConnected() {
     m_socket->setSocketOption(QAbstractSocket::LowDelayOption, 1);
 
     ByteBuffer bb;
-    bb.writeU32(m_peerId);
+    if (m_secureEnabled) {
+        ByteBuffer inner;
+        inner.writeU32(m_peerId);
+        std::vector<uint8_t> enc = m_cipher.encrypt(inner.data(), inner.size());
+        uint8_t sid[4];
+        writeU32BE(sid, m_secureSessionId);
+        bb.writeBytes(sid, 4);
+        if (!enc.empty())
+            bb.writeBytes(enc.data(), enc.size());
+    } else {
+        bb.writeU32(m_peerId);
+    }
     sendMsg(MSG_DATA_CHANNEL_INIT, bb);
 
     LogManager::instance().logDetail(QString("[datachannel] TCP connected, sent DATA_CHANNEL_INIT for peer %1").arg(m_peerId));
@@ -139,6 +163,19 @@ void DataChannel::onReadyRead() {
 }
 
 void DataChannel::processMessage(uint8_t msgType, const uint8_t* payload, size_t len) {
+    std::vector<uint8_t> plain;
+    if (msgType == MSG_ENCRYPTED) {
+        if (!m_secureEnabled || !m_cipher.decrypt(payload, len, &plain) || plain.empty())
+            return;
+        msgType = plain[0];
+        payload = plain.size() > 1 ? plain.data() + 1 : nullptr;
+        len = plain.size() > 1 ? plain.size() - 1 : 0;
+    } else if (m_secureEnabled) {
+        LogManager::instance().logError(QString("[datachannel] Plaintext frame in secure mode, reconnecting"));
+        m_socket->abort();
+        return;
+    }
+
     switch (msgType) {
     case MSG_DATA_CHANNEL_ACK:
         m_established = true;
@@ -149,16 +186,17 @@ void DataChannel::processMessage(uint8_t msgType, const uint8_t* payload, size_t
         break;
 
     case MSG_TCP_RELAY_DATA: {
-        if (len < 8) break;
+        if (len < 9) break;
         ByteBuffer bb(payload, len);
         uint32_t srcId = bb.readU32();
         bb.readU32();
+        TrafficClass cls = bb.readU8() == TRAFFIC_TCP ? TRAFFIC_TCP : TRAFFIC_UDP;
         size_t remaining = bb.remaining();
         QByteArray data(reinterpret_cast<const char*>(payload + len - remaining),
                         static_cast<int>(remaining));
         if (g_verboseLog)
             LogManager::instance().logDetail(QString("[datachannel] relayData srcPeerId=%1 dataSize=%2").arg(srcId).arg(data.size()));
-        emit relayDataReceived(srcId, data);
+        emit relayDataReceived(srcId, cls, data);
         break;
     }
     case MSG_PONG:
@@ -197,6 +235,23 @@ void DataChannel::onReconnectTimer() {
 
 void DataChannel::sendMsg(uint8_t msgType, const ByteBuffer& body) {
     if (m_socket->state() != QAbstractSocket::ConnectedState) return;
+
+    if (m_secureEnabled && msgType != MSG_DATA_CHANNEL_INIT) {
+        std::vector<uint8_t> plain;
+        plain.reserve(1 + body.size());
+        plain.push_back(msgType);
+        if (body.size() > 0)
+            plain.insert(plain.end(), body.data(), body.data() + body.size());
+        std::vector<uint8_t> enc = m_cipher.encrypt(plain.data(), plain.size());
+        TcpMsgHeader hdr;
+        hdr.msgType = MSG_ENCRYPTED;
+        hdr.length  = htons(static_cast<uint16_t>(enc.size()));
+        m_socket->write(reinterpret_cast<const char*>(&hdr), sizeof(hdr));
+        if (!enc.empty())
+            m_socket->write(reinterpret_cast<const char*>(enc.data()), enc.size());
+        return;
+    }
+
     TcpMsgHeader hdr;
     hdr.msgType = msgType;
     hdr.length  = htons(static_cast<uint16_t>(body.size()));
@@ -207,10 +262,8 @@ void DataChannel::sendMsg(uint8_t msgType, const ByteBuffer& body) {
 
 void DataChannel::sendMsg(uint8_t msgType) {
     if (m_socket->state() != QAbstractSocket::ConnectedState) return;
-    TcpMsgHeader hdr;
-    hdr.msgType = msgType;
-    hdr.length  = 0;
-    m_socket->write(reinterpret_cast<const char*>(&hdr), sizeof(hdr));
+    ByteBuffer empty;
+    sendMsg(msgType, empty);
 }
 
 } // namespace VLan

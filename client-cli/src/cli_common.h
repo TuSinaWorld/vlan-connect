@@ -1,10 +1,11 @@
-﻿#ifndef VLAN_CLI_COMMON_H
+#ifndef VLAN_CLI_COMMON_H
 #define VLAN_CLI_COMMON_H
 
 #include "protocol.h"
 #include "byte_buffer.h"
 #include "net_common.h"
 #include "payload_cipher.h"
+#include "secure_frame.h"
 
 #include <vector>
 #include <string>

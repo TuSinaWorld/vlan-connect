@@ -29,17 +29,17 @@ SOURCES += \
     src/core/kcp_tunnel.cpp \
     src/core/raw_udp_tunnel.cpp \
     src/core/tunnel_manager.cpp \
-    src/core/p2p_peer.cpp \
+    src/core/peer_connection.cpp \
     src/core/fec_codec.cpp \
     src/network/signal_client.cpp \
     src/network/data_channel.cpp \
-    src/network/nat_detector.cpp \
-    src/network/hole_puncher.cpp \
     src/network/room_manager.cpp \
+    src/ui/app_settings.cpp \
     src/ui/mainwindow.cpp \
     src/ui/modern_tray_menu.cpp \
     src/ui/roomwidget.cpp \
     src/ui/style_manager.cpp \
+    src/ui/ui_strings.cpp \
     src/ui/log_manager.cpp \
     ../3rdparty/kcp/ikcp.c \
     ../3rdparty/cm256cc/cm256.cpp \
@@ -51,17 +51,17 @@ HEADERS += \
     src/core/kcp_tunnel.h \
     src/core/raw_udp_tunnel.h \
     src/core/tunnel_manager.h \
-    src/core/p2p_peer.h \
+    src/core/peer_connection.h \
     src/core/fec_codec.h \
     src/network/signal_client.h \
     src/network/data_channel.h \
-    src/network/nat_detector.h \
-    src/network/hole_puncher.h \
     src/network/room_manager.h \
+    src/ui/app_settings.h \
     src/ui/mainwindow.h \
     src/ui/modern_tray_menu.h \
     src/ui/roomwidget.h \
     src/ui/style_manager.h \
+    src/ui/ui_strings.h \
     src/ui/log_manager.h \
     ../3rdparty/kcp/ikcp.h \
     ../3rdparty/cm256cc/cm256.h \
@@ -72,13 +72,14 @@ HEADERS += \
     ../common/net_common.h \
     ../common/msvc2015_compat.h \
     ../common/payload_cipher.h \
+    ../common/secure_frame.h \
     ../3rdparty/monocypher/monocypher.h
 
 RESOURCES += resources/resources.qrc
 
 RC_ICONS = resources/vlan.ico
 
-LIBS += -lws2_32 -liphlpapi
+LIBS += -lws2_32 -liphlpapi -lbcrypt
 
 # MSVC 2015 can't find rc.exe from the newer Windows SDK; point to it explicitly
 RC_INCLUDEPATH = "C:/Program Files (x86)/Windows Kits/10/Include/10.0.26100.0/um"

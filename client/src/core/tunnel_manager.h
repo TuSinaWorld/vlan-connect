@@ -6,13 +6,14 @@
 #include <QTimer>
 #include <QMap>
 #include "protocol.h"
+#include "secure_frame.h"
 
 namespace VLan {
 
 class TunAdapter;
 class KcpTunnel;
 class RawUdpTunnel;
-class P2PPeer;
+class PeerConnection;
 
 /*
  * Central routing engine.
@@ -20,9 +21,9 @@ class P2PPeer;
  * Connects the virtual TUN adapter to the network:
  *   TUN (game) <-> TunnelManager <-> KcpTunnel(s) <-> UDP socket <-> peers/relay
  *
- * Maintains a routing table: virtualIP -> P2PPeer.
+ * Maintains a routing table: virtualIP -> PeerConnection.
  * Handles broadcast by forwarding to all peers.
- * Sends periodic UDP keepalives to keep NAT mappings alive.
+ * Sends periodic UDP keepalives so relay sessions stay active.
  */
 class TunnelManager : public QObject {
     Q_OBJECT
@@ -31,39 +32,43 @@ public:
     ~TunnelManager();
 
     void setTunAdapter(TunAdapter* tun);
-    void setServerEndpoint(const QHostAddress& addr, quint16 stunPort);
+    void setServerEndpoint(const QHostAddress& addr, quint16 udpPort);
 
     QUdpSocket* udpSocket() { return m_udpSocket; }
     quint16     localUdpPort() const;
 
-    P2PPeer* addPeer(uint32_t peerId, uint32_t virtualIP, const QString& name);
+    PeerConnection* addPeer(uint32_t peerId, uint32_t virtualIP, const QString& name);
     void     removePeer(uint32_t peerId);
+    void     removeTransport(uint32_t peerId, TrafficClass cls);
     void     removeAllPeers();
-    P2PPeer* peerById(uint32_t peerId);
-    P2PPeer* peerByVirtualIP(uint32_t vip);
-    QList<P2PPeer*> allPeers() const { return m_peerById.values(); }
+    PeerConnection* peerById(uint32_t peerId);
+    PeerConnection* peerByVirtualIP(uint32_t vip);
+    QList<PeerConnection*> allPeers() const { return m_peerById.values(); }
 
-    KcpTunnel* createKcpTunnel(P2PPeer* peer,
+    KcpTunnel* createKcpTunnel(PeerConnection* peer,
                                const QHostAddress& addr, quint16 port,
                                TransportType type,
                                FecMode fecMode = FEC_NONE,
-                               uint16_t mtu = ROOM_MTU_DEFAULT);
+                               uint16_t mtu = ROOM_MTU_DEFAULT,
+                               KcpProfile profile = KCP_PROFILE_REALTIME,
+                               TrafficClass trafficClass = TRAFFIC_UDP);
 
-    RawUdpTunnel* createRawUdpTunnel(P2PPeer* peer,
+    RawUdpTunnel* createRawUdpTunnel(PeerConnection* peer,
                                      const QHostAddress& addr, quint16 port,
                                      FecMode fecMode = FEC_NONE,
-                                     uint16_t mtu = ROOM_MTU_DEFAULT);
+                                     uint16_t mtu = ROOM_MTU_DEFAULT,
+                                     TrafficClass trafficClass = TRAFFIC_UDP);
 
     void setMyPeerId(uint32_t id)   { m_myPeerId = id; }
     void setMyVirtualIP(uint32_t ip) { m_myVirtualIP = ip; }
+    void setSecureSession(uint32_t sessionId, const QByteArray& master);
     void resetTrafficCounters();
     void trafficCounters(quint64* uploadBytes, quint64* downloadBytes) const;
     void addTunDownloadBytes(quint64 bytes);
 
 signals:
     void peerDataReceived(uint32_t peerId, QByteArray data);
-    void rawUdpReceived(QByteArray data, QHostAddress senderAddr, quint16 senderPort);
-    void tunnelDead(uint32_t peerId);
+    void transportDead(uint32_t peerId, VLan::TrafficClass cls);
 
 private slots:
     void onTunPacketReceived(QByteArray packet);
@@ -75,14 +80,18 @@ private slots:
 private:
     void routeFromTun(const QByteArray& ipPacket);
     void routeToTun(const QByteArray& ipPacket);
+    void sendUdpDatagram(const QByteArray& datagram,
+                         const QHostAddress& addr, quint16 port);
+    void markTransportDead(uint32_t peerId, TrafficClass cls);
+    void flushPendingTransportDead();
 
     TunAdapter*             m_tun;
     QUdpSocket*             m_udpSocket;
     QTimer*                 m_kcpTimer;
     QTimer*                 m_udpKeepaliveTimer;
 
-    QMap<uint32_t, P2PPeer*> m_peerById;
-    QMap<uint32_t, P2PPeer*> m_peerByVIP;
+    QMap<uint32_t, PeerConnection*> m_peerById;
+    QMap<uint32_t, PeerConnection*> m_peerByVIP;
 
     struct EndpointKey {
         quint32 ip; quint16 port;
@@ -92,12 +101,26 @@ private:
     };
     QMap<EndpointKey, KcpTunnel*> m_endpointToKcp;
 
+    struct TransportKey {
+        uint32_t peerId;
+        TrafficClass cls;
+        bool operator<(const TransportKey& o) const {
+            return (peerId < o.peerId) ||
+                   (peerId == o.peerId && static_cast<int>(cls) < static_cast<int>(o.cls));
+        }
+    };
+    QMap<TransportKey, bool> m_pendingTransportDead;
+
     QHostAddress m_serverAddr;
-    quint16      m_serverStunPort;
+    quint16      m_serverUdpPort;
     uint32_t     m_myPeerId;
     uint32_t     m_myVirtualIP;
     quint64      m_tunUploadBytes;
     quint64      m_tunDownloadBytes;
+    bool         m_secureUdpEnabled;
+    uint32_t     m_secureSessionId;
+    QByteArray   m_secureMaster;
+    SecureFrameCipher m_udpCipher;
 };
 
 } // namespace VLan

@@ -11,7 +11,7 @@ CXXFLAGS = -std=c++11 -O2 -Wall -Wextra \
            -I../../3rdparty/monocypher \
            -I../../3rdparty/cm256cc \
            -DWIN32_LEAN_AND_MEAN -DUSE_SSSE3 -mssse3
-LDFLAGS  = -lws2_32 -liphlpapi -static
+LDFLAGS  = -lws2_32 -liphlpapi -lbcrypt -static
 
 SHARED_SRC = ../src
 KCP_DIR    = ../../3rdparty/kcp

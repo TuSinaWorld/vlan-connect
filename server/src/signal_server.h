@@ -1,17 +1,17 @@
-﻿#ifndef VLAN_SIGNAL_SERVER_H
+#ifndef VLAN_SIGNAL_SERVER_H
 #define VLAN_SIGNAL_SERVER_H
 
 #include "protocol.h"
 #include "byte_buffer.h"
 #include "net_common.h"
 #include "room.h"
-#include "stun_server.h"
 #include "relay_server.h"
 
 #include <map>
 #include <vector>
 #include <cstdint>
 #include <string>
+#include <set>
 
 namespace VLan {
 
@@ -19,6 +19,9 @@ class SignalServer {
 public:
     SignalServer();
     ~SignalServer();
+
+    void setAuthPassword(const std::string& password);
+    bool authEnabled() const { return m_authEnabled; }
 
     bool init(uint16_t port = DEFAULT_PORT);
     void run();
@@ -43,27 +46,55 @@ private:
                         const uint8_t* payload, size_t len);
     void processDataMessage(ClientSession& client, uint8_t msgType,
                             const uint8_t* payload, size_t len);
+    void onClientHello(ClientSession& c, const uint8_t* p, size_t len);
+    void onServerAuth(ClientSession& c, const uint8_t* p, size_t len);
     void onLogin(ClientSession& c, const uint8_t* p, size_t len);
     void onCreateRoom(ClientSession& c, const uint8_t* p, size_t len);
     void onJoinRoom(ClientSession& c, const uint8_t* p, size_t len);
+    void onResumeRoom(ClientSession& c, const uint8_t* p, size_t len);
     void onAuthResponse(ClientSession& c, const uint8_t* p, size_t len);
     void completeJoin(ClientSession& c, Room* room);
+    void completeResume(ClientSession& c, Room* room, RoomLease* lease);
     void onLeaveRoom(ClientSession& c);
+    void onLogout(ClientSession& c);
     void onListRooms(ClientSession& c);
-    void onNatReport(ClientSession& c, const uint8_t* p, size_t len);
-    void onPunchResult(ClientSession& c, const uint8_t* p, size_t len);
     void onRequestRelay(ClientSession& c, const uint8_t* p, size_t len);
     void onPing(ClientSession& c);
     void onTcpRelayData(ClientSession& c, const uint8_t* p, size_t len);
     void onDataChannelInit(int fd, const uint8_t* p, size_t len);
+    void onSecureDataChannelInit(int fd, const uint8_t* p, size_t len);
+    ByteBuffer buildRoomListPayload();
+    void broadcastRoomListPush();
 
     void sendMsg(int fd, uint8_t msgType, const ByteBuffer& body);
     void sendMsg(int fd, uint8_t msgType);
+    void sendClientMsg(ClientSession& c, uint8_t msgType, const ByteBuffer& body);
+    void sendClientMsg(ClientSession& c, uint8_t msgType);
     void sendDataMsg(ClientSession& c, uint8_t msgType, const ByteBuffer& body);
     void sendError(int fd, const std::string& text);
     void broadcastToRoom(uint32_t roomId, uint8_t msgType,
                          const ByteBuffer& body, uint32_t excludePeerId = 0);
-    void notifyPunchPeers(ClientSession& c);
+    void notifyRelayPeers(ClientSession& c);
+    void sendRelayReady(ClientSession& c, uint32_t peerId);
+    uint32_t allocatePeerId();
+    void releasePeerId(uint32_t peerId);
+    void generateLeaseToken(uint8_t token[RECONNECT_TOKEN_SIZE]);
+    bool validateResumeLease(uint32_t roomId, uint32_t peerId,
+                             const uint8_t token[RECONNECT_TOKEN_SIZE],
+                             Room** roomOut, RoomLease** leaseOut);
+    void sendJoinResponse(ClientSession& c, Room* room,
+                          const uint8_t token[RECONNECT_TOKEN_SIZE]);
+    void markSessionOffline(ClientSession& c);
+    void closeClientForTakeover(ClientSession& c);
+    void cleanupExpiredLeases(time_t now);
+    bool decryptClientFrame(ClientSession& c, const uint8_t* payload, size_t len,
+                            uint8_t* innerType, std::vector<uint8_t>* innerPayload);
+    ByteBuffer encryptForClient(ClientSession& c, uint8_t msgType, const ByteBuffer& body);
+    bool decryptUdpPacket(const uint8_t* data, size_t len, ClientSession** src,
+                          std::vector<uint8_t>* plain);
+    void sendEncryptedUdp(int udpFd, ClientSession& dst,
+                          const std::vector<uint8_t>& plain,
+                          const struct sockaddr_in& dstAddr);
 
     void flushSendBuf(ClientSession& c);
     void flushDataSendBuf(ClientSession& c);
@@ -72,7 +103,7 @@ private:
 
     int  m_epfd;
     int  m_tcpListenFd;
-    int  m_stunFd;
+    int  m_udpFd;
     bool m_running;
 
     struct PendingConn {
@@ -87,6 +118,10 @@ private:
     std::map<uint32_t, ClientSession*> m_peerMap;
     RoomManager                        m_rooms;
     uint32_t                           m_nextPeerId;
+    std::set<uint32_t>                 m_freePeerIds;
+    bool                               m_authEnabled;
+    uint8_t                            m_serverAuthHash[32];
+    std::map<uint32_t, ClientSession*> m_secureSessionMap;
 };
 
 } // namespace VLan

@@ -1,9 +1,10 @@
-﻿#include "signal_server.h"
+#include "signal_server.h"
 #include "server_logger.h"
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <csignal>
+#include <fstream>
 
 static VLan::SignalServer* g_server = nullptr;
 
@@ -16,6 +17,8 @@ static void usage(const char* prog) {
         "  -p PORT   Listen port (TCP+UDP)   (default %u)\n"
         "  -l PATH   Log file path           (default: stdout only)\n"
         "  -L SIZE   Max log file MB         (default: 10)\n"
+        "  --auth-file PATH  Read server auth password from file\n"
+        "  --auth PASSWORD   Set server auth password (testing only)\n"
         "  -v        Verbose/detail log\n"
         "  -h        Show this help\n",
         prog,
@@ -25,6 +28,7 @@ static void usage(const char* prog) {
 int main(int argc, char* argv[]) {
     uint16_t port = VLan::DEFAULT_PORT;
     std::string logPath;
+    std::string authPassword;
     size_t logMaxMB = 10;
     bool verbose = false;
 
@@ -51,6 +55,20 @@ int main(int argc, char* argv[]) {
                 return 1;
             }
             logMaxMB = static_cast<size_t>(val);
+        } else if (strcmp(argv[i], "--auth-file") == 0 && i + 1 < argc) {
+            std::ifstream in(argv[++i], std::ios::in | std::ios::binary);
+            if (!in) {
+                fprintf(stderr, "Error: cannot read auth file '%s'\n", argv[i]);
+                return 1;
+            }
+            std::getline(in, authPassword);
+            while (!authPassword.empty() &&
+                   (authPassword.back() == '\r' || authPassword.back() == '\n' ||
+                    authPassword.back() == ' ' || authPassword.back() == '\t')) {
+                authPassword.pop_back();
+            }
+        } else if (strcmp(argv[i], "--auth") == 0 && i + 1 < argc) {
+            authPassword = argv[++i];
         } else if (strcmp(argv[i], "-v") == 0) {
             verbose = true;
         } else {
@@ -66,6 +84,11 @@ int main(int argc, char* argv[]) {
     VLan::sock_init();
 
     VLan::SignalServer server;
+    const char* envAuth = getenv("VLAN_SERVER_AUTH_PASSWORD");
+    if (authPassword.empty() && envAuth && envAuth[0] != '\0')
+        authPassword = envAuth;
+    if (!authPassword.empty())
+        server.setAuthPassword(authPassword);
     g_server = &server;
 
     signal(SIGINT,  signalHandler);
@@ -76,10 +99,11 @@ int main(int argc, char* argv[]) {
         return 1;
     }
 
-    LOG_INFO("VLan Server started (port=%u log=%s maxLogMB=%zu verbose=%s)",
+    LOG_INFO("VLan Server started (port=%u log=%s maxLogMB=%zu verbose=%s auth=%s)",
              port,
              logPath.empty() ? "stdout" : logPath.c_str(),
-             logMaxMB, verbose ? "yes" : "no");
+             logMaxMB, verbose ? "yes" : "no",
+             server.authEnabled() ? "enabled" : "disabled");
 
     server.run();
     LOG_INFO("Server stopped.");

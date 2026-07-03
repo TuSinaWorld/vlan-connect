@@ -1,20 +1,47 @@
-﻿[Unit]
-Description=VLan Server - Virtual LAN P2P Network Service
+[Unit]
+Description=VLan Server
+Documentation=file:/usr/local/share/doc/vlan-server/DEPLOY.md
 After=network-online.target
 Wants=network-online.target
 
 [Service]
 Type=simple
-ExecStart=/usr/local/bin/vlan-server -p 11510 -l /var/log/vlan-server.log -L 10
+WorkingDirectory=/var/lib/vlan-server
+
+Environment=VLAN_SERVER_PORT=11510
+Environment=VLAN_SERVER_LOG=/var/log/vlan-server/server.log
+Environment=VLAN_SERVER_LOG_MAX_MB=10
+Environment=VLAN_SERVER_AUTH_FILE=/usr/local/bin/auth.password
+Environment=VLAN_SERVER_EXTRA_ARGS=
+EnvironmentFile=-/usr/local/bin/vlan-server.env
+
+ExecStart=/usr/local/bin/vlan-server -p ${VLAN_SERVER_PORT} -l ${VLAN_SERVER_LOG} -L ${VLAN_SERVER_LOG_MAX_MB} --auth-file ${VLAN_SERVER_AUTH_FILE} -v $VLAN_SERVER_EXTRA_ARGS
+
 Restart=on-failure
-RestartSec=5
-StandardOutput=journal
-StandardError=journal
-LimitNOFILE=65535
+RestartSec=3
 KillSignal=SIGTERM
 TimeoutStopSec=10
+LimitNOFILE=65535
+UMask=0077
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=vlan-server
+
+RuntimeDirectory=vlan-server
+StateDirectory=vlan-server
+LogsDirectory=vlan-server
+ReadWritePaths=/var/log/vlan-server /var/lib/vlan-server
+
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=true
+ProtectControlGroups=true
+ProtectKernelModules=true
+ProtectKernelTunables=true
+RestrictAddressFamilies=AF_INET AF_INET6
+LockPersonality=true
 
 [Install]
 WantedBy=multi-user.target
-
-#example.invalid:11510

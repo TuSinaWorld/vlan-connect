@@ -1,27 +1,22 @@
-﻿#include "cli_peer.h"
+#include "cli_peer.h"
 #include "cli_log.h"
 #include <cstring>
 #include <algorithm>
-#include <random>
-
-extern "C" {
-#include "monocypher.h"
-}
 
 namespace VLan {
-
-// ======================== CliKcpTunnel ========================
 
 static const char KCP_KEEPALIVE_MARKER = 0x00;
 
 CliKcpTunnel::CliKcpTunnel(uint32_t conv, UdpSendFunc udpSend,
                            uint32_t peerIP, uint16_t peerPort,
-                           FecMode fecMode,
-                           uint16_t mtu)
-    : m_udpSend(udpSend), m_peerIP(peerIP), m_peerPort(peerPort),
+                           FecMode fecMode, uint16_t mtu,
+                           KcpProfile profile, TrafficClass trafficClass,
+                           bool secureFrames)
+    : m_kcp(nullptr), m_udpSend(udpSend), m_peerIP(peerIP), m_peerPort(peerPort),
+      m_trafficClass(trafficClass), m_profile(profile),
       m_relayMode(false), m_relaySrcPeerId(0), m_relayDstPeerId(0),
-      m_dead(false),
-      m_fecMode(fecMode), m_fecEncoder(nullptr), m_fecDecoder(nullptr)
+      m_dead(false), m_fecMode(fecMode),
+      m_fecEncoder(nullptr), m_fecDecoder(nullptr)
 {
     uint32_t now = currentTimeMs();
     m_lastRecvTime = now;
@@ -29,11 +24,18 @@ CliKcpTunnel::CliKcpTunnel(uint32_t conv, UdpSendFunc udpSend,
 
     m_kcp = ikcp_create(conv, this);
     m_kcp->output = kcpOutput;
-    ikcp_setmtu(m_kcp, kcpMtuFromRoomMtu(mtu));
-    ikcp_nodelay(m_kcp, 1, 10, 2, 1);
-    ikcp_wndsize(m_kcp, 256, 256);
-    m_kcp->rx_minrto = 10;
-    m_kcp->fastresend = 2;
+    ikcp_setmtu(m_kcp, kcpMtuFromRoomMtu(mtu, m_fecMode != FEC_NONE, secureFrames));
+    if (m_profile == KCP_PROFILE_BULK) {
+        ikcp_nodelay(m_kcp, 1, 20, 4, 0);
+        ikcp_wndsize(m_kcp, 1024, 1024);
+        m_kcp->rx_minrto = 30;
+        m_kcp->fastresend = 4;
+    } else {
+        ikcp_nodelay(m_kcp, 1, 10, 2, 1);
+        ikcp_wndsize(m_kcp, 256, 256);
+        m_kcp->rx_minrto = 10;
+        m_kcp->fastresend = 2;
+    }
 
     if (m_fecMode != FEC_NONE) {
         m_fecEncoder = new CliFecEncoder(m_fecMode,
@@ -67,7 +69,9 @@ void CliKcpTunnel::sendKcpPacket(const Buffer& payload) {
     Buffer pkt;
     if (m_relayMode) {
         UdpRelayHeader hdr;
-        hdr.type      = UDP_RELAY_DATA;
+        memset(&hdr, 0, sizeof(hdr));
+        hdr.type = UDP_RELAY_DATA;
+        hdr.trafficClass = static_cast<uint8_t>(m_trafficClass);
         hdr.srcPeerId = htonl(m_relaySrcPeerId);
         hdr.dstPeerId = htonl(m_relayDstPeerId);
         pkt.reserve(sizeof(hdr) + payload.size());
@@ -95,6 +99,8 @@ void CliKcpTunnel::feedInput(const char* data, int len) {
 }
 
 int CliKcpTunnel::send(const Buffer& data) {
+    if (m_profile == KCP_PROFILE_BULK && ikcp_waitsnd(m_kcp) > 2048)
+        return -1;
     return ikcp_send(m_kcp, reinterpret_cast<const char*>(data.data()),
                      static_cast<int>(data.size()));
 }
@@ -132,30 +138,26 @@ void CliKcpTunnel::setRelayMode(uint32_t srcPeerId, uint32_t dstPeerId) {
     m_relayDstPeerId = dstPeerId;
 }
 
-bool CliKcpTunnel::isAlive() const {
-    if (m_dead) return false;
-    return (currentTimeMs() - m_lastRecvTime) < static_cast<uint32_t>(KCP_DEAD_TIMEOUT_MS);
-}
-
 int CliKcpTunnel::getRttMs() const {
     return m_kcp ? m_kcp->rx_srtt : -1;
 }
-
-// ======================== CliRawUdpTunnel ========================
 
 static const char RAW_UDP_KEEPALIVE_MARKER = 0x00;
 static const uint8_t RAW_UDP_LATENCY_PING = 0x01;
 static const uint8_t RAW_UDP_LATENCY_PONG = 0x02;
 
 CliRawUdpTunnel::CliRawUdpTunnel(UdpSendFunc udpSend,
-                                   uint32_t peerIP, uint16_t peerPort,
-                                   FecMode fecMode,
-                                   uint16_t mtu)
+                                 uint32_t peerIP, uint16_t peerPort,
+                                 FecMode fecMode, uint16_t mtu,
+                                 TrafficClass trafficClass,
+                                 bool secureFrames)
     : m_udpSend(udpSend), m_peerIP(peerIP), m_peerPort(peerPort),
+      m_trafficClass(trafficClass),
       m_relayMode(false), m_relaySrcPeerId(0), m_relayDstPeerId(0),
       m_nextMsgId(0), m_dead(false), m_rttMs(-1),
       m_fecMode(fecMode), m_fecEncoder(nullptr), m_fecDecoder(nullptr),
-      m_roomMtu(normalizeRoomMtu(mtu))
+      m_roomMtu(normalizeRoomMtu(mtu)),
+      m_secureFrames(secureFrames)
 {
     uint32_t now = currentTimeMs();
     m_lastRecvTime = now;
@@ -197,14 +199,14 @@ int CliRawUdpTunnel::send(const Buffer& ipPacket) {
 }
 
 void CliRawUdpTunnel::sendFragment(const char* data, int len,
-                                    uint8_t fragIndex, uint8_t fragTotal,
-                                    uint16_t msgId, uint16_t totalLen)
+                                   uint8_t fragIndex, uint8_t fragTotal,
+                                   uint16_t msgId, uint16_t totalLen)
 {
     FragHeader fh;
-    fh.msgId     = htons(msgId);
+    fh.msgId = htons(msgId);
     fh.fragIndex = fragIndex;
     fh.fragTotal = fragTotal;
-    fh.totalLen  = htons(totalLen);
+    fh.totalLen = htons(totalLen);
 
     Buffer innerPayload;
     innerPayload.reserve(sizeof(fh) + len);
@@ -222,7 +224,9 @@ void CliRawUdpTunnel::sendRawPacket(const Buffer& payload) {
     Buffer pkt;
     if (m_relayMode) {
         UdpRelayHeader hdr;
-        hdr.type      = UDP_RAW_RELAY_DATA;
+        memset(&hdr, 0, sizeof(hdr));
+        hdr.type = UDP_RAW_RELAY_DATA;
+        hdr.trafficClass = static_cast<uint8_t>(m_trafficClass);
         hdr.srcPeerId = htonl(m_relaySrcPeerId);
         hdr.dstPeerId = htonl(m_relayDstPeerId);
         pkt.reserve(sizeof(hdr) + payload.size());
@@ -252,10 +256,10 @@ void CliRawUdpTunnel::feedInput(const char* data, int len) {
 void CliRawUdpTunnel::processFrag(const char* data, int len) {
     if (len < static_cast<int>(sizeof(FragHeader))) return;
     const FragHeader* fh = reinterpret_cast<const FragHeader*>(data);
-    uint16_t msgId     = ntohs(fh->msgId);
-    uint8_t  fragIndex = fh->fragIndex;
-    uint8_t  fragTotal = fh->fragTotal;
-    uint16_t totalLen  = ntohs(fh->totalLen);
+    uint16_t msgId = ntohs(fh->msgId);
+    uint8_t fragIndex = fh->fragIndex;
+    uint8_t fragTotal = fh->fragTotal;
+    uint16_t totalLen = ntohs(fh->totalLen);
 
     const char* payload = data + sizeof(FragHeader);
     int payloadLen = len - sizeof(FragHeader);
@@ -277,7 +281,7 @@ void CliRawUdpTunnel::processFrag(const char* data, int len) {
         if (probeType == RAW_UDP_LATENCY_PONG) {
             uint32_t sentTs = (static_cast<uint8_t>(payload[1]) << 24) |
                               (static_cast<uint8_t>(payload[2]) << 16) |
-                              (static_cast<uint8_t>(payload[3]) << 8)  |
+                              (static_cast<uint8_t>(payload[3]) << 8) |
                                static_cast<uint8_t>(payload[4]);
             m_rttMs = static_cast<int>(currentTimeMs() - sentTs);
             if (m_rttMs < 0) m_rttMs = 0;
@@ -292,10 +296,10 @@ void CliRawUdpTunnel::processFrag(const char* data, int len) {
 
     ReassemblyEntry& entry = m_reassembly[msgId];
     if (entry.fragments.empty()) {
-        entry.totalLen      = totalLen;
-        entry.fragTotal     = fragTotal;
+        entry.totalLen = totalLen;
+        entry.fragTotal = fragTotal;
         entry.receivedCount = 0;
-        entry.createTime    = currentTimeMs();
+        entry.createTime = currentTimeMs();
     }
     if (entry.fragments.find(fragIndex) == entry.fragments.end()) {
         entry.fragments[fragIndex] = Buffer(payload, payload + payloadLen);
@@ -351,10 +355,8 @@ void CliRawUdpTunnel::cleanupStaleEntries() {
 }
 
 int CliRawUdpTunnel::maxFragmentPayload() const {
-    int payload = static_cast<int>(normalizeRoomMtu(m_roomMtu)) + CIPHER_OVERHEAD;
-    if (payload > RAW_UDP_MAX_FRAG_PAYLOAD)
-        payload = RAW_UDP_MAX_FRAG_PAYLOAD;
-    return payload;
+    return transportPayloadBudget(m_roomMtu, MODE_RELAY_RAW_UDP,
+                                  m_fecMode != FEC_NONE, m_secureFrames);
 }
 
 void CliRawUdpTunnel::setRelayMode(uint32_t srcPeerId, uint32_t dstPeerId) {
@@ -363,277 +365,251 @@ void CliRawUdpTunnel::setRelayMode(uint32_t srcPeerId, uint32_t dstPeerId) {
     m_relayDstPeerId = dstPeerId;
 }
 
-bool CliRawUdpTunnel::isAlive() const {
-    if (m_dead) return false;
-    return (currentTimeMs() - m_lastRecvTime) < static_cast<uint32_t>(RAW_UDP_DEAD_TIMEOUT_MS);
-}
-
-// ======================== CliP2PPeer ========================
-
-CliP2PPeer::CliP2PPeer(uint32_t peerId, uint32_t virtualIP, const std::string& name)
-    : m_peerId(peerId), m_virtualIP(virtualIP), m_name(name),
-      m_natType(NAT_UNKNOWN), m_transport(TRANSPORT_NONE),
-      m_publicIP(0), m_publicPort(0),
-      m_kcpTunnel(nullptr), m_rawUdpTunnel(nullptr),
-      m_tcpRelayLastRecv(currentTimeMs()),
-      m_tcpRelayLastSend(currentTimeMs()),
-      m_tcpRtt(-1), m_latencyPingSentTime(0),
-      m_hasCipher(false), m_myPeerId(0), m_sendCounter(0),
-      m_recvMaxCounter(0), m_replayActive(false)
+CliPeerConnection::CliPeerConnection(uint32_t peerId, uint32_t virtualIP,
+                                     const std::string& name)
+    : m_peerId(peerId), m_virtualIP(virtualIP), m_name(name)
 {
-    memset(m_cipherKey, 0, CIPHER_KEY_SIZE);
-    memset(m_sessionSeed, 0, CIPHER_SESSION_SEED_SIZE);
-    memset(m_replayBitmap, 0, sizeof(m_replayBitmap));
+    uint32_t now = currentTimeMs();
+    for (int i = 0; i < 3; ++i) {
+        m_transport[i] = TRANSPORT_NONE;
+        m_kcpTunnel[i] = nullptr;
+        m_rawUdpTunnel[i] = nullptr;
+        m_tcpRelayLastRecv[i] = now;
+        m_tcpRelayLastSend[i] = now;
+        m_rtt[i] = -1;
+        m_latencyPingSentTime[i] = 0;
+        m_latencyLastReply[i] = 0;
+    }
 }
 
-CliP2PPeer::~CliP2PPeer() {}
+CliPeerConnection::~CliPeerConnection() {}
 
-void CliP2PPeer::setKcpTunnel(CliKcpTunnel* tunnel) {
-    m_kcpTunnel = tunnel;
+TransportType CliPeerConnection::transport(TrafficClass cls) const {
+    int idx = static_cast<int>(cls);
+    if (idx < 0 || idx > 2) idx = TRAFFIC_UDP;
+    return m_transport[idx];
+}
+
+void CliPeerConnection::setKcpTunnel(TrafficClass cls, CliKcpTunnel* tunnel) {
+    int idx = static_cast<int>(cls);
+    if (idx < 0 || idx > 2) idx = TRAFFIC_UDP;
+    m_kcpTunnel[idx] = tunnel;
     if (tunnel) {
-        tunnel->setOnDataReceived([this](const Buffer& data) {
-            onTunnelDataReceived(data);
+        tunnel->setOnDataReceived([this, cls](const Buffer& data) {
+            onTunnelDataReceived(cls, data);
         });
     }
 }
 
-void CliP2PPeer::setRawUdpTunnel(CliRawUdpTunnel* tunnel) {
-    m_rawUdpTunnel = tunnel;
+CliKcpTunnel* CliPeerConnection::kcpTunnel(TrafficClass cls) const {
+    int idx = static_cast<int>(cls);
+    if (idx < 0 || idx > 2) idx = TRAFFIC_UDP;
+    return m_kcpTunnel[idx];
+}
+
+void CliPeerConnection::clearKcpTunnel(TrafficClass cls) {
+    int idx = static_cast<int>(cls);
+    if (idx < 0 || idx > 2) idx = TRAFFIC_UDP;
+    m_kcpTunnel[idx] = nullptr;
+}
+
+void CliPeerConnection::setRawUdpTunnel(TrafficClass cls, CliRawUdpTunnel* tunnel) {
+    int idx = static_cast<int>(cls);
+    if (idx < 0 || idx > 2) idx = TRAFFIC_UDP;
+    m_rawUdpTunnel[idx] = tunnel;
     if (tunnel) {
-        tunnel->setOnDataReceived([this](const Buffer& data) {
-            onTunnelDataReceived(data);
+        tunnel->setOnDataReceived([this, cls](const Buffer& data) {
+            onTunnelDataReceived(cls, data);
         });
     }
 }
 
-void CliP2PPeer::setCipherKey(const uint8_t key[CIPHER_KEY_SIZE],
-                              uint32_t myPeerId,
-                              const uint8_t sessionSeed[CIPHER_SESSION_SEED_SIZE]) {
-    memcpy(m_cipherKey, key, CIPHER_KEY_SIZE);
-    memcpy(m_sessionSeed, sessionSeed, CIPHER_SESSION_SEED_SIZE);
-    m_myPeerId = myPeerId;
-    m_sendCounter = 0;
-    resetReplayState();
-    m_hasCipher = true;
+CliRawUdpTunnel* CliPeerConnection::rawUdpTunnel(TrafficClass cls) const {
+    int idx = static_cast<int>(cls);
+    if (idx < 0 || idx > 2) idx = TRAFFIC_UDP;
+    return m_rawUdpTunnel[idx];
 }
 
-void CliP2PPeer::resetReplayState() {
-    m_recvMaxCounter = 0;
-    m_replayActive = false;
-    memset(m_replayBitmap, 0, sizeof(m_replayBitmap));
+void CliPeerConnection::clearRawUdpTunnel(TrafficClass cls) {
+    int idx = static_cast<int>(cls);
+    if (idx < 0 || idx > 2) idx = TRAFFIC_UDP;
+    m_rawUdpTunnel[idx] = nullptr;
 }
 
-bool CliP2PPeer::checkAndRecordCounter(uint32_t counter) {
-    if (!m_replayActive) {
-        m_recvMaxCounter = 0;
-        m_replayActive = true;
-        memset(m_replayBitmap, 0, sizeof(m_replayBitmap));
-    }
+void CliPeerConnection::setTransport(TrafficClass cls, TransportType t) {
+    int idx = static_cast<int>(cls);
+    if (idx < 0 || idx > 2) idx = TRAFFIC_UDP;
+    m_transport[idx] = t;
+}
 
-    if (m_recvMaxCounter >= static_cast<uint32_t>(REPLAY_WINDOW_SIZE) &&
-        counter <= m_recvMaxCounter - static_cast<uint32_t>(REPLAY_WINDOW_SIZE))
-        return false;
+void CliPeerConnection::clearTransport(TrafficClass cls) {
+    int idx = static_cast<int>(cls);
+    if (idx < 0 || idx > 2) idx = TRAFFIC_UDP;
+    uint32_t now = currentTimeMs();
+    m_transport[idx] = TRANSPORT_NONE;
+    m_tcpRelayLastRecv[idx] = now;
+    m_tcpRelayLastSend[idx] = now;
+    m_rtt[idx] = -1;
+    m_latencyPingSentTime[idx] = 0;
+    m_latencyLastReply[idx] = 0;
+}
 
-    if (counter > m_recvMaxCounter) {
-        uint32_t shift = counter - m_recvMaxCounter;
-        if (shift >= static_cast<uint32_t>(REPLAY_WINDOW_SIZE)) {
-            memset(m_replayBitmap, 0, sizeof(m_replayBitmap));
-        } else {
-            for (uint32_t i = 0; i < shift; ++i) {
-                uint32_t pos = (m_recvMaxCounter + i + 1) % REPLAY_WINDOW_SIZE;
-                uint8_t bit = static_cast<uint8_t>(1u << (pos % 8));
-                m_replayBitmap[pos / 8] =
-                    static_cast<uint8_t>(m_replayBitmap[pos / 8] & ~bit);
-            }
+void CliPeerConnection::onTunnelDataReceived(TrafficClass cls, const Buffer& data) {
+    if (handleLatencyProbe(cls, data))
+        return;
+    if (m_onData) m_onData(m_peerId, data);
+}
+
+int CliPeerConnection::sendData(const Buffer& ipPacket) {
+    TrafficClass cls = trafficClassFromIpPacket(ipPacket.data(), ipPacket.size());
+    int idx = static_cast<int>(cls);
+    if (idx < 0 || idx > 2) idx = TRAFFIC_UDP;
+    TransportType t = m_transport[idx];
+    if (t == TRANSPORT_NONE) return -1;
+
+    if (t == TRANSPORT_RELAY_TCP) {
+        if (m_tcpSender) {
+            m_tcpSender(m_peerId, cls, ipPacket);
+            return static_cast<int>(ipPacket.size());
         }
-        m_recvMaxCounter = counter;
-    }
-
-    uint32_t pos = counter % REPLAY_WINDOW_SIZE;
-    uint8_t bit = static_cast<uint8_t>(1u << (pos % 8));
-    if (m_replayBitmap[pos / 8] & bit)
-        return false;
-    m_replayBitmap[pos / 8] =
-        static_cast<uint8_t>(m_replayBitmap[pos / 8] | bit);
-    return true;
-}
-
-static void buildNonce(uint8_t nonce[CIPHER_NONCE_SIZE],
-                       uint32_t peerId, uint32_t counter,
-                       const uint8_t sessionSeed[CIPHER_SESSION_SEED_SIZE]) {
-    memcpy(nonce,     &peerId,      4);
-    memcpy(nonce + 4, &counter,     4);
-    memcpy(nonce + 8, sessionSeed, CIPHER_SESSION_SEED_SIZE);
-}
-
-static bool parseEncryptedPacket(const Buffer& encPacket,
-                                 int& ihl, int& cipherLen,
-                                 uint32_t& counter) {
-    if (encPacket.size() < 20) return false;
-    ihl = (encPacket[0] & 0x0F) * 4;
-    if (ihl < 20 || encPacket.size() < static_cast<size_t>(ihl + CIPHER_OVERHEAD))
-        return false;
-    cipherLen = static_cast<int>(encPacket.size()) - ihl
-        - CIPHER_CTR_SIZE - CIPHER_MAC_SIZE;
-    if (cipherLen <= 0) return false;
-    memcpy(&counter, encPacket.data() + ihl, CIPHER_CTR_SIZE);
-    return true;
-}
-
-Buffer cliEncryptPacket(const Buffer& ipPacket, uint8_t key[CIPHER_KEY_SIZE],
-                            uint32_t myPeerId, uint32_t& sendCounter,
-                            const uint8_t sessionSeed[CIPHER_SESSION_SEED_SIZE]) {
-    if (sendCounter >= 0xFFFFFFF0u) return Buffer();
-    if (ipPacket.size() < 20) return ipPacket;
-    int ihl = (ipPacket[0] & 0x0F) * 4;
-    if (ihl < 20 || ihl > static_cast<int>(ipPacket.size())) return ipPacket;
-    int payloadLen = static_cast<int>(ipPacket.size()) - ihl;
-    if (payloadLen <= 0) return ipPacket;
-
-    uint32_t ctr = sendCounter++;
-    uint8_t nonce[CIPHER_NONCE_SIZE];
-    buildNonce(nonce, myPeerId, ctr, sessionSeed);
-
-    Buffer out(ihl + CIPHER_CTR_SIZE + payloadLen + CIPHER_MAC_SIZE);
-    memcpy(out.data(), ipPacket.data(), ihl);
-    memcpy(out.data() + ihl, &ctr, CIPHER_CTR_SIZE);
-
-    uint8_t* cipherOut = out.data() + ihl + CIPHER_CTR_SIZE;
-    uint8_t* macOut    = cipherOut + payloadLen;
-
-    crypto_aead_lock(cipherOut, macOut,
-                     key, nonce,
-                     ipPacket.data(), ihl,
-                     ipPacket.data() + ihl, payloadLen);
-    return out;
-}
-
-Buffer cliDecryptPacket(const Buffer& encPacket, uint8_t key[CIPHER_KEY_SIZE],
-                            uint32_t senderPeerId,
-                            const uint8_t sessionSeed[CIPHER_SESSION_SEED_SIZE]) {
-    int ihl = 0;
-    int cipherLen = 0;
-    uint32_t ctr;
-    if (!parseEncryptedPacket(encPacket, ihl, cipherLen, ctr))
-        return Buffer();
-
-    uint8_t nonce[CIPHER_NONCE_SIZE];
-    buildNonce(nonce, senderPeerId, ctr, sessionSeed);
-
-    const uint8_t* cipherData = encPacket.data() + ihl + CIPHER_CTR_SIZE;
-    const uint8_t* mac = cipherData + cipherLen;
-
-    Buffer out(ihl + cipherLen);
-    memcpy(out.data(), encPacket.data(), ihl);
-
-    int rc = crypto_aead_unlock(out.data() + ihl, mac,
-                                key, nonce,
-                                encPacket.data(), ihl,
-                                cipherData, cipherLen);
-    if (rc != 0) return Buffer();
-    return out;
-}
-
-Buffer CliP2PPeer::decryptData(const Buffer& data) {
-    if (!m_hasCipher || data.size() < 20 || (data[0] & 0xF0) != 0x40)
-        return data;
-
-    int ihl = 0;
-    int cipherLen = 0;
-    uint32_t counter = 0;
-    if (!parseEncryptedPacket(data, ihl, cipherLen, counter))
-        return Buffer();
-
-    Buffer pkt = cliDecryptPacket(data, m_cipherKey, m_peerId, m_sessionSeed);
-    if (pkt.empty()) return Buffer();
-
-    if (!checkAndRecordCounter(counter)) {
-        LOG_DBG("Dropped replayed encrypted packet from peer %u counter=%u",
-                m_peerId, counter);
-        return Buffer();
-    }
-    return pkt;
-}
-
-void CliP2PPeer::onTunnelDataReceived(const Buffer& data) {
-    Buffer pkt = decryptData(data);
-    if (pkt.empty()) return;
-    if (m_onData) m_onData(m_peerId, pkt);
-}
-
-int CliP2PPeer::sendData(const Buffer& ipPacket) {
-    if (m_transport == TRANSPORT_NONE) return -1;
-
-    Buffer pkt = ipPacket;
-    if (m_hasCipher)
-        pkt = cliEncryptPacket(pkt, m_cipherKey, m_myPeerId, m_sendCounter, m_sessionSeed);
-
-    if (m_transport == TRANSPORT_RELAY_TCP) {
-        if (m_tcpSender) { m_tcpSender(m_peerId, pkt); return static_cast<int>(pkt.size()); }
         return -1;
     }
-    if (m_transport == TRANSPORT_RELAY_RAW_UDP) {
-        if (!m_rawUdpTunnel) return -1;
-        return m_rawUdpTunnel->send(pkt);
+    if (t == TRANSPORT_RELAY_RAW_UDP) {
+        if (!m_rawUdpTunnel[idx]) return -1;
+        return m_rawUdpTunnel[idx]->send(ipPacket);
     }
-    if (!m_kcpTunnel) return -1;
-    return m_kcpTunnel->send(pkt);
+    if (!m_kcpTunnel[idx]) return -1;
+    return m_kcpTunnel[idx]->send(ipPacket);
 }
 
-void CliP2PPeer::sendTcpRelayKeepalive() {
-    if (m_transport != TRANSPORT_RELAY_TCP || !m_tcpSender) return;
+void CliPeerConnection::onTcpRelayDataReceived(TrafficClass cls) {
+    int idx = static_cast<int>(cls);
+    if (idx < 0 || idx > 2) idx = TRAFFIC_TCP;
+    m_tcpRelayLastRecv[idx] = currentTimeMs();
+}
+
+void CliPeerConnection::sendTcpRelayKeepalive() {
     uint32_t now = currentTimeMs();
-    if (now - m_tcpRelayLastSend >= static_cast<uint32_t>(TCP_RELAY_KEEPALIVE_MS)) {
-        m_tcpSender(m_peerId, Buffer());
-        m_tcpRelayLastSend = now;
+    for (int idx = TRAFFIC_TCP; idx <= TRAFFIC_UDP; ++idx) {
+        if (m_transport[idx] != TRANSPORT_RELAY_TCP || !m_tcpSender) continue;
+        if (now - m_tcpRelayLastSend[idx] >= static_cast<uint32_t>(TCP_RELAY_KEEPALIVE_MS)) {
+            m_tcpSender(m_peerId, static_cast<TrafficClass>(idx), Buffer());
+            m_tcpRelayLastSend[idx] = now;
+        }
     }
 }
 
-bool CliP2PPeer::isTcpRelayDead() const {
-    if (m_transport != TRANSPORT_RELAY_TCP) return false;
-    return (currentTimeMs() - m_tcpRelayLastRecv) > static_cast<uint32_t>(TCP_RELAY_DEAD_MS);
+bool CliPeerConnection::isTcpRelayDead(TrafficClass cls) const {
+    int idx = static_cast<int>(cls);
+    if (idx < 0 || idx > 2) idx = TRAFFIC_TCP;
+    if (m_transport[idx] != TRANSPORT_RELAY_TCP)
+        return false;
+
+    uint32_t now = currentTimeMs();
+    return now - m_tcpRelayLastRecv[idx] > static_cast<uint32_t>(TCP_RELAY_DEAD_MS);
 }
 
-int CliP2PPeer::latencyMs() const {
-    if (m_transport == TRANSPORT_RELAY_TCP) return m_tcpRtt;
-    if (m_transport == TRANSPORT_RELAY_RAW_UDP)
-        return m_rawUdpTunnel ? m_rawUdpTunnel->getRttMs() : -1;
-    if (m_kcpTunnel) return m_kcpTunnel->getRttMs();
+bool CliPeerConnection::isTcpRelayDead() const {
+    for (int idx = TRAFFIC_TCP; idx <= TRAFFIC_UDP; ++idx) {
+        if (isTcpRelayDead(static_cast<TrafficClass>(idx)))
+            return true;
+    }
+    return false;
+}
+
+int CliPeerConnection::latencyMs(TrafficClass cls) const {
+    int idx = static_cast<int>(cls);
+    if (idx < 0 || idx > 2) idx = TRAFFIC_UDP;
+    if (m_latencyLastReply[idx] == 0)
+        return -1;
+    uint32_t now = currentTimeMs();
+    if (now - m_latencyLastReply[idx] > CLI_LATENCY_STALE_MS)
+        return -1;
+    return m_rtt[idx];
+}
+
+int CliPeerConnection::latencyMs() const {
+    int tcp = latencyMs(TRAFFIC_TCP);
+    if (tcp >= 0)
+        return tcp;
+    int udp = latencyMs(TRAFFIC_UDP);
+    if (udp >= 0)
+        return udp;
+    TransportType t = m_transport[TRAFFIC_TCP] != TRANSPORT_NONE
+        ? m_transport[TRAFFIC_TCP] : m_transport[TRAFFIC_UDP];
+    if (t == TRANSPORT_RELAY_RAW_UDP)
+        return m_rawUdpTunnel[TRAFFIC_UDP] ? m_rawUdpTunnel[TRAFFIC_UDP]->getRttMs() : -1;
+    if (m_kcpTunnel[TRAFFIC_UDP]) return m_kcpTunnel[TRAFFIC_UDP]->getRttMs();
     return -1;
 }
 
-void CliP2PPeer::sendLatencyPing() {
-    if (m_transport != TRANSPORT_RELAY_TCP || !m_tcpSender) return;
-    m_latencyPingSentTime = currentTimeMs();
+void CliPeerConnection::sendLatencyPing(TrafficClass cls) {
+    int idx = static_cast<int>(cls);
+    if (idx < 0 || idx > 2) idx = TRAFFIC_UDP;
+    if (m_transport[idx] == TRANSPORT_NONE) return;
+    m_latencyPingSentTime[idx] = currentTimeMs();
     Buffer probe(6, 0);
     probe[0] = CLI_LATENCY_PROBE_MARKER;
     probe[1] = CLI_LATENCY_PROBE_PING;
-    uint32_t ts = m_latencyPingSentTime;
+    uint32_t ts = m_latencyPingSentTime[idx];
     probe[2] = (ts >> 24) & 0xFF;
     probe[3] = (ts >> 16) & 0xFF;
     probe[4] = (ts >> 8) & 0xFF;
     probe[5] = ts & 0xFF;
-    m_tcpSender(m_peerId, probe);
+    sendControlPacket(cls, probe);
 }
 
-bool CliP2PPeer::handleLatencyProbe(const Buffer& data) {
-    if (data.size() < 6) return false;
-    if (data[0] != CLI_LATENCY_PROBE_MARKER) return false;
+void CliPeerConnection::sendLatencyPing() {
+    sendLatencyPing(TRAFFIC_TCP);
+    sendLatencyPing(TRAFFIC_UDP);
+}
 
+bool CliPeerConnection::handleLatencyProbe(TrafficClass cls, const Buffer& data) {
+    if (data.size() < 6 || data[0] != CLI_LATENCY_PROBE_MARKER) return false;
+    int idx = static_cast<int>(cls);
+    if (idx < 0 || idx > 2) idx = TRAFFIC_UDP;
     if (data[1] == CLI_LATENCY_PROBE_PING) {
         Buffer pong(6, 0);
         pong[0] = CLI_LATENCY_PROBE_MARKER;
         pong[1] = CLI_LATENCY_PROBE_PONG;
         pong[2] = data[2]; pong[3] = data[3];
         pong[4] = data[4]; pong[5] = data[5];
-        if (m_onLatencyPong) m_onLatencyPong(m_peerId, pong);
+        sendControlPacket(cls, pong);
         return true;
     }
     if (data[1] == CLI_LATENCY_PROBE_PONG) {
-        uint32_t sentTs = (data[2] << 24) | (data[3] << 16) | (data[4] << 8) | data[5];
-        m_tcpRtt = static_cast<int>(currentTimeMs() - sentTs);
-        if (m_tcpRtt < 0) m_tcpRtt = 0;
+        uint32_t sentTs = (static_cast<uint32_t>(data[2]) << 24) |
+                          (static_cast<uint32_t>(data[3]) << 16) |
+                          (static_cast<uint32_t>(data[4]) << 8) |
+                           static_cast<uint32_t>(data[5]);
+        m_rtt[idx] = static_cast<int>(currentTimeMs() - sentTs);
+        if (m_rtt[idx] < 0) m_rtt[idx] = 0;
+        m_latencyLastReply[idx] = currentTimeMs();
         return true;
+    }
+    return false;
+}
+
+bool CliPeerConnection::handleLatencyProbe(const Buffer& data) {
+    return handleLatencyProbe(TRAFFIC_TCP, data);
+}
+
+bool CliPeerConnection::sendControlPacket(TrafficClass cls, const Buffer& data) {
+    int idx = static_cast<int>(cls);
+    if (idx < 0 || idx > 2) idx = TRAFFIC_UDP;
+    TransportType t = m_transport[idx];
+    if (t == TRANSPORT_RELAY_TCP) {
+        if (!m_tcpSender) return false;
+        m_tcpSender(m_peerId, cls, data);
+        return true;
+    }
+    if (t == TRANSPORT_RELAY_RAW_UDP) {
+        if (!m_rawUdpTunnel[idx]) return false;
+        return m_rawUdpTunnel[idx]->send(data) >= 0;
+    }
+    if (t == TRANSPORT_RELAY_KCP) {
+        if (!m_kcpTunnel[idx]) return false;
+        return m_kcpTunnel[idx]->send(data) >= 0;
     }
     return false;
 }

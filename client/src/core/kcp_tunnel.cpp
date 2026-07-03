@@ -1,4 +1,4 @@
-﻿#include "kcp_tunnel.h"
+#include "kcp_tunnel.h"
 #include "fec_codec.h"
 #include "net_common.h"
 #include "protocol.h"
@@ -13,12 +13,17 @@ KcpTunnel::KcpTunnel(uint32_t conv, QUdpSocket* socket,
                      const QHostAddress& peerAddr, quint16 peerPort,
                      FecMode fecMode,
                      uint16_t mtu,
+                     KcpProfile profile,
+                     TrafficClass trafficClass,
+                     bool secureFrames,
                      QObject* parent)
     : QObject(parent),
       m_socket(socket), m_peerAddr(peerAddr), m_peerPort(peerPort),
       m_relayMode(false), m_relaySrcPeerId(0), m_relayDstPeerId(0),
+      m_trafficClass(trafficClass),
       m_dead(false),
-      m_fecMode(fecMode), m_fecEncoder(nullptr), m_fecDecoder(nullptr)
+      m_fecMode(fecMode), m_profile(profile),
+      m_fecEncoder(nullptr), m_fecDecoder(nullptr)
 {
     uint32_t now = currentTimeMs();
     m_lastRecvTime = now;
@@ -27,11 +32,18 @@ KcpTunnel::KcpTunnel(uint32_t conv, QUdpSocket* socket,
     m_kcp = ikcp_create(conv, this);
     m_kcp->output = kcpOutput;
 
-    ikcp_setmtu(m_kcp, kcpMtuFromRoomMtu(mtu));
-    ikcp_nodelay(m_kcp, 1, 10, 2, 1);
-    ikcp_wndsize(m_kcp, 256, 256);
-    m_kcp->rx_minrto = 10;
-    m_kcp->fastresend = 2;
+    ikcp_setmtu(m_kcp, kcpMtuFromRoomMtu(mtu, m_fecMode != FEC_NONE, secureFrames));
+    if (m_profile == KCP_PROFILE_BULK) {
+        ikcp_nodelay(m_kcp, 1, 20, 4, 0);
+        ikcp_wndsize(m_kcp, 1024, 1024);
+        m_kcp->rx_minrto = 30;
+        m_kcp->fastresend = 4;
+    } else {
+        ikcp_nodelay(m_kcp, 1, 10, 2, 1);
+        ikcp_wndsize(m_kcp, 256, 256);
+        m_kcp->rx_minrto = 10;
+        m_kcp->fastresend = 2;
+    }
 
     if (m_fecMode != FEC_NONE) {
         m_fecEncoder = new FecEncoder(m_fecMode,
@@ -76,6 +88,7 @@ void KcpTunnel::sendKcpPacket(const QByteArray& payload) {
     if (m_relayMode) {
         UdpRelayHeader hdr;
         hdr.type      = UDP_RELAY_DATA;
+        hdr.trafficClass = static_cast<uint8_t>(m_trafficClass);
         hdr.srcPeerId = htonl(m_relaySrcPeerId);
         hdr.dstPeerId = htonl(m_relayDstPeerId);
         pkt.reserve(sizeof(hdr) + payload.size());
@@ -87,7 +100,10 @@ void KcpTunnel::sendKcpPacket(const QByteArray& payload) {
         pkt.append(payload);
     }
 
-    m_socket->writeDatagram(pkt, m_peerAddr, m_peerPort);
+    if (m_datagramSender)
+        m_datagramSender(pkt, m_peerAddr, m_peerPort);
+    else
+        m_socket->writeDatagram(pkt, m_peerAddr, m_peerPort);
     m_lastSendTime = currentTimeMs();
 }
 
@@ -108,6 +124,8 @@ void KcpTunnel::feedInput(const char* data, int len) {
 }
 
 int KcpTunnel::send(const QByteArray& data) {
+    if (m_profile == KCP_PROFILE_BULK && ikcp_waitsnd(m_kcp) > 2048)
+        return -1;
     return ikcp_send(m_kcp, data.constData(), data.size());
 }
 

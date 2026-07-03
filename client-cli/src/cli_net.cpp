@@ -1,4 +1,4 @@
-﻿#include "cli_net.h"
+#include "cli_net.h"
 #include "cli_log.h"
 #include <cstring>
 #include <algorithm>
@@ -12,15 +12,25 @@ namespace VLan {
 // ======================== CliSignalClient ========================
 
 CliSignalClient::CliSignalClient()
-    : m_myPeerId(0), m_pingSentTime(0), m_connectStartTime(0), m_hasPendingAuth(false)
+    : m_myPeerId(0), m_pingSentTime(0), m_connectStartTime(0), m_hasPendingAuth(false),
+      m_serverAuthRequired(false), m_secureReady(false), m_secureSessionId(0)
 {
     memset(m_pendingAuthHash, 0, CIPHER_KEY_SIZE);
+    memset(m_clientNonce, 0, sizeof(m_clientNonce));
+    memset(m_serverNonce, 0, sizeof(m_serverNonce));
+    memset(m_clientPrivKey, 0, sizeof(m_clientPrivKey));
+    memset(m_clientPubKey, 0, sizeof(m_clientPubKey));
+    memset(m_serverPubKey, 0, sizeof(m_serverPubKey));
 }
 
 CliSignalClient::~CliSignalClient() { disconnect(); }
 
 bool CliSignalClient::connectTo(const std::string& ip, uint16_t port) {
     m_myPeerId = 0;
+    m_serverAuthRequired = false;
+    m_secureReady = false;
+    m_secureSessionId = 0;
+    m_secureMaster.clear();
     m_connectStartTime = currentTimeMs();
     return m_conn.connectTo(ip, port);
 }
@@ -30,27 +40,52 @@ void CliSignalClient::disconnect() {
     m_myPeerId = 0;
 }
 
-void CliSignalClient::login(const std::string& name) {
+void CliSignalClient::setServerPassword(const std::string& password) {
+    m_serverPassword = password;
+}
+
+void CliSignalClient::continueServerAuth() {
+    if (m_serverAuthRequired && !m_secureReady)
+        sendServerAuth();
+}
+
+void CliSignalClient::login(const std::string& name,
+                            bool hasResume,
+                            uint32_t resumeRoomId,
+                            uint32_t resumePeerId,
+                            const uint8_t* resumeToken) {
     ByteBuffer bb;
     bb.writeString(name);
     bb.writeU16(PROTOCOL_VERSION);
-    m_conn.sendTcpMsg(MSG_LOGIN, bb);
+    bool sendResume = hasResume && resumeToken != nullptr;
+    bb.writeU8(sendResume ? 1 : 0);
+    if (sendResume) {
+        bb.writeU32(resumeRoomId);
+        bb.writeU32(resumePeerId);
+        bb.writeBytes(resumeToken, RECONNECT_TOKEN_SIZE);
+    }
+    sendMsg(MSG_LOGIN, bb);
 }
 
 void CliSignalClient::createRoom(const std::string& roomName, uint8_t maxPlayers,
-                                  TransportMode mode, FecMode fecMode,
-                                  uint16_t mtu,
-                                  bool encrypted, const uint8_t* passwordHash) {
+                                 RoomTrafficPolicy tcpPolicy,
+                                 RoomTrafficPolicy udpPolicy,
+                                 uint16_t mtu,
+                                 bool passwordProtected, const uint8_t* passwordHash) {
     ByteBuffer bb;
     bb.writeString(roomName);
     bb.writeU8(maxPlayers);
-    bb.writeU8(static_cast<uint8_t>(mode));
-    bb.writeU8(static_cast<uint8_t>(fecMode));
-    bb.writeU8(encrypted ? 1 : 0);
-    if (encrypted && passwordHash)
+    bb.writeU8(static_cast<uint8_t>(tcpPolicy.transportMode));
+    bb.writeU8(static_cast<uint8_t>(tcpPolicy.fecMode));
+    bb.writeU8(static_cast<uint8_t>(tcpPolicy.kcpProfile));
+    bb.writeU8(static_cast<uint8_t>(udpPolicy.transportMode));
+    bb.writeU8(static_cast<uint8_t>(udpPolicy.fecMode));
+    bb.writeU8(static_cast<uint8_t>(udpPolicy.kcpProfile));
+    bb.writeU8(passwordProtected ? 1 : 0);
+    if (passwordProtected && passwordHash)
         bb.writeBytes(passwordHash, 32);
     bb.writeU16(normalizeRoomMtu(mtu));
-    m_conn.sendTcpMsg(MSG_CREATE_ROOM, bb);
+    sendMsg(MSG_CREATE_ROOM, bb);
 }
 
 void CliSignalClient::joinRoom(uint32_t roomId, const uint8_t* authHash) {
@@ -62,40 +97,108 @@ void CliSignalClient::joinRoom(uint32_t roomId, const uint8_t* authHash) {
     }
     ByteBuffer bb;
     bb.writeU32(roomId);
-    m_conn.sendTcpMsg(MSG_JOIN_ROOM, bb);
+    sendMsg(MSG_JOIN_ROOM, bb);
 }
 
-void CliSignalClient::leaveRoom() { m_conn.sendTcpMsg(MSG_LEAVE_ROOM); }
-void CliSignalClient::listRooms() { m_conn.sendTcpMsg(MSG_LIST_ROOMS); }
-
-void CliSignalClient::reportNatType(NatType type) {
+void CliSignalClient::resumeRoom(uint32_t roomId, uint32_t peerId, const uint8_t* resumeToken) {
+    if (!resumeToken) return;
     ByteBuffer bb;
-    bb.writeU8(type);
-    m_conn.sendTcpMsg(MSG_NAT_REPORT, bb);
+    bb.writeU32(roomId);
+    bb.writeU32(peerId);
+    bb.writeBytes(resumeToken, RECONNECT_TOKEN_SIZE);
+    sendMsg(MSG_RESUME_ROOM, bb);
 }
 
-void CliSignalClient::reportPunchResult(uint32_t targetPeerId, bool success) {
-    ByteBuffer bb;
-    bb.writeU32(targetPeerId);
-    bb.writeU8(success ? 1 : 0);
-    m_conn.sendTcpMsg(MSG_PUNCH_RESULT, bb);
-}
+void CliSignalClient::leaveRoom() { sendMsg(MSG_LEAVE_ROOM); }
+void CliSignalClient::logout() { sendMsg(MSG_LOGOUT); }
+void CliSignalClient::listRooms() { sendMsg(MSG_LIST_ROOMS); }
 
 void CliSignalClient::requestRelay(uint32_t targetPeerId) {
     ByteBuffer bb;
     bb.writeU32(targetPeerId);
-    m_conn.sendTcpMsg(MSG_REQUEST_RELAY, bb);
+    sendMsg(MSG_REQUEST_RELAY, bb);
 }
 
 void CliSignalClient::sendPing() {
     m_pingSentTime = currentTimeMs();
-    m_conn.sendTcpMsg(MSG_PING);
+    sendMsg(MSG_PING);
 }
 
 void CliSignalClient::sendAuthResponse(const uint8_t* response) {
     ByteBuffer bb;
     bb.writeBytes(response, 32);
-    m_conn.sendTcpMsg(MSG_AUTH_RESPONSE, bb);
+    sendMsg(MSG_AUTH_RESPONSE, bb);
+}
+
+void CliSignalClient::sendClientHello() {
+    secureRandomBytes(m_clientNonce, 16);
+    secureRandomBytes(m_clientPrivKey, 32);
+    crypto_x25519_public_key(m_clientPubKey, m_clientPrivKey);
+
+    ByteBuffer bb;
+    bb.writeU16(PROTOCOL_VERSION);
+    bb.writeBytes(m_clientNonce, 16);
+    bb.writeBytes(m_clientPubKey, 32);
+    m_conn.sendTcpMsg(MSG_CLIENT_HELLO, bb);
+}
+
+void CliSignalClient::sendServerAuth() {
+    if (m_serverPassword.empty()) {
+        if (onServerPasswordRequired) onServerPasswordRequired();
+        return;
+    }
+
+    uint8_t intermediate[CIPHER_KEY_SIZE];
+    uint8_t authHash[CIPHER_KEY_SIZE];
+    computeIntermediate(reinterpret_cast<const uint8_t*>(m_serverPassword.data()),
+                        m_serverPassword.size(), intermediate);
+    authHashFromIntermediate(intermediate, authHash);
+
+    uint8_t shared[32];
+    uint8_t master[32];
+    crypto_x25519(shared, m_clientPrivKey, m_serverPubKey);
+    deriveSecureMaster(master, shared, authHash, m_clientNonce, m_serverNonce,
+                       m_clientPubKey, m_serverPubKey);
+    uint8_t proof[32];
+    computeClientAuthProof(proof, master, authHash);
+
+    m_secureMaster.assign(master, master + 32);
+
+    ByteBuffer bb;
+    bb.writeBytes(proof, 32);
+    m_conn.sendTcpMsg(MSG_SERVER_AUTH, bb);
+
+    crypto_wipe(intermediate, sizeof(intermediate));
+    crypto_wipe(authHash, sizeof(authHash));
+    crypto_wipe(shared, sizeof(shared));
+    crypto_wipe(master, sizeof(master));
+    crypto_wipe(proof, sizeof(proof));
+}
+
+void CliSignalClient::sendMsg(uint8_t msgType, const ByteBuffer& body) {
+    if (m_secureReady &&
+        msgType != MSG_CLIENT_HELLO &&
+        msgType != MSG_SERVER_AUTH &&
+        msgType != MSG_SERVER_AUTH_OK &&
+        msgType != MSG_SERVER_HELLO) {
+        std::vector<uint8_t> plain;
+        plain.reserve(1 + body.size());
+        plain.push_back(msgType);
+        if (body.size() > 0)
+            plain.insert(plain.end(), body.data(), body.data() + body.size());
+        std::vector<uint8_t> enc = m_secureCipher.encrypt(plain.data(), plain.size());
+        ByteBuffer wrapped;
+        if (!enc.empty())
+            wrapped.writeBytes(enc.data(), enc.size());
+        m_conn.sendTcpMsg(MSG_ENCRYPTED, wrapped);
+        return;
+    }
+    m_conn.sendTcpMsg(msgType, body);
+}
+
+void CliSignalClient::sendMsg(uint8_t msgType) {
+    ByteBuffer empty;
+    sendMsg(msgType, empty);
 }
 
 void CliSignalClient::onWritable() {
@@ -109,7 +212,7 @@ void CliSignalClient::onWritable() {
             m_conn.connected = true;
             m_conn.lastRecvTime = currentTimeMs();
             LOG_INFO("Signal TCP connected");
-            if (onConnected) onConnected();
+            sendClientHello();
         } else {
             LOG_ERR("Signal connect failed: error %d", err);
             if (onConnectFailed) onConnectFailed("connect error");
@@ -179,42 +282,125 @@ void CliSignalClient::processMessage(uint8_t msgType, const uint8_t* payload, si
     ByteBuffer bb(payload, len);
     LOG_DBG("[signal] msg type=0x%02x len=%zu", msgType, len);
 
+    if (msgType == MSG_SERVER_HELLO) {
+        uint16_t serverVersion = bb.readU16();
+        bool authRequired = bb.remaining() > 0 ? (bb.readU8() != 0) : false;
+        if (serverVersion != PROTOCOL_VERSION) {
+            if (onServerError) onServerError("protocol version mismatch");
+            m_conn.reset();
+            return;
+        }
+        m_serverAuthRequired = authRequired;
+        if (!authRequired) {
+            if (onConnected) onConnected();
+            return;
+        }
+        if (bb.remaining() < 48) {
+            if (onServerError) onServerError("invalid server auth hello");
+            m_conn.reset();
+            return;
+        }
+        bb.readBytes(m_serverNonce, 16);
+        bb.readBytes(m_serverPubKey, 32);
+        if (m_serverPassword.empty()) {
+            if (onServerPasswordRequired) onServerPasswordRequired();
+        } else {
+            sendServerAuth();
+        }
+        return;
+    }
+
+    if (msgType == MSG_SERVER_AUTH_OK) {
+        if (m_secureMaster.size() != 32 || bb.remaining() < 36) {
+            if (onServerError) onServerError("invalid server auth response");
+            m_conn.reset();
+            return;
+        }
+        m_secureSessionId = bb.readU32();
+        uint8_t serverProof[32];
+        bb.readBytes(serverProof, 32);
+
+        uint8_t intermediate[CIPHER_KEY_SIZE];
+        uint8_t authHash[CIPHER_KEY_SIZE];
+        computeIntermediate(reinterpret_cast<const uint8_t*>(m_serverPassword.data()),
+                            m_serverPassword.size(), intermediate);
+        authHashFromIntermediate(intermediate, authHash);
+        uint8_t expected[32];
+        computeServerAuthProof(expected, m_secureMaster.data(), authHash);
+        if (crypto_verify32(expected, serverProof) != 0) {
+            if (onServerError) onServerError("server auth proof failed");
+            m_conn.reset();
+            crypto_wipe(intermediate, sizeof(intermediate));
+            crypto_wipe(authHash, sizeof(authHash));
+            crypto_wipe(expected, sizeof(expected));
+            return;
+        }
+        m_secureCipher.init(m_secureMaster.data(), true, "signal");
+        m_secureReady = true;
+        if (onSecureSessionEstablished)
+            onSecureSessionEstablished(m_secureSessionId, m_secureMaster);
+        if (onConnected) onConnected();
+        crypto_wipe(intermediate, sizeof(intermediate));
+        crypto_wipe(authHash, sizeof(authHash));
+        crypto_wipe(expected, sizeof(expected));
+        return;
+    }
+
+    std::vector<uint8_t> plain;
+    if (msgType == MSG_ENCRYPTED) {
+        if (!m_secureReady ||
+            !m_secureCipher.decrypt(payload, len, &plain) || plain.empty()) {
+            m_conn.reset();
+            if (onDisconnected) onDisconnected();
+            return;
+        }
+        msgType = plain[0];
+        payload = plain.size() > 1 ? plain.data() + 1 : nullptr;
+        len = plain.size() > 1 ? plain.size() - 1 : 0;
+        bb = len > 0 ? ByteBuffer(payload, len) : ByteBuffer();
+    } else if (m_secureReady) {
+        m_conn.reset();
+        if (onDisconnected) onDisconnected();
+        return;
+    }
+
     switch (msgType) {
     case MSG_LOGIN_RESP: {
         m_myPeerId = bb.readU32();
         uint16_t ver = bb.remaining() >= 2 ? bb.readU16() : 1;
-        LOG_INFO("Login OK, peerId=%u serverVersion=%u", m_myPeerId, ver);
+        bool resumeAccepted = bb.remaining() > 0 ? (bb.readU8() != 0) : false;
+        LOG_INFO("Login OK, peerId=%u serverVersion=%u resume=%u",
+                 m_myPeerId, ver, resumeAccepted ? 1 : 0);
         if (ver != PROTOCOL_VERSION)
             LOG_ERR("Protocol version mismatch: client=%u server=%u", PROTOCOL_VERSION, ver);
-        if (onLoginResponse) onLoginResponse(m_myPeerId);
+        if (onLoginResponse) onLoginResponse(m_myPeerId, resumeAccepted);
         break;
     }
     case MSG_ROOM_CREATED: {
         uint32_t roomId = bb.readU32();
         uint32_t vip    = bb.readU32();
-        TransportMode tmode = bb.remaining() > 0 ? static_cast<TransportMode>(bb.readU8()) : MODE_RELAY_KCP;
-        FecMode fmode = bb.remaining() > 0 ? static_cast<FecMode>(bb.readU8()) : FEC_NONE;
-        bool enc = bb.remaining() > 0 ? (bb.readU8() != 0) : false;
-        uint8_t salt[16] = {0}, seed[16] = {0};
-        if (enc && bb.remaining() >= 32) {
-            bb.readBytes(salt, 16);
-            bb.readBytes(seed, 16);
-        }
+        RoomTrafficPolicy tcpPolicy = normalizeTrafficPolicy(
+            bb.readU8(), bb.readU8(), bb.readU8(), makeDefaultTcpPolicy());
+        RoomTrafficPolicy udpPolicy = normalizeTrafficPolicy(
+            bb.readU8(), bb.readU8(), bb.readU8(), makeDefaultUdpPolicy());
+        bool passwordProtected = bb.remaining() > 0 ? (bb.readU8() != 0) : false;
         uint16_t mtu = bb.remaining() >= 2 ? normalizeRoomMtu(bb.readU16()) : ROOM_MTU_DEFAULT;
-        if (onRoomCreated) onRoomCreated(roomId, vip, tmode, fmode, mtu, enc, salt, seed);
+        Buffer leaseToken;
+        if (bb.remaining() >= RECONNECT_TOKEN_SIZE) {
+            leaseToken.resize(RECONNECT_TOKEN_SIZE);
+            bb.readBytes(leaseToken.data(), RECONNECT_TOKEN_SIZE);
+        }
+        if (onRoomCreated) onRoomCreated(roomId, vip, tcpPolicy, udpPolicy, mtu, passwordProtected, leaseToken);
         break;
     }
     case MSG_JOIN_RESP: {
         uint32_t roomId = bb.readU32();
         uint32_t vip    = bb.readU32();
-        TransportMode tmode = static_cast<TransportMode>(bb.readU8());
-        FecMode fmode = bb.remaining() > 0 ? static_cast<FecMode>(bb.readU8()) : FEC_NONE;
-        bool enc = bb.remaining() > 0 ? (bb.readU8() != 0) : false;
-        uint8_t salt[16] = {0}, seed[16] = {0};
-        if (enc && bb.remaining() >= 32) {
-            bb.readBytes(salt, 16);
-            bb.readBytes(seed, 16);
-        }
+        RoomTrafficPolicy tcpPolicy = normalizeTrafficPolicy(
+            bb.readU8(), bb.readU8(), bb.readU8(), makeDefaultTcpPolicy());
+        RoomTrafficPolicy udpPolicy = normalizeTrafficPolicy(
+            bb.readU8(), bb.readU8(), bb.readU8(), makeDefaultUdpPolicy());
+        bool passwordProtected = bb.remaining() > 0 ? (bb.readU8() != 0) : false;
         uint16_t mtu = bb.remaining() >= 2 ? normalizeRoomMtu(bb.readU16()) : ROOM_MTU_DEFAULT;
         uint8_t count = bb.readU8();
         std::vector<PeerInfo> members;
@@ -223,14 +409,16 @@ void CliSignalClient::processMessage(uint8_t msgType, const uint8_t* payload, si
             pi.peerId     = bb.readU32();
             pi.virtualIP  = bb.readU32();
             pi.name       = bb.readString();
-            pi.natType    = static_cast<NatType>(bb.readU8());
-            pi.publicIP   = bb.readU32();
-            pi.publicPort = bb.readU16();
             pi.transport  = TRANSPORT_NONE;
             members.push_back(pi);
         }
+        Buffer leaseToken;
+        if (bb.remaining() >= RECONNECT_TOKEN_SIZE) {
+            leaseToken.resize(RECONNECT_TOKEN_SIZE);
+            bb.readBytes(leaseToken.data(), RECONNECT_TOKEN_SIZE);
+        }
         m_hasPendingAuth = false;
-        if (onJoinResponse) onJoinResponse(roomId, vip, tmode, fmode, mtu, enc, salt, seed, members);
+        if (onJoinResponse) onJoinResponse(roomId, vip, tcpPolicy, udpPolicy, mtu, passwordProtected, members, leaseToken);
         break;
     }
     case MSG_PEER_JOINED: {
@@ -238,9 +426,6 @@ void CliSignalClient::processMessage(uint8_t msgType, const uint8_t* payload, si
         pi.peerId     = bb.readU32();
         pi.virtualIP  = bb.readU32();
         pi.name       = bb.readString();
-        pi.natType    = static_cast<NatType>(bb.readU8());
-        pi.publicIP   = 0;
-        pi.publicPort = 0;
         pi.transport  = TRANSPORT_NONE;
         if (onPeerJoined) onPeerJoined(pi);
         break;
@@ -250,7 +435,13 @@ void CliSignalClient::processMessage(uint8_t msgType, const uint8_t* payload, si
         if (onPeerLeft) onPeerLeft(peerId);
         break;
     }
-    case MSG_ROOM_LIST: {
+    case MSG_LOGOUT_ACK: {
+        m_myPeerId = 0;
+        if (onLogoutAck) onLogoutAck();
+        break;
+    }
+    case MSG_ROOM_LIST:
+    case MSG_ROOM_LIST_PUSH: {
         uint16_t count = bb.readU16();
         std::vector<CliRoomListItem> rooms;
         for (uint16_t i = 0; i < count; ++i) {
@@ -259,22 +450,15 @@ void CliSignalClient::processMessage(uint8_t msgType, const uint8_t* payload, si
             ri.roomName      = bb.readString();
             ri.playerCount   = bb.readU8();
             ri.maxPlayers    = bb.readU8();
-            ri.transportMode = static_cast<TransportMode>(bb.readU8());
-            ri.fecMode = bb.remaining() > 0 ? static_cast<FecMode>(bb.readU8()) : FEC_NONE;
-            ri.encrypted = bb.remaining() > 0 ? bb.readU8() : 0;
+            ri.tcpPolicy = normalizeTrafficPolicy(
+                bb.readU8(), bb.readU8(), bb.readU8(), makeDefaultTcpPolicy());
+            ri.udpPolicy = normalizeTrafficPolicy(
+                bb.readU8(), bb.readU8(), bb.readU8(), makeDefaultUdpPolicy());
+            ri.passwordProtected = bb.remaining() > 0 ? bb.readU8() : 0;
             ri.mtu = bb.remaining() >= 2 ? normalizeRoomMtu(bb.readU16()) : ROOM_MTU_DEFAULT;
             rooms.push_back(ri);
         }
-        if (onRoomList) onRoomList(rooms);
-        break;
-    }
-    case MSG_PUNCH_NOTIFY: {
-        uint32_t peerId = bb.readU32();
-        uint32_t vip    = bb.readU32();
-        NatType  nat    = static_cast<NatType>(bb.readU8());
-        uint32_t pubIP  = bb.readU32();
-        uint16_t pubPort= bb.readU16();
-        if (onPunchNotify) onPunchNotify(peerId, vip, nat, pubIP, pubPort);
+        if (onRoomList) onRoomList(rooms, msgType == MSG_ROOM_LIST_PUSH);
         break;
     }
     case MSG_RELAY_READY: {
@@ -321,7 +505,8 @@ void CliSignalClient::processMessage(uint8_t msgType, const uint8_t* payload, si
 
 CliDataChannel::CliDataChannel()
     : m_port(0), m_peerId(0), m_established(false),
-      m_needReconnect(false), m_reconnectTime(0)
+      m_needReconnect(false), m_reconnectTime(0),
+      m_secureEnabled(false), m_secureSessionId(0)
 {}
 
 CliDataChannel::~CliDataChannel() { disconnect(); }
@@ -339,21 +524,33 @@ void CliDataChannel::disconnect() {
     m_conn.reset();
     m_established = false;
     m_needReconnect = false;
+    m_peerId = 0;
+    m_port = 0;
 }
 
-void CliDataChannel::sendRelayData(uint32_t srcPeerId, uint32_t dstPeerId, const Buffer& data) {
+void CliDataChannel::setSecureSession(uint32_t sessionId, const Buffer& master) {
+    m_secureSessionId = sessionId;
+    m_secureMaster = master;
+    m_secureEnabled = (sessionId != 0 && master.size() == 32);
+    if (m_secureEnabled)
+        m_cipher.init(m_secureMaster.data(), true, "data");
+}
+
+void CliDataChannel::sendRelayData(uint32_t srcPeerId, uint32_t dstPeerId,
+                                   TrafficClass cls, const Buffer& data) {
     if (!m_established) return;
     ByteBuffer bb;
     bb.writeU32(srcPeerId);
     bb.writeU32(dstPeerId);
+    bb.writeU8(static_cast<uint8_t>(cls));
     if (!data.empty())
         bb.writeBytes(data.data(), data.size());
-    m_conn.sendTcpMsg(MSG_TCP_RELAY_DATA, bb);
+    sendMsg(MSG_TCP_RELAY_DATA, bb);
 }
 
 void CliDataChannel::sendPing() {
     if (!m_established) return;
-    m_conn.sendTcpMsg(MSG_PING);
+    sendMsg(MSG_PING);
 }
 
 void CliDataChannel::onWritable() {
@@ -368,7 +565,18 @@ void CliDataChannel::onWritable() {
             m_conn.lastRecvTime = currentTimeMs();
 
             ByteBuffer bb;
-            bb.writeU32(m_peerId);
+            if (m_secureEnabled) {
+                ByteBuffer inner;
+                inner.writeU32(m_peerId);
+                std::vector<uint8_t> enc = m_cipher.encrypt(inner.data(), inner.size());
+                uint8_t sid[SECURE_SESSION_ID_SIZE];
+                writeU32BE(sid, m_secureSessionId);
+                bb.writeBytes(sid, SECURE_SESSION_ID_SIZE);
+                if (!enc.empty())
+                    bb.writeBytes(enc.data(), enc.size());
+            } else {
+                bb.writeU32(m_peerId);
+            }
             m_conn.sendTcpMsg(MSG_DATA_CHANNEL_INIT, bb);
             LOG_DBG("[datachannel] TCP connected, sent INIT for peer %u", m_peerId);
         } else {
@@ -412,6 +620,23 @@ void CliDataChannel::onReadable() {
 }
 
 void CliDataChannel::processMessage(uint8_t msgType, const uint8_t* payload, size_t len) {
+    std::vector<uint8_t> plain;
+    if (msgType == MSG_ENCRYPTED) {
+        if (!m_secureEnabled ||
+            !m_cipher.decrypt(payload, len, &plain) || plain.empty())
+            return;
+        msgType = plain[0];
+        payload = plain.size() > 1 ? plain.data() + 1 : nullptr;
+        len = plain.size() > 1 ? plain.size() - 1 : 0;
+    } else if (m_secureEnabled) {
+        m_conn.reset();
+        m_established = false;
+        if (onDisconnectedCb) onDisconnectedCb();
+        if (m_peerId != 0)
+            scheduleReconnect();
+        return;
+    }
+
     switch (msgType) {
     case MSG_DATA_CHANNEL_ACK:
         m_established = true;
@@ -420,13 +645,14 @@ void CliDataChannel::processMessage(uint8_t msgType, const uint8_t* payload, siz
         if (onConnectedCb) onConnectedCb();
         break;
     case MSG_TCP_RELAY_DATA: {
-        if (len < 8) break;
+        if (len < 9) break;
         ByteBuffer bb(payload, len);
         uint32_t srcId = bb.readU32();
         bb.readU32();
+        TrafficClass cls = bb.readU8() == TRAFFIC_TCP ? TRAFFIC_TCP : TRAFFIC_UDP;
         size_t remaining = bb.remaining();
         Buffer data(payload + len - remaining, payload + len);
-        if (onRelayData) onRelayData(srcId, data);
+        if (onRelayData) onRelayData(srcId, cls, data);
         break;
     }
     case MSG_PONG:
@@ -434,6 +660,28 @@ void CliDataChannel::processMessage(uint8_t msgType, const uint8_t* payload, siz
     default:
         break;
     }
+}
+
+void CliDataChannel::sendMsg(uint8_t msgType, const ByteBuffer& body) {
+    if (m_secureEnabled && msgType != MSG_DATA_CHANNEL_INIT) {
+        std::vector<uint8_t> plain;
+        plain.reserve(1 + body.size());
+        plain.push_back(msgType);
+        if (body.size() > 0)
+            plain.insert(plain.end(), body.data(), body.data() + body.size());
+        std::vector<uint8_t> enc = m_cipher.encrypt(plain.data(), plain.size());
+        ByteBuffer wrapped;
+        if (!enc.empty())
+            wrapped.writeBytes(enc.data(), enc.size());
+        m_conn.sendTcpMsg(MSG_ENCRYPTED, wrapped);
+        return;
+    }
+    m_conn.sendTcpMsg(msgType, body);
+}
+
+void CliDataChannel::sendMsg(uint8_t msgType) {
+    ByteBuffer empty;
+    sendMsg(msgType, empty);
 }
 
 void CliDataChannel::checkTimeouts() {
@@ -459,178 +707,6 @@ void CliDataChannel::checkTimeouts() {
 void CliDataChannel::scheduleReconnect() {
     m_needReconnect = true;
     m_reconnectTime = currentTimeMs() + RECONNECT_INTERVAL_MS;
-}
-
-// ======================== CliNatDetector ========================
-
-CliNatDetector::CliNatDetector()
-    : m_serverIP(0), m_serverPort(0), m_localPort(0), m_myPeerId(0),
-      m_token(0), m_observedIP(0), m_observedPort(0),
-      m_done(false), m_retryCount(0), m_lastProbeTime(0), m_result(NAT_UNKNOWN)
-{}
-
-void CliNatDetector::detect(socket_t udpFd, uint16_t localPort,
-                             uint32_t serverIP, uint16_t serverPort, uint32_t myPeerId) {
-    m_serverIP   = serverIP;
-    m_serverPort = serverPort;
-    m_localPort  = localPort;
-    m_myPeerId   = myPeerId;
-    m_done       = false;
-    m_retryCount = 0;
-    std::random_device rd;
-    m_token = rd();
-    sendProbe(udpFd);
-}
-
-void CliNatDetector::sendProbe(socket_t udpFd) {
-    StunRequest req;
-    memset(&req, 0, sizeof(req));
-    req.type      = UDP_STUN_REQUEST;
-    req.token     = htonl(m_token);
-    req.localPort = htons(m_localPort);
-    req.peerId    = htonl(m_myPeerId);
-
-    struct sockaddr_in addr = makeAddr(m_serverIP, m_serverPort);
-    sendto(udpFd, reinterpret_cast<const char*>(&req), sizeof(req), 0,
-           (struct sockaddr*)&addr, sizeof(addr));
-    m_lastProbeTime = currentTimeMs();
-    LOG_DBG("[NAT] sendProbe token=%u retry=%d", m_token, m_retryCount);
-}
-
-void CliNatDetector::handleStunResponse(const uint8_t* data, size_t len) {
-    if (len < sizeof(StunResponse)) return;
-    const StunResponse* resp = reinterpret_cast<const StunResponse*>(data);
-    if (resp->type != UDP_STUN_RESPONSE) return;
-    if (ntohl(resp->token) != m_token) return;
-    if (m_done) return;
-
-    m_observedIP   = ntohl(resp->observedIP);
-    m_observedPort = ntohs(resp->observedPort);
-    m_done = true;
-
-    m_result = (m_observedPort == m_localPort) ? NAT_FULL_CONE : NAT_SYMMETRIC;
-    LOG_INFO("NAT detected: %s (observed %s:%u)",
-             natTypeName(m_result), ipToString(m_observedIP).c_str(), m_observedPort);
-    if (onDetected) onDetected(m_result, m_observedIP, m_observedPort);
-}
-
-void CliNatDetector::checkTimeout(socket_t udpFd) {
-    if (m_done) return;
-    if (currentTimeMs() - m_lastProbeTime < 2000) return;
-    if (m_retryCount < 3) {
-        ++m_retryCount;
-        sendProbe(udpFd);
-    } else {
-        m_done = true;
-        m_result = NAT_UNKNOWN;
-        LOG_INFO("NAT detection failed after retries");
-        if (onDetected) onDetected(NAT_UNKNOWN, 0, 0);
-    }
-}
-
-// ======================== CliHolePuncher ========================
-
-CliHolePuncher::CliHolePuncher(uint32_t myPeerId)
-    : m_myPeerId(myPeerId)
-{
-    std::random_device rd;
-    m_rng.seed(rd());
-}
-
-void CliHolePuncher::startPunch(uint32_t targetPeerId, uint32_t targetIP, uint16_t targetPort) {
-    PunchAttempt& a = m_attempts[targetPeerId];
-    a.targetPeerId = targetPeerId;
-    a.targetIP     = targetIP;
-    a.targetPort   = targetPort;
-    a.token        = m_rng();
-    a.attempts     = 0;
-    a.ackReceived  = false;
-    a.lastSendTime = 0;
-    LOG_INFO("Start punching peer %u at %s:%u", targetPeerId,
-             ipToString(targetIP).c_str(), targetPort);
-}
-
-void CliHolePuncher::cancelPunch(uint32_t targetPeerId) {
-    m_attempts.erase(targetPeerId);
-}
-
-void CliHolePuncher::sendPunchPacket(socket_t udpFd, const PunchAttempt& a) {
-    PunchPacket pkt;
-    memset(&pkt, 0, sizeof(pkt));
-    pkt.type   = UDP_PUNCH;
-    pkt.peerId = htonl(m_myPeerId);
-    pkt.token  = htonl(a.token);
-
-    struct sockaddr_in addr = makeAddr(a.targetIP, a.targetPort);
-    sendto(udpFd, reinterpret_cast<const char*>(&pkt), sizeof(pkt), 0,
-           (struct sockaddr*)&addr, sizeof(addr));
-}
-
-void CliHolePuncher::sendAck(socket_t udpFd, uint32_t token, uint32_t ip, uint16_t port) {
-    PunchPacket ack;
-    memset(&ack, 0, sizeof(ack));
-    ack.type   = UDP_PUNCH_ACK;
-    ack.peerId = htonl(m_myPeerId);
-    ack.token  = htonl(token);
-
-    struct sockaddr_in addr = makeAddr(ip, port);
-    sendto(udpFd, reinterpret_cast<const char*>(&ack), sizeof(ack), 0,
-           (struct sockaddr*)&addr, sizeof(addr));
-}
-
-void CliHolePuncher::handleIncomingPacket(const uint8_t* data, size_t len,
-                                           uint32_t fromIP, uint16_t fromPort) {
-    if (len < sizeof(PunchPacket)) return;
-    const PunchPacket* pkt = reinterpret_cast<const PunchPacket*>(data);
-    uint32_t remotePeerId = ntohl(pkt->peerId);
-    uint32_t token        = ntohl(pkt->token);
-
-    /* Need a UDP fd to send ACK; we'll handle this in the caller via update() */
-    (void)token;
-
-    if (pkt->type == UDP_PUNCH) {
-        auto it = m_attempts.find(remotePeerId);
-        if (it != m_attempts.end() && !it->second.ackReceived) {
-            it->second.ackReceived = true;
-            LOG_INFO("Punch success (received PUNCH from peer %u)", remotePeerId);
-            if (onPunchSucceeded) onPunchSucceeded(remotePeerId, fromIP, fromPort);
-            m_attempts.erase(it);
-        }
-    } else if (pkt->type == UDP_PUNCH_ACK) {
-        auto it = m_attempts.find(remotePeerId);
-        if (it != m_attempts.end() && !it->second.ackReceived) {
-            it->second.ackReceived = true;
-            LOG_INFO("Punch success (ACK from peer %u)", remotePeerId);
-            if (onPunchSucceeded) onPunchSucceeded(remotePeerId, fromIP, fromPort);
-            m_attempts.erase(it);
-        }
-    }
-}
-
-void CliHolePuncher::update(socket_t udpFd) {
-    uint32_t now = currentTimeMs();
-    std::vector<uint32_t> failed;
-
-    for (auto& kv : m_attempts) {
-        PunchAttempt& a = kv.second;
-        if (a.ackReceived) continue;
-        if (now - a.lastSendTime < static_cast<uint32_t>(PUNCH_RETRY_INTERVAL)) continue;
-
-        a.attempts++;
-        int maxAttempts = PUNCH_TIMEOUT_MS / PUNCH_RETRY_INTERVAL;
-        if (a.attempts >= maxAttempts) {
-            failed.push_back(kv.first);
-        } else {
-            sendPunchPacket(udpFd, a);
-            a.lastSendTime = now;
-        }
-    }
-
-    for (uint32_t pid : failed) {
-        LOG_INFO("Punch timeout for peer %u", pid);
-        m_attempts.erase(pid);
-        if (onPunchFailed) onPunchFailed(pid);
-    }
 }
 
 } // namespace VLan

@@ -1,4 +1,4 @@
-﻿#ifndef VLAN_CLI_NET_H
+#ifndef VLAN_CLI_NET_H
 #define VLAN_CLI_NET_H
 
 #include "cli_common.h"
@@ -17,9 +17,9 @@ struct CliRoomListItem {
     std::string   roomName;
     uint8_t       playerCount;
     uint8_t       maxPlayers;
-    TransportMode transportMode;
-    FecMode       fecMode;
-    uint8_t       encrypted;
+    RoomTrafficPolicy tcpPolicy;
+    RoomTrafficPolicy udpPolicy;
+    uint8_t       passwordProtected;
     uint16_t      mtu;
 };
 
@@ -32,17 +32,27 @@ public:
     void disconnect();
     bool isConnected() const { return m_conn.connected; }
     socket_t fd() const { return m_conn.fd; }
+    bool secureEnabled() const { return m_secureReady; }
+    uint32_t secureSessionId() const { return m_secureSessionId; }
+    const Buffer& secureMaster() const { return m_secureMaster; }
+    void setServerPassword(const std::string& password);
+    void continueServerAuth();
 
-    void login(const std::string& name);
+    void login(const std::string& name,
+               bool hasResume = false,
+               uint32_t resumeRoomId = 0,
+               uint32_t resumePeerId = 0,
+               const uint8_t* resumeToken = nullptr);
     void createRoom(const std::string& roomName, uint8_t maxPlayers,
-                    TransportMode mode, FecMode fecMode,
+                    RoomTrafficPolicy tcpPolicy,
+                    RoomTrafficPolicy udpPolicy,
                     uint16_t mtu,
-                    bool encrypted, const uint8_t* passwordHash);
+                    bool passwordProtected, const uint8_t* passwordHash);
     void joinRoom(uint32_t roomId, const uint8_t* authHash);
+    void resumeRoom(uint32_t roomId, uint32_t peerId, const uint8_t* resumeToken);
     void leaveRoom();
+    void logout();
     void listRooms();
-    void reportNatType(NatType type);
-    void reportPunchResult(uint32_t targetPeerId, bool success);
     void requestRelay(uint32_t targetPeerId);
     void sendPing();
 
@@ -56,20 +66,22 @@ public:
     std::function<void()>  onConnected;
     std::function<void()>  onDisconnected;
     std::function<void(const std::string&)> onConnectFailed;
-    std::function<void(uint32_t peerId)> onLoginResponse;
+    std::function<void(uint32_t peerId, bool resumeAccepted)> onLoginResponse;
     std::function<void(uint32_t roomId, uint32_t virtualIP,
-                       TransportMode, FecMode, uint16_t mtu, bool encrypted,
-                       const uint8_t* salt, const uint8_t* sessionSeed)> onRoomCreated;
+                       RoomTrafficPolicy, RoomTrafficPolicy, uint16_t mtu,
+                       bool passwordProtected, const Buffer& leaseToken)> onRoomCreated;
     std::function<void(uint32_t roomId, uint32_t virtualIP,
-                       TransportMode, FecMode, uint16_t mtu, bool encrypted,
-                       const uint8_t* salt, const uint8_t* sessionSeed,
-                       const std::vector<PeerInfo>& members)> onJoinResponse;
+                       RoomTrafficPolicy, RoomTrafficPolicy, uint16_t mtu,
+                       bool passwordProtected,
+                       const std::vector<PeerInfo>& members,
+                       const Buffer& leaseToken)> onJoinResponse;
     std::function<void(PeerInfo)> onPeerJoined;
     std::function<void(uint32_t peerId)> onPeerLeft;
-    std::function<void(const std::vector<CliRoomListItem>&)> onRoomList;
-    std::function<void(uint32_t peerId, uint32_t virtualIP,
-                       NatType natType, uint32_t publicIP, uint16_t publicPort)> onPunchNotify;
+    std::function<void(const std::vector<CliRoomListItem>&, bool)> onRoomList;
     std::function<void(uint32_t peerId)> onRelayReady;
+    std::function<void()> onLogoutAck;
+    std::function<void()> onServerPasswordRequired;
+    std::function<void(uint32_t sessionId, const Buffer& master)> onSecureSessionEstablished;
     std::function<void(const std::string&)> onServerError;
     std::function<void(int rttMs)> onServerRtt;
     std::function<void(const uint8_t* challenge)> onAuthChallenge;
@@ -77,7 +89,11 @@ public:
     void sendAuthResponse(const uint8_t* response);
 
 private:
+    void sendMsg(uint8_t msgType, const ByteBuffer& body);
+    void sendMsg(uint8_t msgType);
     void processMessage(uint8_t msgType, const uint8_t* payload, size_t len);
+    void sendClientHello();
+    void sendServerAuth();
 
     TcpConnection m_conn;
     uint32_t      m_myPeerId;
@@ -85,6 +101,17 @@ private:
     uint32_t      m_connectStartTime;
     uint8_t       m_pendingAuthHash[CIPHER_KEY_SIZE];
     bool          m_hasPendingAuth;
+    std::string   m_serverPassword;
+    bool          m_serverAuthRequired;
+    bool          m_secureReady;
+    uint32_t      m_secureSessionId;
+    uint8_t       m_clientNonce[16];
+    uint8_t       m_serverNonce[16];
+    uint8_t       m_clientPrivKey[32];
+    uint8_t       m_clientPubKey[32];
+    uint8_t       m_serverPubKey[32];
+    Buffer        m_secureMaster;
+    SecureFrameCipher m_secureCipher;
 };
 
 // ======================== CliDataChannel ========================
@@ -98,8 +125,10 @@ public:
     void disconnect();
     bool isConnected() const { return m_established; }
     socket_t fd() const { return m_conn.fd; }
+    void setSecureSession(uint32_t sessionId, const Buffer& master);
 
-    void sendRelayData(uint32_t srcPeerId, uint32_t dstPeerId, const Buffer& data);
+    void sendRelayData(uint32_t srcPeerId, uint32_t dstPeerId,
+                       TrafficClass cls, const Buffer& data);
     void sendPing();
 
     void onReadable();
@@ -108,9 +137,11 @@ public:
 
     std::function<void()> onConnectedCb;
     std::function<void()> onDisconnectedCb;
-    std::function<void(uint32_t srcPeerId, Buffer data)> onRelayData;
+    std::function<void(uint32_t srcPeerId, TrafficClass cls, Buffer data)> onRelayData;
 
 private:
+    void sendMsg(uint8_t msgType, const ByteBuffer& body);
+    void sendMsg(uint8_t msgType);
     void processMessage(uint8_t msgType, const uint8_t* payload, size_t len);
     void scheduleReconnect();
 
@@ -121,74 +152,10 @@ private:
     bool          m_established;
     bool          m_needReconnect;
     uint32_t      m_reconnectTime;
-};
-
-// ======================== CliNatDetector ========================
-
-class CliNatDetector {
-public:
-    CliNatDetector();
-
-    void detect(socket_t udpFd, uint16_t localPort,
-                uint32_t serverIP, uint16_t serverPort, uint32_t myPeerId);
-    void handleStunResponse(const uint8_t* data, size_t len);
-    void checkTimeout(socket_t udpFd);
-
-    bool done() const { return m_done; }
-    NatType result() const { return m_result; }
-    uint32_t observedIP() const { return m_observedIP; }
-    uint16_t observedPort() const { return m_observedPort; }
-
-    std::function<void(NatType, uint32_t publicIP, uint16_t publicPort)> onDetected;
-
-private:
-    void sendProbe(socket_t udpFd);
-
-    uint32_t m_serverIP;
-    uint16_t m_serverPort;
-    uint16_t m_localPort;
-    uint32_t m_myPeerId;
-    uint32_t m_token;
-    uint32_t m_observedIP;
-    uint16_t m_observedPort;
-    bool     m_done;
-    int      m_retryCount;
-    uint32_t m_lastProbeTime;
-    NatType  m_result;
-};
-
-// ======================== CliHolePuncher ========================
-
-class CliHolePuncher {
-public:
-    CliHolePuncher(uint32_t myPeerId);
-
-    void startPunch(uint32_t targetPeerId, uint32_t targetIP, uint16_t targetPort);
-    void cancelPunch(uint32_t targetPeerId);
-    void handleIncomingPacket(const uint8_t* data, size_t len,
-                              uint32_t fromIP, uint16_t fromPort);
-    void update(socket_t udpFd);
-
-    std::function<void(uint32_t peerId, uint32_t ip, uint16_t port)> onPunchSucceeded;
-    std::function<void(uint32_t peerId)> onPunchFailed;
-
-private:
-    struct PunchAttempt {
-        uint32_t targetPeerId;
-        uint32_t targetIP;
-        uint16_t targetPort;
-        uint32_t token;
-        int      attempts;
-        bool     ackReceived;
-        uint32_t lastSendTime;
-    };
-
-    void sendPunchPacket(socket_t udpFd, const PunchAttempt& a);
-    void sendAck(socket_t udpFd, uint32_t token, uint32_t ip, uint16_t port);
-
-    uint32_t m_myPeerId;
-    std::map<uint32_t, PunchAttempt> m_attempts;
-    std::mt19937 m_rng;
+    bool          m_secureEnabled;
+    uint32_t      m_secureSessionId;
+    Buffer        m_secureMaster;
+    SecureFrameCipher m_cipher;
 };
 
 } // namespace VLan

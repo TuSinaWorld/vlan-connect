@@ -34,7 +34,6 @@ private slots:
     void onJoinRoomClicked();
     void onLeaveRoomClicked();
     void onRefreshClicked();
-    void onServerModeChanged(int index);
     void onTransportModeChanged(int index);
     void changePage(int index);
 
@@ -55,6 +54,7 @@ private slots:
     void onTrayMenuItemClicked(const QString& id);
     void showFromTray();
     void quitProgram();
+    void finishProgramQuit();
 
 protected:
     void closeEvent(QCloseEvent* event) override;
@@ -65,7 +65,8 @@ private:
         PageLobby = 1,
         PageCreateRoom = 2,
         PageMembers = 3,
-        PageLog = 4
+        PageLog = 4,
+        PageSettings = 5
     };
 
     void setupUI();
@@ -74,12 +75,21 @@ private:
     QWidget* createCreateRoomPage();
     QWidget* createMembersPage();
     QWidget* createLogPage();
+    QWidget* createSettingsPage();
     void initTray();
     void updateTrayState();
     void refreshDashboardState();
+    void applyLanguage();
+    void loadPersistentSettings();
+    void saveConnectionDefaults(const QString& host, quint16 port,
+                                const QString& playerName);
+    QString settingsEndpointText() const;
     void setRoomControlsEnabled(bool inRoom);
     void updateConnectButton(bool connected);
-    bool showGfwWarning();
+    RoomTrafficPolicy policyFromControls(bool tcpTraffic) const;
+    void updatePolicyControlState();
+    void updateComboTexts();
+    void promptServerPassword();
 
     RoomManager* m_roomMgr;
     RoomWidget*  m_roomWidget;
@@ -93,14 +103,17 @@ private:
     QLabel*         m_dashConnectionLabel;
     QLabel*         m_dashRoomLabel;
     QLabel*         m_dashPeerLabel;
+    QLabel*         m_dashServerRttLabel;
     QLabel*         m_trafficLabel;
+    QLabel*         m_trafficTitleLabel;
+    QLabel*         m_brandSubtitleLabel;
+    QLabel*         m_shellBadgeLabel;
 
     /* Tray */
     QSystemTrayIcon* m_trayIcon;
     ModernTrayMenu*  m_trayMenu;
 
     /* Connection panel */
-    QComboBox*   m_serverModeBox;
     QLineEdit*   m_serverEdit;
     QLineEdit*   m_nameEdit;
     QPushButton* m_connectBtn;
@@ -113,10 +126,15 @@ private:
     /* Room creation */
     QLineEdit*   m_roomNameEdit;
     QSpinBox*    m_maxPlayersBox;
-    QComboBox*   m_transportModeBox;
-    QComboBox*   m_fecModeBox;
+    QCheckBox*   m_advancedCheck;
+    QWidget*     m_advancedOptionsWidget;
+    QComboBox*   m_tcpModeBox;
+    QComboBox*   m_tcpFecBox;
+    QComboBox*   m_tcpKcpProfileBox;
+    QComboBox*   m_udpModeBox;
+    QComboBox*   m_udpFecBox;
+    QComboBox*   m_udpKcpProfileBox;
     QComboBox*   m_mtuModeBox;
-    QCheckBox*   m_encryptCheck;
     QLineEdit*   m_passwordEdit;
     QPushButton* m_createBtn;
     QPushButton* m_joinBtn;
@@ -126,6 +144,16 @@ private:
     QTextEdit*   m_logEdit;
     QCheckBox*   m_detailLogCheck;
     bool         m_showDetailLog;
+
+    /* Settings */
+    QComboBox*   m_languageBox;
+    QLineEdit*   m_settingsServerEdit;
+    QSpinBox*    m_settingsPortBox;
+    QLineEdit*   m_settingsNameEdit;
+    QCheckBox*   m_settingsVerboseCheck;
+    int          m_serverRttMs;
+    quint64      m_lastUploadRate;
+    quint64      m_lastDownloadRate;
 };
 
 } // namespace VLan

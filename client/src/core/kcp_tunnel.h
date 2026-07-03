@@ -6,6 +6,7 @@
 #include <QHostAddress>
 #include <QByteArray>
 #include <QTimer>
+#include <functional>
 #include "ikcp.h"
 #include "protocol.h"
 
@@ -31,6 +32,9 @@ public:
               const QHostAddress& peerAddr, quint16 peerPort,
               FecMode fecMode = FEC_NONE,
               uint16_t mtu = ROOM_MTU_DEFAULT,
+              KcpProfile profile = KCP_PROFILE_REALTIME,
+              TrafficClass trafficClass = TRAFFIC_UDP,
+              bool secureFrames = false,
               QObject* parent = nullptr);
     ~KcpTunnel();
 
@@ -43,6 +47,8 @@ public:
     quint16      peerPort()    const { return m_peerPort; }
 
     void setRelayMode(uint32_t srcPeerId, uint32_t dstPeerId);
+    using DatagramSender = std::function<void(const QByteArray&, const QHostAddress&, quint16)>;
+    void setDatagramSender(DatagramSender sender) { m_datagramSender = sender; }
     bool isRelay() const { return m_relayMode; }
 
     int  waitSendCount() const;
@@ -67,12 +73,15 @@ private:
     bool     m_relayMode;
     uint32_t m_relaySrcPeerId;
     uint32_t m_relayDstPeerId;
+    TrafficClass m_trafficClass;
+    DatagramSender m_datagramSender;
 
     uint32_t m_lastRecvTime;
     uint32_t m_lastSendTime;
     bool     m_dead;
 
     FecMode      m_fecMode;
+    KcpProfile   m_profile;
     FecEncoder*  m_fecEncoder;
     FecDecoder*  m_fecDecoder;
 };

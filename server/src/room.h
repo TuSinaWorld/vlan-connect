@@ -1,11 +1,13 @@
-﻿#ifndef VLAN_ROOM_H
+#ifndef VLAN_ROOM_H
 #define VLAN_ROOM_H
 
 #include "protocol.h"
 #include "net_common.h"
+#include "secure_frame.h"
 #include <map>
 #include <vector>
 #include <string>
+#include <set>
 #include <cstring>
 #include <ctime>
 
@@ -19,7 +21,6 @@ struct ClientSession {
     uint32_t         roomId;
     struct sockaddr_in udpAddr;
     bool             udpAddrKnown;
-    NatType          natType;
     std::string      name;
     std::vector<uint8_t> recvBuf;
     std::vector<uint8_t> sendBuf;
@@ -28,67 +29,197 @@ struct ClientSession {
     time_t           lastPing;
     time_t           dataLastPing;
     bool             alive;
+    bool             helloDone;
+    bool             serverAuthOk;
+    bool             secureEnabled;
+    uint32_t         secureSessionId;
+    uint8_t          clientNonce[16];
+    uint8_t          serverNonce[16];
+    uint8_t          clientPubKey[32];
+    uint8_t          serverPrivKey[32];
+    uint8_t          serverPubKey[32];
+    uint8_t          secureMaster[32];
+    SecureFrameCipher secureCipher;
+    SecureFrameCipher dataCipher;
+    SecureFrameCipher udpCipher;
+    time_t           authDeadline;
 
     uint32_t         pendingJoinRoomId;
     uint8_t          authChallenge[32];
     bool             awaitingAuth;
+    bool             resumeAccepted;
+    uint32_t         resumeRoomId;
+    uint32_t         resumePeerId;
+    uint8_t          resumeToken[RECONNECT_TOKEN_SIZE];
 
     ClientSession()
         : tcpFd(-1), dataFd(-1), peerId(0), virtualIP(0), roomId(0),
-          udpAddrKnown(false), natType(NAT_UNKNOWN),
+          udpAddrKnown(false),
           lastPing(0), dataLastPing(0), alive(true),
-          pendingJoinRoomId(0), awaitingAuth(false) {
+          helloDone(false), serverAuthOk(false), secureEnabled(false),
+          secureSessionId(0), authDeadline(0),
+          pendingJoinRoomId(0), awaitingAuth(false),
+          resumeAccepted(false), resumeRoomId(0), resumePeerId(0) {
         memset(&udpAddr, 0, sizeof(udpAddr));
+        memset(clientNonce, 0, sizeof(clientNonce));
+        memset(serverNonce, 0, sizeof(serverNonce));
+        memset(clientPubKey, 0, sizeof(clientPubKey));
+        memset(serverPrivKey, 0, sizeof(serverPrivKey));
+        memset(serverPubKey, 0, sizeof(serverPubKey));
+        memset(secureMaster, 0, sizeof(secureMaster));
         memset(authChallenge, 0, sizeof(authChallenge));
+        memset(resumeToken, 0, sizeof(resumeToken));
     }
 
     int relayFd() const { return (dataFd >= 0) ? dataFd : tcpFd; }
+};
+
+struct RoomLease {
+    uint32_t    peerId;
+    uint32_t    virtualIP;
+    std::string name;
+    uint8_t     token[RECONNECT_TOKEN_SIZE];
+    bool        online;
+    time_t      offlineSince;
+    time_t      expiresAt;
+
+    RoomLease()
+        : peerId(0), virtualIP(0), online(false),
+          offlineSince(0), expiresAt(0) {
+        memset(token, 0, sizeof(token));
+    }
 };
 
 struct Room {
     uint32_t              id;
     std::string           name;
     uint32_t              hostPeerId;
-    std::vector<uint32_t> members;
+    std::vector<RoomLease> leases;
     uint8_t               maxPlayers;
-    TransportMode         transportMode;
-    FecMode               fecMode;
+    RoomTrafficPolicy     tcpPolicy;
+    RoomTrafficPolicy     udpPolicy;
     uint16_t              mtu;
-    uint8_t               nextIPSuffix;
-    uint8_t               encrypted;
+    uint8_t               passwordProtected;
     uint8_t               passwordHash[32];
-    uint8_t               salt[16];
-    uint8_t               sessionSeed[16];
     time_t                emptyTimestamp;
 
     Room() : id(0), hostPeerId(0), maxPlayers(MAX_PLAYERS),
-             transportMode(MODE_RELAY_KCP), fecMode(FEC_NONE),
-             mtu(ROOM_MTU_DEFAULT), nextIPSuffix(2), encrypted(0), emptyTimestamp(0) {
+             tcpPolicy(makeDefaultTcpPolicy()), udpPolicy(makeDefaultUdpPolicy()),
+             mtu(ROOM_MTU_DEFAULT), passwordProtected(0), emptyTimestamp(0) {
         memset(passwordHash, 0, sizeof(passwordHash));
-        memset(salt, 0, sizeof(salt));
-        memset(sessionSeed, 0, sizeof(sessionSeed));
     }
 
-    uint32_t allocateVirtualIP() {
-        uint32_t ip = VNET_SUBNET | nextIPSuffix;
-        ++nextIPSuffix;
-        return ip;
-    }
-
-    bool isFull() const {
-        return static_cast<uint8_t>(members.size()) >= maxPlayers;
-    }
-
-    bool hasMember(uint32_t peerId) const {
-        for (size_t i = 0; i < members.size(); ++i)
-            if (members[i] == peerId) return true;
+    bool hasVirtualIP(uint32_t ip) const {
+        for (size_t i = 0; i < leases.size(); ++i) {
+            if (leases[i].virtualIP == ip) return true;
+        }
         return false;
     }
 
-    void removeMember(uint32_t peerId) {
-        for (auto it = members.begin(); it != members.end(); ++it) {
-            if (*it == peerId) { members.erase(it); return; }
+    uint32_t allocateVirtualIP() const {
+        for (uint32_t suffix = VNET_FIRST_HOST_SUFFIX;
+             suffix <= VNET_LAST_HOST_SUFFIX; ++suffix) {
+            uint32_t ip = VNET_SUBNET | suffix;
+            if (!hasVirtualIP(ip)) return ip;
         }
+        return 0;
+    }
+
+    bool isFull() const {
+        return leases.size() >= maxPlayers;
+    }
+
+    bool hasLease(uint32_t peerId) const {
+        return leaseByPeerId(peerId) != nullptr;
+    }
+
+    RoomLease* leaseByPeerId(uint32_t peerId) {
+        for (size_t i = 0; i < leases.size(); ++i) {
+            if (leases[i].peerId == peerId) return &leases[i];
+        }
+        return nullptr;
+    }
+
+    const RoomLease* leaseByPeerId(uint32_t peerId) const {
+        for (size_t i = 0; i < leases.size(); ++i) {
+            if (leases[i].peerId == peerId) return &leases[i];
+        }
+        return nullptr;
+    }
+
+    RoomLease* addLease(uint32_t peerId, const std::string& peerName,
+                        const uint8_t token[RECONNECT_TOKEN_SIZE]) {
+        if (isFull() || hasLease(peerId)) return nullptr;
+        uint32_t ip = allocateVirtualIP();
+        if (ip == 0) return nullptr;
+
+        RoomLease lease;
+        lease.peerId = peerId;
+        lease.virtualIP = ip;
+        lease.name = peerName;
+        lease.online = true;
+        lease.offlineSince = 0;
+        lease.expiresAt = 0;
+        if (token)
+            memcpy(lease.token, token, RECONNECT_TOKEN_SIZE);
+        leases.push_back(lease);
+        emptyTimestamp = 0;
+        ensureHost();
+        return &leases.back();
+    }
+
+    bool removeLease(uint32_t peerId) {
+        for (auto it = leases.begin(); it != leases.end(); ++it) {
+            if (it->peerId == peerId) {
+                leases.erase(it);
+                if (leases.empty()) emptyTimestamp = time(nullptr);
+                ensureHost();
+                return true;
+            }
+        }
+        return false;
+    }
+
+    bool markLeaseOffline(uint32_t peerId, time_t now) {
+        RoomLease* lease = leaseByPeerId(peerId);
+        if (!lease) return false;
+        lease->online = false;
+        lease->offlineSince = now;
+        lease->expiresAt = now + RECONNECT_LEASE_TIMEOUT_SEC;
+        return true;
+    }
+
+    bool markLeaseOnline(uint32_t peerId) {
+        RoomLease* lease = leaseByPeerId(peerId);
+        if (!lease) return false;
+        lease->online = true;
+        lease->offlineSince = 0;
+        lease->expiresAt = 0;
+        ensureHost();
+        return true;
+    }
+
+    std::vector<uint32_t> peerIds() const {
+        std::vector<uint32_t> result;
+        result.reserve(leases.size());
+        for (size_t i = 0; i < leases.size(); ++i)
+            result.push_back(leases[i].peerId);
+        return result;
+    }
+
+    void ensureHost() {
+        if (leases.empty()) {
+            hostPeerId = 0;
+            return;
+        }
+        if (leaseByPeerId(hostPeerId)) return;
+        for (size_t i = 0; i < leases.size(); ++i) {
+            if (leases[i].online) {
+                hostPeerId = leases[i].peerId;
+                return;
+            }
+        }
+        hostPeerId = leases.front().peerId;
     }
 };
 
@@ -97,29 +228,27 @@ public:
     RoomManager() : m_nextRoomId(1) {}
 
     Room* createRoom(const std::string& name, uint32_t hostPeerId,
-                     uint8_t maxPlayers, TransportMode mode,
-                     FecMode fec = FEC_NONE,
+                     uint8_t maxPlayers,
+                     const RoomTrafficPolicy& tcpPolicy,
+                     const RoomTrafficPolicy& udpPolicy,
                      uint16_t mtu = ROOM_MTU_DEFAULT,
-                     uint8_t encrypted = 0,
-                     const uint8_t* pwdHash = nullptr,
-                     const uint8_t* salt = nullptr,
-                     const uint8_t* sessionSeed = nullptr) {
-        uint32_t rid = m_nextRoomId++;
+                     uint8_t passwordProtected = 0,
+                     const uint8_t* pwdHash = nullptr) {
+        uint32_t rid = allocateRoomId();
         Room& r = m_rooms[rid];
+        r = Room();
         r.id            = rid;
         r.name          = name;
         r.hostPeerId    = hostPeerId;
         r.maxPlayers    = maxPlayers;
-        r.transportMode = mode;
-        r.fecMode       = fec;
+        r.tcpPolicy     = tcpPolicy;
+        r.udpPolicy     = udpPolicy;
         r.mtu           = normalizeRoomMtu(mtu);
-        r.encrypted     = encrypted;
-        if (encrypted && pwdHash && salt && sessionSeed) {
+        r.passwordProtected = passwordProtected;
+        if (passwordProtected && pwdHash) {
             memcpy(r.passwordHash, pwdHash, 32);
-            memcpy(r.salt, salt, 16);
-            memcpy(r.sessionSeed, sessionSeed, 16);
         }
-        r.members.push_back(hostPeerId);
+        r.emptyTimestamp = 0;
         return &r;
     }
 
@@ -128,37 +257,23 @@ public:
         return (it != m_rooms.end()) ? &it->second : nullptr;
     }
 
-    bool joinRoom(uint32_t roomId, uint32_t peerId) {
+    void ensureHost(uint32_t roomId) {
         Room* r = getRoom(roomId);
-        if (!r || r->isFull() || r->hasMember(peerId)) return false;
-        r->members.push_back(peerId);
-        r->emptyTimestamp = 0;
-        return true;
+        if (r) r->ensureHost();
     }
 
-    void leaveRoom(uint32_t roomId, uint32_t peerId) {
-        Room* r = getRoom(roomId);
-        if (!r) return;
-        r->removeMember(peerId);
-        if (r->members.empty()) {
-            r->emptyTimestamp = time(nullptr);
-        } else if (r->hostPeerId == peerId) {
-            r->hostPeerId = r->members.front();
-        }
-    }
-
-    void cleanupEmptyRooms() {
-        static const int ROOM_GRACE_PERIOD_SEC = 60;
-        time_t now = time(nullptr);
+    bool cleanupEmptyRooms() {
+        bool changed = false;
         for (auto it = m_rooms.begin(); it != m_rooms.end(); ) {
-            if (it->second.members.empty() &&
-                it->second.emptyTimestamp > 0 &&
-                (now - it->second.emptyTimestamp) > ROOM_GRACE_PERIOD_SEC) {
+            if (it->second.leases.empty()) {
+                m_freeRoomIds.insert(it->first);
                 it = m_rooms.erase(it);
+                changed = true;
             } else {
                 ++it;
             }
         }
+        return changed;
     }
 
     std::vector<Room*> listRooms() {
@@ -167,8 +282,25 @@ public:
         return result;
     }
 
+    void eraseRoom(uint32_t roomId) {
+        auto it = m_rooms.find(roomId);
+        if (it == m_rooms.end()) return;
+        m_rooms.erase(it);
+        if (roomId != 0) m_freeRoomIds.insert(roomId);
+    }
+
 private:
+    uint32_t allocateRoomId() {
+        if (!m_freeRoomIds.empty()) {
+            uint32_t id = *m_freeRoomIds.begin();
+            m_freeRoomIds.erase(m_freeRoomIds.begin());
+            return id;
+        }
+        return m_nextRoomId++;
+    }
+
     std::map<uint32_t, Room> m_rooms;
+    std::set<uint32_t> m_freeRoomIds;
     uint32_t m_nextRoomId;
 };
 

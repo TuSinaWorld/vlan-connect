@@ -1,14 +1,31 @@
-﻿#include "cli_app.h"
+#include "cli_app.h"
 #include "cli_log.h"
 #include <cstdio>
 #include <cstring>
 #include <cstdlib>
 #include <csignal>
+#include <fstream>
 
 static VLan::CliApp* g_app = nullptr;
 
 static void signalHandler(int) {
     if (g_app) g_app->requestStop();
+}
+
+static std::string trimLine(const std::string& s) {
+    size_t start = s.find_first_not_of(" \t\r\n");
+    if (start == std::string::npos) return "";
+    size_t end = s.find_last_not_of(" \t\r\n");
+    return s.substr(start, end - start + 1);
+}
+
+static bool readPasswordFile(const char* path, std::string* out) {
+    std::ifstream in(path, std::ios::in);
+    if (!in) return false;
+    std::string line;
+    if (!std::getline(in, line)) return false;
+    *out = trimLine(line);
+    return !out->empty();
 }
 
 static void usage(const char* prog) {
@@ -18,14 +35,18 @@ static void usage(const char* prog) {
         "  -s HOST   Server address          (default: 127.0.0.1)\n"
         "  -p PORT   Server port             (default: %u)\n"
         "  -n NAME   Player name             (prompted if omitted)\n"
+        "  --auth PASSWORD       Server auth password for this process\n"
+        "  --auth-file PATH      Read server auth password from first line\n"
         "  -v        Verbose/debug log\n"
         "  -h        Show this help\n"
         "\n"
         "Interactive commands (after connecting):\n"
         "  list                                    List rooms\n"
-        "  create <name> [max] [mode] [fec] [pwd]  Create room\n"
-        "      mode: 1=P2P 2=KCP 3=TCP 4=RawUDP\n"
-        "      fec:  0=None 1=10%% 2=30%% 3=50%% 4=70%% 5=100%% 6=200%%\n"
+        "  server <host[:port]> [password]           Set server endpoint\n"
+        "  server-password <password>                Set cached server password\n"
+        "  create <name> [max] [password] [mtu] [opts]\n"
+        "      opts: tcp=raw|kcp|tcp udp=raw|kcp|tcp tcp-fec=none|30 udp-fec=none|30\n"
+        "            tcp-profile=realtime|bulk udp-profile=realtime|bulk mtu=1280|1400|1420\n"
         "  join <roomId> [password]                Join room\n"
         "  leave                                   Leave room\n"
         "  status                                  Show connection status\n"
@@ -38,6 +59,7 @@ int main(int argc, char* argv[]) {
     std::string serverHost = "127.0.0.1";
     uint16_t    serverPort = VLan::DEFAULT_PORT;
     std::string playerName;
+    std::string serverPassword;
     bool        verbose = false;
 
     for (int i = 1; i < argc; ++i) {
@@ -53,6 +75,13 @@ int main(int argc, char* argv[]) {
             serverPort = static_cast<uint16_t>(val);
         } else if (strcmp(argv[i], "-n") == 0 && i + 1 < argc) {
             playerName = argv[++i];
+        } else if (strcmp(argv[i], "--auth") == 0 && i + 1 < argc) {
+            serverPassword = argv[++i];
+        } else if (strcmp(argv[i], "--auth-file") == 0 && i + 1 < argc) {
+            if (!readPasswordFile(argv[++i], &serverPassword)) {
+                fprintf(stderr, "Error: failed to read auth password file\n");
+                return 1;
+            }
         } else if (strcmp(argv[i], "-v") == 0) {
             verbose = true;
         } else if (strcmp(argv[i], "-h") == 0 || strcmp(argv[i], "--help") == 0) {
@@ -72,6 +101,11 @@ int main(int argc, char* argv[]) {
     signal(SIGTERM, signalHandler);
 
     app.setServer(serverHost, serverPort);
+    const char* envPassword = std::getenv("VLAN_SERVER_AUTH_PASSWORD");
+    if (!serverPassword.empty())
+        app.setServerPassword(serverPassword);
+    else if (envPassword && *envPassword)
+        app.setServerPassword(envPassword);
     app.setPlayerName(playerName);
     app.setVerbose(verbose);
 

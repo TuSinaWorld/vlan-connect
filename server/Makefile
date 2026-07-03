@@ -6,7 +6,6 @@ SRCDIR   = src
 SOURCES  = $(SRCDIR)/main.cpp       \
            $(SRCDIR)/signal_server.cpp \
            $(SRCDIR)/relay_server.cpp  \
-           $(SRCDIR)/stun_server.cpp   \
            $(SRCDIR)/room.cpp          \
            $(SRCDIR)/server_logger.cpp \
            ../3rdparty/kcp/ikcp.c \

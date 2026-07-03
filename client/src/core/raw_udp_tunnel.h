@@ -6,6 +6,7 @@
 #include <QHostAddress>
 #include <QByteArray>
 #include <QMap>
+#include <functional>
 #include "protocol.h"
 
 namespace VLan {
@@ -29,6 +30,8 @@ public:
                  const QHostAddress& peerAddr, quint16 peerPort,
                  FecMode fecMode = FEC_NONE,
                  uint16_t mtu = ROOM_MTU_DEFAULT,
+                 TrafficClass trafficClass = TRAFFIC_UDP,
+                 bool secureFrames = false,
                  QObject* parent = nullptr);
     ~RawUdpTunnel();
 
@@ -41,6 +44,8 @@ public:
     quint16      peerPort()    const { return m_peerPort; }
 
     void setRelayMode(uint32_t srcPeerId, uint32_t dstPeerId);
+    using DatagramSender = std::function<void(const QByteArray&, const QHostAddress&, quint16)>;
+    void setDatagramSender(DatagramSender sender) { m_datagramSender = sender; }
     bool isRelay() const { return m_relayMode; }
 
     bool isAlive() const;
@@ -77,6 +82,8 @@ private:
     bool     m_relayMode;
     uint32_t m_relaySrcPeerId;
     uint32_t m_relayDstPeerId;
+    TrafficClass m_trafficClass;
+    DatagramSender m_datagramSender;
 
     uint16_t m_nextMsgId;
     uint32_t m_lastRecvTime;
@@ -89,6 +96,7 @@ private:
     FecEncoder*  m_fecEncoder;
     FecDecoder*  m_fecDecoder;
     uint16_t     m_roomMtu;
+    bool         m_secureFrames;
 
     int          m_rttMs;
 };
