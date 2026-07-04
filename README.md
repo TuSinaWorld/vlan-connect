@@ -1,82 +1,86 @@
 # VLan
 
-VLan is a virtual LAN relay tool built around a virtual network adapter, a relay server, and selectable TCP/UDP traffic policies.
+VLan 是一个虚拟局域网联机工具。它由 Linux 中继服务端、Windows 图形客户端、命令行客户端和虚拟网卡组成，用于让不同网络中的玩家像在同一个局域网内一样通信。
 
-## Current Design
+## 快速入口
 
-- Relay-only networking: Raw UDP, KCP, or TCP Relay.
-- Inner traffic split:
-  - TCP traffic uses its own transport/FEC/KCP profile policy.
-  - UDP and non-TCP traffic use their own transport/FEC/KCP profile policy.
-- Default room policy:
-  - TCP: Raw UDP, FEC off.
-  - UDP/non-TCP: KCP, FEC off, realtime profile.
-- Shared room settings: room name, max players, room password, MTU.
-- MTU options: `1280`, `1400`, `1420`; transport overhead is deducted internally.
-- Room password is only room access control. It is not used for transport encryption.
-- Server auth password is optional. When enabled, signaling, TCP relay data, UDP relay frames, and TUN payloads are encrypted after auth.
+- 服务端部署和 systemd 安装: [server/DEPLOY.md](server/DEPLOY.md)
+- CLI 客户端启动和交互命令: [client-cli/README.md](client-cli/README.md)
+- GUI 客户端构建: 见本文的 [GUI 客户端](#gui-客户端)
 
-## Components
+如果从 GitHub Release 安装服务端，不要只下载 `vlan-server-linux-*.tar.gz` 后直接运行。服务端安装还需要 `server/vlan-server.service`、`server/vlan-server.env.example`、`server/auth.password.example` 等文件，这些文件在 `vlan-connect-source-*.tar.gz` 源码包里。具体步骤见 [server/DEPLOY.md](server/DEPLOY.md)。
 
-- `server/`: Linux relay server, C++11, POSIX sockets, epoll.
-- `client/`: Windows GUI client, Qt 5.9.9, MSVC 2015.
-- `client-cli/`: command-line client.
-- `common/`: shared protocol, buffers, crypto helpers.
-- `3rdparty/`: bundled third-party code.
+## 功能概览
 
-## Server
+- 中继网络模式: Raw UDP、KCP、TCP Relay。
+- 流量分流:
+  - TCP 流量可以单独设置传输模式、FEC 和 KCP profile。
+  - UDP 及其它非 TCP 流量可以单独设置传输模式、FEC 和 KCP profile。
+- 默认房间策略:
+  - TCP: Raw UDP，关闭 FEC。
+  - UDP/非 TCP: KCP，关闭 FEC，realtime profile。
+- 房间设置: 房间名、最大人数、房间密码、MTU。
+- MTU 选项: `1280`、`1400`、`1420`，程序内部会扣除传输开销。
+- 房间密码只用于加入房间校验，不参与传输加密。
+- 服务端鉴权密码是可选的。启用后，信令、TCP Relay data channel、UDP relay frame 和 TUN payload 会在鉴权后加密传输。
 
-Build:
+## 目录结构
+
+- `server/`: Linux 中继服务端，C++11，POSIX sockets，epoll。
+- `client/`: Windows GUI 客户端，Qt 5.9.9，MSVC 2015。
+- `client-cli/`: 命令行客户端。
+- `common/`: 协议、字节缓冲区、加密辅助代码。
+- `3rdparty/`: 随源码一起携带的第三方代码。
+
+## 服务端
+
+完整部署文档见 [server/DEPLOY.md](server/DEPLOY.md)。
+
+源码构建:
 
 ```bash
 cd server
 make
 ```
 
-Run without server auth:
+前台运行，不启用服务端鉴权:
 
 ```bash
 ./vlan-server -p 11510
 ```
 
-Run with server auth:
+前台运行，启用服务端鉴权:
 
 ```bash
 ./vlan-server -p 11510 --auth-file /path/to/password.txt
 ```
 
-Supported auth sources:
+服务端端口:
 
-- `--auth-file PATH`
-- `VLAN_SERVER_AUTH_PASSWORD`
-- `--auth PASSWORD` for testing
-
-Ports:
-
-| Port | Protocol | Purpose |
+| 端口 | 协议 | 用途 |
 |---|---|---|
-| 11510 | TCP | Signaling and TCP relay data channel |
+| 11510 | TCP | 信令和 TCP Relay data channel |
 | 11510 | UDP | UDP relay traffic |
 
-## GUI Client
+## GUI 客户端
 
-Build with Qt 5.9.9 and MSVC 2015:
+使用 Qt 5.9.9 和 MSVC 2015 构建:
 
 ```cmd
 qmake network.pro
 nmake
 ```
 
-Run as Administrator so the virtual adapter can be created.
+运行 GUI 客户端时需要管理员权限，因为程序需要创建和配置虚拟网卡。
 
-Room creation is simple by default: room name, max players, and optional room password. Enable advanced settings to edit TCP/UDP transport policy, FEC, KCP profile, and MTU.
+GUI 客户端会在本机用户配置中保存语言、默认服务器地址、默认端口、默认昵称和详细日志开关。服务端鉴权密码和房间密码不会持久化保存。
 
-## CLI Client
+## CLI 客户端
 
-See `client-cli/README.md`.
+完整使用文档见 [client-cli/README.md](client-cli/README.md)。
 
-## Notes
+启动示例:
 
-- Updated clients and server are not wire-compatible with older versions.
-- TCP Relay is kept as an extreme fallback.
-- No public default server address is embedded in this repository.
+```bash
+vlan-cli -s 127.0.0.1 -p 11510 -n Player1
+```

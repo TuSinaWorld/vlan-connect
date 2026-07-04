@@ -1,29 +1,125 @@
 # VLan Server 部署指南
 
-本文面向新版本服务端。新版本不兼容旧客户端/旧服务端，升级时请确保 GUI、CLI、server 同步更新。
+本文说明如何把 VLan 服务端安装到 Linux 服务器，并用 systemd 管理服务。
 
-服务端默认监听同一个端口的 TCP 和 UDP，默认端口为 `11510`。TCP 用于信令和 TCP Relay data channel，UDP 用于 KCP/Raw UDP relay。
+## 相关文档
+
+- 项目入口和客户端说明: [../README.md](../README.md)
+- CLI 客户端使用: [../client-cli/README.md](../client-cli/README.md)
+
+## 服务端文件和安装路径
+
+推荐使用以下路径:
+
+| 文件或目录 | 目标路径 | 用途 |
+|---|---|---|
+| `vlan-server` | `/usr/local/bin/vlan-server` | 服务端可执行文件 |
+| `server/vlan-server.service` | `/etc/systemd/system/vlan-server.service` | systemd unit |
+| `server/vlan-server.env.example` | `/usr/local/bin/vlan-server.env` | 服务端环境配置 |
+| `server/auth.password.example` | `/usr/local/bin/auth.password` | 服务端鉴权密码文件模板 |
+| `server/DEPLOY.md` | `/usr/local/share/doc/vlan-server/DEPLOY.md` | 本部署文档 |
+| 工作目录 | `/var/lib/vlan-server` | systemd 管理的状态目录 |
+| 日志目录 | `/var/log/vlan-server` | 服务端日志目录 |
+
+不要只把 `vlan-server` 一个二进制文件上传到服务器后直接启动。默认的 systemd 配置还会读取 `/usr/local/bin/vlan-server.env` 和 `/usr/local/bin/auth.password`，缺少这些文件会导致服务启动失败或行为不符合预期。
 
 ## 运行模式
 
-- 无服务端鉴权：不启用传输层 SecureFrame 加密，但登录、房间、TCP/UDP 分流、FEC、Relay、断线重连等功能都应完整正常。
-- 有服务端鉴权：客户端必须先完成服务端密码鉴权。鉴权成功后，业务信令、TCP Relay data channel、UDP relay 和 TUN payload 都使用会话密钥加密传输。
-- 房间密码只用于房间加入控制，不参与传输加密派生。
+- 不启用服务端鉴权: 客户端直接连接服务端。
+- 启用服务端鉴权: 客户端先完成服务端密码鉴权，之后信令、TCP Relay data channel、UDP relay frame 和 TUN payload 使用会话密钥传输。
+- 房间密码只用于加入房间校验，不参与服务端鉴权，也不作为传输加密密钥。
 
-本指南提供的 `vlan-server.service` 默认启用服务端鉴权，并固定带 `--auth-file /usr/local/bin/auth.password`。也就是说，按本文部署后默认就是鉴权加密模式。
+本仓库提供的 `server/vlan-server.service` 默认启用服务端鉴权，并通过 `--auth-file /usr/local/bin/auth.password` 读取密码文件。
 
-## 路径约定
+## 方式一: 使用 Release 二进制包安装
 
-推荐按以下路径部署：
+适合不想在服务器上编译的用户。
 
-- 服务端程序：`/usr/local/bin/vlan-server`
-- systemd unit：`/etc/systemd/system/vlan-server.service`
-- 配置文件：`/usr/local/bin/vlan-server.env`
-- 鉴权密码文件：`/usr/local/bin/auth.password`
-- 工作目录：`/var/lib/vlan-server`
-- 应用日志：`/var/log/vlan-server/server.log`
+### 1. 下载文件
 
-## 构建
+从 GitHub Release 下载两个文件:
+
+- `vlan-server-linux-x86_64.tar.gz` 或 `vlan-server-linux-arm64.tar.gz`
+- `vlan-connect-source-vX.Y.Z.tar.gz`
+
+第一个包只包含服务端二进制和许可证文件。第二个源码包包含 systemd unit、环境配置模板、密码模板和部署文档。
+
+### 2. 上传到服务器
+
+在本机执行，按你的服务器地址替换 `user@example.com`:
+
+```bash
+scp vlan-server-linux-x86_64.tar.gz vlan-connect-source-vX.Y.Z.tar.gz \
+  user@example.com:/tmp/
+```
+
+如果服务器是 ARM64，把文件名换成 `vlan-server-linux-arm64.tar.gz`。
+
+### 3. 在服务器解压
+
+登录服务器:
+
+```bash
+ssh user@example.com
+```
+
+解压到临时目录:
+
+```bash
+mkdir -p /tmp/vlan-install
+cd /tmp/vlan-install
+tar -xzf /tmp/vlan-server-linux-x86_64.tar.gz
+tar -xzf /tmp/vlan-connect-source-vX.Y.Z.tar.gz
+```
+
+解压后通常会得到:
+
+```text
+vlan-server-linux-x86_64/
+vlan-connect-vX.Y.Z/
+```
+
+### 4. 创建目录
+
+```bash
+sudo install -d -o root -g root -m 0750 /var/lib/vlan-server
+sudo install -d -o root -g root -m 0750 /var/log/vlan-server
+sudo install -d -o root -g root -m 0755 /usr/local/share/doc/vlan-server
+```
+
+### 5. 安装文件
+
+```bash
+cd /tmp/vlan-install
+
+sudo install -o root -g root -m 0755 \
+  vlan-server-linux-x86_64/vlan-server \
+  /usr/local/bin/vlan-server
+
+sudo install -o root -g root -m 0644 \
+  vlan-connect-vX.Y.Z/server/vlan-server.service \
+  /etc/systemd/system/vlan-server.service
+
+sudo install -o root -g root -m 0644 \
+  vlan-connect-vX.Y.Z/server/DEPLOY.md \
+  /usr/local/share/doc/vlan-server/DEPLOY.md
+
+sudo install -o root -g root -m 0600 \
+  vlan-connect-vX.Y.Z/server/vlan-server.env.example \
+  /usr/local/bin/vlan-server.env
+
+sudo install -o root -g root -m 0600 \
+  vlan-connect-vX.Y.Z/server/auth.password.example \
+  /usr/local/bin/auth.password
+```
+
+如果使用 ARM64 包，把 `vlan-server-linux-x86_64` 换成 `vlan-server-linux-arm64`。
+
+## 方式二: 从源码构建后安装
+
+适合需要自己编译服务端的用户。
+
+### 1. 安装编译工具
 
 Debian/Ubuntu:
 
@@ -39,54 +135,73 @@ sudo dnf groupinstall -y "Development Tools"
 sudo dnf install -y git
 ```
 
-构建服务端：
+### 2. 获取源码
+
+可以直接 clone 仓库:
 
 ```bash
-cd /path/to/network
-make -C server clean all
+git clone https://github.com/TuSinaWorld/vlan-connect.git
+cd vlan-connect
 ```
 
-成功后会生成：
+也可以从 Release 下载 `vlan-connect-source-vX.Y.Z.tar.gz`，上传到服务器后解压:
 
 ```bash
+mkdir -p /tmp/vlan-build
+cd /tmp/vlan-build
+tar -xzf /tmp/vlan-connect-source-vX.Y.Z.tar.gz
+cd vlan-connect-vX.Y.Z
+```
+
+### 3. 构建服务端
+
+```bash
+make -C server
+```
+
+成功后会生成:
+
+```text
 server/vlan-server
 ```
 
-## 安装
+### 4. 安装文件
 
-创建运行目录：
+在源码根目录执行:
 
 ```bash
 sudo install -d -o root -g root -m 0750 /var/lib/vlan-server
 sudo install -d -o root -g root -m 0750 /var/log/vlan-server
 sudo install -d -o root -g root -m 0755 /usr/local/share/doc/vlan-server
-```
 
-安装二进制、配置示例、模拟鉴权文件、文档和 systemd unit：
-
-```bash
-cd /path/to/network
 sudo install -o root -g root -m 0755 server/vlan-server /usr/local/bin/vlan-server
 sudo install -o root -g root -m 0644 server/vlan-server.service /etc/systemd/system/vlan-server.service
 sudo install -o root -g root -m 0644 server/DEPLOY.md /usr/local/share/doc/vlan-server/DEPLOY.md
-
-sudo install -o root -g root -m 0600 server/vlan-server.env.example \
-  /usr/local/bin/vlan-server.env
-sudo install -o root -g root -m 0600 server/auth.password.example \
-  /usr/local/bin/auth.password
+sudo install -o root -g root -m 0600 server/vlan-server.env.example /usr/local/bin/vlan-server.env
+sudo install -o root -g root -m 0600 server/auth.password.example /usr/local/bin/auth.password
 ```
 
-`server/auth.password.example` 只是用于模拟鉴权文件和首次启动验证。正式部署前必须替换为自己的强密码。
+## 配置服务端
 
-## 配置
+### 1. 设置鉴权密码
 
-编辑环境配置：
+编辑密码文件:
+
+```bash
+sudoedit /usr/local/bin/auth.password
+```
+
+把第一行改成你自己的强密码。不要继续使用模板中的占位值，也不要把正式密码写入仓库。
+
+### 2. 检查环境配置
+
+编辑环境配置:
 
 ```bash
 sudoedit /usr/local/bin/vlan-server.env
 ```
 
-默认鉴权配置：
+默认配置:
 
 ```ini
 VLAN_SERVER_PORT=11510
@@ -96,19 +211,19 @@ VLAN_SERVER_AUTH_FILE=/usr/local/bin/auth.password
 VLAN_SERVER_EXTRA_ARGS=
 ```
 
-编辑鉴权密码文件：
+说明:
 
-```bash
-sudoedit /usr/local/bin/auth.password
-```
+- `VLAN_SERVER_PORT`: 服务端 TCP/UDP 共用端口。
+- `VLAN_SERVER_LOG`: 服务端日志文件路径。
+- `VLAN_SERVER_LOG_MAX_MB`: 单个日志文件大小上限，单位 MB。
+- `VLAN_SERVER_AUTH_FILE`: 服务端鉴权密码文件。
+- `VLAN_SERVER_EXTRA_ARGS`: 额外命令行参数。
 
-`/usr/local/bin/auth.password` 第一行写入服务端鉴权密码。不要把正式密码提交进仓库或写进 systemd unit 文件。
+服务端也支持 `VLAN_SERVER_AUTH_PASSWORD=...`，但不建议长期用环境变量保存密码。默认 systemd unit 使用 `--auth-file`。
 
-服务端也支持 `VLAN_SERVER_AUTH_PASSWORD=...`，但本 service 默认使用 `--auth-file`，不推荐长期用环境变量保存密码。
+## 防火墙和安全组
 
-## 防火墙
-
-必须同时放行 TCP 和 UDP。
+服务端需要同时开放 TCP 和 UDP。
 
 ufw:
 
@@ -126,9 +241,9 @@ sudo firewall-cmd --permanent --add-port=11510/udp
 sudo firewall-cmd --reload
 ```
 
-云服务器还需要在安全组中放行同样的 TCP/UDP 端口。
+如果使用云服务器，还需要在云厂商安全组里放行相同的 TCP/UDP 端口。
 
-## 启动
+## 启动服务
 
 ```bash
 sudo systemctl daemon-reload
@@ -136,14 +251,14 @@ sudo systemctl enable --now vlan-server
 sudo systemctl status vlan-server
 ```
 
-查看日志：
+查看日志:
 
 ```bash
 journalctl -u vlan-server -f
 sudo tail -f /var/log/vlan-server/server.log
 ```
 
-确认端口监听：
+确认端口监听:
 
 ```bash
 ss -lntup | grep 11510
@@ -152,49 +267,71 @@ ss -lnu | grep 11510
 
 ## 修改配置
 
-修改 `/usr/local/bin/vlan-server.env` 或 `/usr/local/bin/auth.password` 后重启：
+修改 `/usr/local/bin/vlan-server.env` 或 `/usr/local/bin/auth.password` 后重启:
 
 ```bash
 sudo systemctl restart vlan-server
 ```
 
-本 service 默认必须读取鉴权文件；如果鉴权文件不存在、为空或权限错误，服务会启动失败。
+如果鉴权密码文件不存在、为空或权限错误，默认服务会启动失败。
 
-## 升级
+## 前台验证
+
+需要排查 systemd 之外的问题时，可以先停止服务，然后前台运行:
 
 ```bash
-cd /path/to/network
-make -C server clean all
+sudo systemctl stop vlan-server
+/usr/local/bin/vlan-server -p 11510 -l /tmp/vlan-server.log -L 10 \
+  --auth-file /usr/local/bin/auth.password
+```
+
+验证结束后重新启动 systemd 服务:
+
+```bash
+sudo systemctl start vlan-server
+```
+
+## 更新服务端
+
+如果使用 Release 二进制包:
+
+```bash
+cd /tmp/vlan-install
+tar -xzf /tmp/vlan-server-linux-x86_64.tar.gz
+sudo systemctl stop vlan-server
+sudo install -o root -g root -m 0755 \
+  vlan-server-linux-x86_64/vlan-server \
+  /usr/local/bin/vlan-server
+sudo systemctl start vlan-server
+sudo systemctl status vlan-server
+```
+
+如果从源码构建:
+
+```bash
+cd /path/to/vlan-connect
+make -C server
 sudo systemctl stop vlan-server
 sudo install -o root -g root -m 0755 server/vlan-server /usr/local/bin/vlan-server
 sudo systemctl start vlan-server
 sudo systemctl status vlan-server
 ```
 
-本项目新版本不做旧 wire format 兼容。升级时请同时更新服务端、GUI 客户端和 CLI 客户端。
-
 ## 排错
 
-服务启动失败：
+服务启动失败:
 
 ```bash
 journalctl -u vlan-server -n 100 --no-pager
 ```
 
-常见原因：
+常见原因:
 
 - `/usr/local/bin/vlan-server` 不存在或不可执行。
 - `/usr/local/bin/auth.password` 不存在、为空，或权限导致服务进程无法读取。
-- TCP/UDP `11510` 被其他进程占用。
+- TCP/UDP `11510` 被其它进程占用。
 - 云安全组或系统防火墙只放行了 TCP，没有放行 UDP。
-- 客户端和服务端版本不一致，协议版本会被拒绝。
-
-临时前台运行验证：
-
-```bash
-/usr/local/bin/vlan-server -p 11510 -l /tmp/vlan-server.log -L 10 \
-  --auth-file /usr/local/bin/auth.password
-```
+- `/usr/local/bin/vlan-server.env` 内容有误。
 
 ## 卸载
 
@@ -206,7 +343,7 @@ sudo rm -f /usr/local/bin/vlan-server
 sudo rm -f /usr/local/bin/vlan-server.env /usr/local/bin/auth.password
 ```
 
-如需连配置和日志一起删除：
+如果需要同时删除日志和状态目录:
 
 ```bash
 sudo rm -rf /var/log/vlan-server /var/lib/vlan-server
