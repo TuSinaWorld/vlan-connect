@@ -44,14 +44,19 @@ cm256cc
   Notes: Because GPLv3-licensed cm256cc material is included, the combined
   VLan project is distributed under GPLv3.
 
-Wintun header
+Wintun header and runtime DLL
   Path: 3rdparty/wintun/wintun.h
-  Purpose: Windows TUN adapter API declarations used by the Windows client.
+  Runtime binary in Windows packages: wintun.dll
+  Purpose: Windows TUN adapter API declarations and runtime DLL used by the
+  Windows GUI and CLI clients.
   License: GPL-2.0 OR MIT; VLan uses the MIT option for this header.
   Copyright: Copyright (C) 2018-2021 WireGuard LLC.
-  Notes: The prebuilt wintun.dll binary is not included in this source tree.
-  If a binary release bundles wintun.dll, include the official Wintun binary
-  license notice supplied in the Wintun ZIP package by WireGuard LLC.
+  Notes: The source repository commits only wintun.h and does not vendor
+  prebuilt Wintun DLLs. Windows binary packages may bundle the official
+  prebuilt wintun.dll from the Wintun distribution. When the DLL is bundled,
+  the package must include the official Wintun LICENSE.txt, README.md, and
+  wintun.h notices supplied by WireGuard LLC, and the binary notice file should
+  identify the bundled DLL.
 
 External build/runtime dependencies
 -----------------------------------
@@ -69,9 +74,18 @@ Qt 5.9.9
   Installer: Qt 5.9.9 Open Source Windows installer:
     https://download.qt.io/archive/qt/5.9/5.9.9/qt-opensource-windows-x86-5.9.9.exe
   Notes: Qt is not vendored in this repository. If a Windows GUI client binary
-  is distributed with Qt runtime libraries, the binary package should preserve
-  the applicable Qt license texts and notices, keep this NOTICE file available
-  to recipients, and provide the Qt 5.9.9 source location above.
+  is distributed with Qt runtime libraries or plugins, the binary package
+  should preserve the applicable Qt license texts and notices, keep this NOTICE
+  file available to recipients, and provide the Qt 5.9.9 source location above.
+
+Microsoft Direct3D compiler runtime
+  Runtime binary in Windows GUI packages: D3Dcompiler_47.dll
+  Purpose: Runtime dependency used by Qt ANGLE/OpenGL support.
+  License: Microsoft component; not covered by the VLan, Qt, or Wintun
+  open-source licenses.
+  Notes: If this DLL is redistributed with a Windows GUI package, include the
+  applicable Microsoft redistribution notice or license terms for the
+  Qt/Visual Studio/Windows SDK package from which the DLL was obtained.
 
 MIT License text for MIT-licensed components
 --------------------------------------------
@@ -100,6 +114,8 @@ Distribution notes
 Source distributions should include LICENSE, NOTICE, and all third-party source
 license headers already present in the source tree.
 
-Binary distributions should include LICENSE, NOTICE, and license files/notices
-for bundled third-party binaries or dynamic libraries, including Qt and Wintun
-where applicable.
+Binary distributions should include LICENSE, NOTICE, a binary-specific
+third-party notice file, and license files/notices for bundled third-party
+binaries or dynamic libraries. For Windows GUI packages, this includes the Qt
+runtime DLLs/plugins, wintun.dll when bundled, D3Dcompiler_47.dll when bundled,
+and the corresponding files under the package's licenses/ directory.
