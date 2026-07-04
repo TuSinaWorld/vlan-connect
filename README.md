@@ -84,3 +84,7 @@ GUI 客户端会在本机用户配置中保存语言、默认服务器地址、�
 ```bash
 vlan-cli -s 127.0.0.1 -p 11510 -n Player1
 ```
+
+## 许可证与第三方组件
+
+本项目使用 GPL-3.0-only 开源协议，完整文本见 [LICENSE](LICENSE)。项目源码中包含或引用 KCP、Monocypher、cm256cc、Wintun header 等第三方组件；Windows 二进制包还可能随带 Qt 5.9.9 运行库、官方 Wintun DLL 和 Microsoft Direct3D compiler runtime。各组件保留其原始许可证和声明，汇总信息见 [NOTICE](NOTICE)。
