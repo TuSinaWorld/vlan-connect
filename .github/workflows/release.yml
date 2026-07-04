@@ -42,6 +42,14 @@ jobs:
             echo "tag=${GITHUB_REF_NAME}" >> "$GITHUB_OUTPUT"
           fi
 
+      - name: Verify release NOTICE
+        shell: bash
+        run: |
+          set -euo pipefail
+          grep -F "Wintun header and runtime DLL" NOTICE
+          grep -F "Runtime binary in Windows packages: wintun.dll" NOTICE
+          grep -F "D3Dcompiler_47.dll" NOTICE
+
       - name: Create or update release
         env:
           GH_TOKEN: ${{ github.token }}
@@ -55,6 +63,8 @@ jobs:
 
           ## Assets
 
+          Automated assets:
+
           vlan-connect-source-${RELEASE_TAG}.tar.gz
           vlan-server-linux-x86_64.tar.gz
           vlan-server-linux-arm64.tar.gz
@@ -64,10 +74,18 @@ jobs:
           LICENSE.txt
           NOTICE.txt
 
+          Optional manual Windows Qt GUI package:
+
+          vlan.with.Qt-windows-x64.rar
+
+          Manual GUI packages must include LICENSE.txt, NOTICE.txt copied from
+          this release tag, SOURCE.txt, THIRD-PARTY-BINARY-NOTICES.txt, and the
+          corresponding licenses/ directory.
+
           ## Qt Source Notice
 
           This software uses a Qt project, and according to the license requirements,
-          the Qt source code address should be provided.The Qt 5.9.9 Open Source
+          the Qt source code address should be provided. The Qt 5.9.9 Open Source
           package and corresponding source code are available from the official Qt archive:
 
           Qt 5.9.9 Open Source archive: [https://download.qt.io/archive/qt/5.9/5.9.9/](https://download.qt.io/archive/qt/5.9/5.9.9/)
@@ -98,6 +116,7 @@ jobs:
 
           cp LICENSE LICENSE.txt
           cp NOTICE NOTICE.txt
+          cmp NOTICE NOTICE.txt
           git archive \
             --format=tar.gz \
             --prefix="vlan-connect-${RELEASE_TAG}/" \
@@ -151,6 +170,7 @@ jobs:
           cp server/vlan-server "$stage/vlan-server"
           cp LICENSE "$stage/LICENSE.txt"
           cp NOTICE "$stage/NOTICE.txt"
+          cmp NOTICE "$stage/NOTICE.txt"
           cp 3rdparty/kcp/README.md "$stage/licenses/kcp/README.md"
           cp 3rdparty/monocypher/monocypher.h "$stage/licenses/monocypher/monocypher.h"
 
@@ -233,6 +253,7 @@ jobs:
           cp client-cli/linux/vlan-cli "$stage/vlan-cli"
           cp LICENSE "$stage/LICENSE.txt"
           cp NOTICE "$stage/NOTICE.txt"
+          cmp NOTICE "$stage/NOTICE.txt"
           cp 3rdparty/kcp/README.md "$stage/licenses/kcp/README.md"
           cp 3rdparty/monocypher/monocypher.h "$stage/licenses/monocypher/monocypher.h"
           cp 3rdparty/cm256cc/* "$stage/licenses/cm256cc/"
@@ -336,6 +357,11 @@ jobs:
           Copy-Item -LiteralPath 'client-cli\windows\vlan-cli.exe' -Destination (Join-Path $stage 'vlan-cli.exe')
           Copy-Item -LiteralPath 'LICENSE' -Destination (Join-Path $stage 'LICENSE.txt')
           Copy-Item -LiteralPath 'NOTICE' -Destination (Join-Path $stage 'NOTICE.txt')
+          $repoNoticeHash = (Get-FileHash -LiteralPath 'NOTICE' -Algorithm SHA256).Hash
+          $packageNoticeHash = (Get-FileHash -LiteralPath (Join-Path $stage 'NOTICE.txt') -Algorithm SHA256).Hash
+          if ($repoNoticeHash -ne $packageNoticeHash) {
+            throw 'Packaged NOTICE.txt does not match repository NOTICE'
+          }
           Copy-Item -LiteralPath '3rdparty\kcp\README.md' -Destination (Join-Path $stage 'licenses\kcp\README.md')
           Copy-Item -LiteralPath '3rdparty\monocypher\monocypher.h' -Destination (Join-Path $stage 'licenses\monocypher\monocypher.h')
           Copy-Item -Path '3rdparty\cm256cc\*' -Destination (Join-Path $stage 'licenses\cm256cc') -Force
