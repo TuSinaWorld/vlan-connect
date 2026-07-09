@@ -349,6 +349,7 @@ void CliApp::setupCallbacks() {
         onJoinResponse(rid, vip, tcpPolicy, udpPolicy, mtu, passwordProtected, members, leaseToken);
     };
     m_signal.onPeerJoined    = [this](PeerInfo info) { onPeerJoined(info); };
+    m_signal.onPeerResumed   = [this](PeerInfo info) { onPeerResumed(info); };
     m_signal.onPeerLeft      = [this](uint32_t pid) { onPeerLeft(pid); };
     m_signal.onRoomList      = [this](const std::vector<CliRoomListItem>& rooms, bool pushed) {
         m_cachedRoomList = rooms;
@@ -1283,6 +1284,39 @@ void CliApp::onPeerJoined(PeerInfo info) {
             name.c_str(), ipToString(info.virtualIP).c_str());
     fflush(stdout);
     m_signal.requestRelay(info.peerId);
+}
+
+void CliApp::rebuildPeerTransports(uint32_t peerId) {
+    CliPeerConnection* peer = m_tunnel.peerById(peerId);
+    if (!peer) return;
+
+    clearPendingRebuild(peerId);
+    for (int cls = TRAFFIC_TCP; cls <= TRAFFIC_UDP; ++cls) {
+        TrafficClass trafficClass = static_cast<TrafficClass>(cls);
+        if (peer->transport(trafficClass) == TRANSPORT_NONE)
+            continue;
+        m_tunnel.removeTransport(peerId, trafficClass);
+    }
+
+    if (m_signal.isConnected())
+        m_signal.requestRelay(peerId);
+}
+
+void CliApp::onPeerResumed(PeerInfo info) {
+    CliPeerConnection* peer = m_tunnel.peerById(info.peerId);
+    if (!peer) {
+        onPeerJoined(info);
+        return;
+    }
+
+    std::string name = info.name.empty() ? peer->name() : info.name;
+    LOG_INFO("[room] Peer resumed peerId=%u ip=%s name=%s oldTcp=%s oldUdp=%s",
+             info.peerId, ipToString(info.virtualIP).c_str(), name.c_str(),
+             transportName(peer->transport(TRAFFIC_TCP)),
+             transportName(peer->transport(TRAFFIC_UDP)));
+    fprintf(stdout, "* %s reconnected, rebuilding relay...\n> ", name.c_str());
+    fflush(stdout);
+    rebuildPeerTransports(info.peerId);
 }
 
 void CliApp::onRelayReady(uint32_t peerId) {

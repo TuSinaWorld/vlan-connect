@@ -76,6 +76,7 @@ public:
                        const std::vector<PeerInfo>& members,
                        const Buffer& leaseToken)> onJoinResponse;
     std::function<void(PeerInfo)> onPeerJoined;
+    std::function<void(PeerInfo)> onPeerResumed;
     std::function<void(uint32_t peerId)> onPeerLeft;
     std::function<void(const std::vector<CliRoomListItem>&, bool)> onRoomList;
     std::function<void(uint32_t peerId)> onRelayReady;

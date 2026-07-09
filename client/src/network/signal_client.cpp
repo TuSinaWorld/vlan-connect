@@ -528,6 +528,16 @@ void SignalClient::processMessage(uint8_t msgType,
         emit peerJoined(pi);
         break;
     }
+    case MSG_PEER_RESUMED: {
+        PeerInfo pi;
+        pi.peerId     = bb.readU32();
+        pi.virtualIP  = bb.readU32();
+        pi.name       = bb.readString();
+        pi.transport  = TRANSPORT_NONE;
+        LogManager::instance().logDetail(QString("[signal] PEER_RESUMED peerId=%1 vip=%2 name=%3").arg(pi.peerId).arg(virtualIPToString(pi.virtualIP)).arg(QString::fromStdString(pi.name)));
+        emit peerResumed(pi);
+        break;
+    }
     case MSG_PEER_LEFT: {
         uint32_t peerId = bb.readU32();
         LogManager::instance().logDetail(QString("[signal] PEER_LEFT peerId=%1").arg(peerId));

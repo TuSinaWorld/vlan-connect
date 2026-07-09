@@ -197,6 +197,7 @@ const UiEntry kEntries[] = {
     {"status.roomJoined", "Joined room (ID=%1, IP=%2, MTU=%3)", "已加入房间 (ID=%1, IP=%2, MTU=%3)"},
     {"status.playerJoined", "Player %1 joined room (IP=%2)", "玩家 %1 加入房间 (IP=%2)"},
     {"status.playerLeft", "Player %1 left room", "玩家 %1 离开房间"},
+    {"status.peerResumedRebuild", "%1 reconnected, rebuilding relay...", "%1 已重新连接，正在重建中继..."},
     {"status.relayReady", "%1 relay connected (TCP=%2, UDP=%3)", "%1 已建立中继连接 (TCP=%2, UDP=%3)"},
     {"status.dataChannelConnected", "Data channel connected", "数据通道已建立"},
     {"status.dataChannelDisconnected", "Data channel disconnected, reconnecting...", "数据通道断开，正在自动重连..."},

@@ -78,6 +78,7 @@ RoomManager::RoomManager(QObject* parent)
     connect(m_signal, &SignalClient::roomCreated,   this, &RoomManager::onRoomCreated);
     connect(m_signal, &SignalClient::joinResponse,  this, &RoomManager::onJoinResponse);
     connect(m_signal, &SignalClient::peerJoined,    this, &RoomManager::onPeerJoined);
+    connect(m_signal, &SignalClient::peerResumed,   this, &RoomManager::onPeerResumed);
     connect(m_signal, &SignalClient::peerLeft,      this, &RoomManager::onPeerLeft);
     connect(m_signal, &SignalClient::relayReady,    this, &RoomManager::onRelayReady);
     connect(m_signal, &SignalClient::logoutAck,     this, &RoomManager::onLogoutAck);
@@ -495,6 +496,23 @@ void RoomManager::finishManualDisconnect() {
         m_signal->disconnect();
 }
 
+void RoomManager::rebuildPeerTransports(uint32_t peerId) {
+    PeerConnection* peer = m_tunnel->peerById(peerId);
+    if (!peer) return;
+
+    clearPendingRebuild(peerId);
+    for (int cls = TRAFFIC_TCP; cls <= TRAFFIC_UDP; ++cls) {
+        TrafficClass trafficClass = static_cast<TrafficClass>(cls);
+        if (peer->transport(trafficClass) == TRANSPORT_NONE)
+            continue;
+        m_tunnel->removeTransport(peerId, trafficClass);
+        emit peerTransportChanged(peerId, trafficClass, TRANSPORT_NONE);
+    }
+
+    if (m_signal && m_signal->isConnected())
+        m_signal->requestRelay(peerId);
+}
+
 void RoomManager::onSecureSessionEstablished(uint32_t sessionId, QByteArray master) {
     if (m_tunnel)
         m_tunnel->setSecureSession(sessionId, master);
@@ -613,6 +631,29 @@ void RoomManager::onPeerJoined(PeerInfo info) {
     emit statusMessage(UiStrings::text("status.playerJoined")
                        .arg(name).arg(virtualIPToString(info.virtualIP)));
     m_signal->requestRelay(info.peerId);
+}
+
+void RoomManager::onPeerResumed(PeerInfo info) {
+    QString name = QString::fromStdString(info.name);
+    if (name.isEmpty()) name = QString("Peer%1").arg(info.peerId);
+
+    PeerConnection* peer = m_tunnel->peerById(info.peerId);
+    if (!peer) {
+        m_tunnel->addPeer(info.peerId, info.virtualIP, name);
+        emit peerConnected(info.peerId, info.virtualIP, name);
+        emit statusMessage(UiStrings::text("status.playerJoined")
+                           .arg(name).arg(virtualIPToString(info.virtualIP)));
+        m_signal->requestRelay(info.peerId);
+        return;
+    }
+
+    LogManager::instance().logDetail(QString("[room] Peer resumed peer=%1 vip=%2 oldTcp=%3 oldUdp=%4, rebuilding transports")
+        .arg(info.peerId)
+        .arg(virtualIPToString(info.virtualIP))
+        .arg(transportName(peer->transport(TRAFFIC_TCP)))
+        .arg(transportName(peer->transport(TRAFFIC_UDP))));
+    emit statusMessage(UiStrings::text("status.peerResumedRebuild").arg(peer->name()));
+    rebuildPeerTransports(info.peerId);
 }
 
 void RoomManager::onPeerLeft(uint32_t peerId) {

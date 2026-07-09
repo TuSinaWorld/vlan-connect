@@ -39,6 +39,7 @@ const char* tcpMsgName(uint8_t msgType) {
     case MSG_LEAVE_ROOM: return "LEAVE_ROOM";
     case MSG_LOGOUT: return "LOGOUT";
     case MSG_LOGOUT_ACK: return "LOGOUT_ACK";
+    case MSG_PEER_RESUMED: return "PEER_RESUMED";
     case MSG_LIST_ROOMS: return "LIST_ROOMS";
     case MSG_ROOM_LIST: return "ROOM_LIST";
     case MSG_ROOM_LIST_PUSH: return "ROOM_LIST_PUSH";
@@ -1303,6 +1304,14 @@ void SignalServer::completeResume(ClientSession& c, Room* room, RoomLease* lease
     LOG_INFO("[server] Peer %u resumed room %u, vip=%s members=%u/%u",
              c.peerId, room->id, ipToString(c.virtualIP).c_str(),
              (unsigned)room->leases.size(), room->maxPlayers);
+
+    ByteBuffer notify;
+    notify.writeU32(c.peerId);
+    notify.writeU32(c.virtualIP);
+    notify.writeString(c.name);
+    broadcastToRoom(room->id, MSG_PEER_RESUMED, notify, c.peerId);
+    LOG_INFO("[server] Peer %u resumed room %u, notifying peers for relay rebuild",
+             c.peerId, room->id);
 
     notifyRelayPeers(c);
 }

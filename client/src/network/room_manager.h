@@ -93,6 +93,7 @@ private slots:
                         QList<VLan::PeerInfo> members,
                         QByteArray leaseToken);
     void onPeerJoined(VLan::PeerInfo info);
+    void onPeerResumed(VLan::PeerInfo info);
     void onPeerLeft(uint32_t peerId);
     void onRelayReady(uint32_t peerId);
     void onLogoutAck();
@@ -122,6 +123,7 @@ private:
     void handleReconnectRoomList(QList<VLan::RoomListItem> rooms);
     void scheduleReconnectAttempt();
     void finishManualDisconnect();
+    void rebuildPeerTransports(uint32_t peerId);
     void startResumeLeaseDeadline();
     void expireResumeLeaseIfNeeded();
     bool hasUsableResumeLease();

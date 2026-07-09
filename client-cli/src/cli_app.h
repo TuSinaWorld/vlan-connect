@@ -68,6 +68,7 @@ private:
                         const std::vector<PeerInfo>& members,
                         const Buffer& leaseToken);
     void onPeerJoined(PeerInfo info);
+    void onPeerResumed(PeerInfo info);
     void onPeerLeft(uint32_t peerId);
     void onRelayReady(uint32_t peerId);
     void onLogoutAck();
@@ -83,6 +84,7 @@ private:
     void handleReconnectRoomList(const std::vector<CliRoomListItem>& rooms);
     void beginGracefulDisconnect(bool exitAfterDisconnect);
     void finishGracefulDisconnect();
+    void rebuildPeerTransports(uint32_t peerId);
     void clearPendingRebuild(uint32_t peerId);
     bool takePendingRebuild(uint32_t peerId, TrafficClass cls);
     static uint64_t transportKey(uint32_t peerId, TrafficClass cls);

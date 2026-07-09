@@ -79,6 +79,7 @@ signals:
                       QByteArray leaseToken);
     void logoutAck();
     void peerJoined(PeerInfo info);
+    void peerResumed(PeerInfo info);
     void peerLeft(uint32_t peerId);
     void roomList(QList<RoomListItem> rooms);
     void relayReady(uint32_t peerId);

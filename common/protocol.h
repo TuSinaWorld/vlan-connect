@@ -51,7 +51,7 @@ static const int TCP_RELAY_DEAD_MS      = 30000;              // peer-level time
 static const int TCP_RECV_TIMEOUT_MS    = 45000;              // client-side no-recv
 
 static const uint32_t PROTOCOL_MAGIC    = 0x564C414E; // "VLAN"
-static const uint16_t PROTOCOL_VERSION  = 5;
+static const uint16_t PROTOCOL_VERSION  = 6;
 
 enum UdpPacketType : uint8_t {
     UDP_KCP_DATA      = 0x01,
@@ -80,6 +80,7 @@ enum TcpMsgType : uint8_t {
     MSG_RESUME_ROOM    = 0x13,
     MSG_LOGOUT         = 0x14,
     MSG_LOGOUT_ACK     = 0x15,
+    MSG_PEER_RESUMED   = 0x16,
     MSG_TCP_RELAY_DATA      = 0x20,
     MSG_DATA_CHANNEL_INIT   = 0x21,
     MSG_DATA_CHANNEL_ACK    = 0x22,

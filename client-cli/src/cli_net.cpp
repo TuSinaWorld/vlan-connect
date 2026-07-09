@@ -430,6 +430,17 @@ void CliSignalClient::processMessage(uint8_t msgType, const uint8_t* payload, si
         if (onPeerJoined) onPeerJoined(pi);
         break;
     }
+    case MSG_PEER_RESUMED: {
+        PeerInfo pi;
+        pi.peerId     = bb.readU32();
+        pi.virtualIP  = bb.readU32();
+        pi.name       = bb.readString();
+        pi.transport  = TRANSPORT_NONE;
+        LOG_INFO("[signal] PEER_RESUMED peerId=%u ip=%s name=%s",
+                 pi.peerId, ipToString(pi.virtualIP).c_str(), pi.name.c_str());
+        if (onPeerResumed) onPeerResumed(pi);
+        break;
+    }
     case MSG_PEER_LEFT: {
         uint32_t peerId = bb.readU32();
         if (onPeerLeft) onPeerLeft(peerId);
