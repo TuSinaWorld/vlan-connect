@@ -166,8 +166,11 @@ void SignalServer::sendJoinResponse(ClientSession& c, Room* room,
 void SignalServer::markSessionOffline(ClientSession& c) {
     if (c.roomId == 0) return;
     Room* room = m_rooms.getRoom(c.roomId);
-    if (room)
-        room->markLeaseOffline(c.peerId, time(nullptr));
+    time_t now = time(nullptr);
+    if (room && room->markLeaseOffline(c.peerId, now)) {
+        LOG_INFO("[server] Peer %u marked offline in room %u, lease expires in %d sec",
+                 c.peerId, room->id, RECONNECT_LEASE_TIMEOUT_SEC);
+    }
     c.roomId = 0;
     c.virtualIP = 0;
 }
@@ -204,14 +207,37 @@ void SignalServer::cleanupExpiredLeases(time_t now) {
     for (Room* room : rooms) {
         for (size_t i = 0; i < room->leases.size(); ) {
             RoomLease& lease = room->leases[i];
+            auto peerIt = m_peerMap.find(lease.peerId);
+            bool hasLiveSession = peerIt != m_peerMap.end() &&
+                                  peerIt->second &&
+                                  peerIt->second->alive &&
+                                  peerIt->second->peerId == lease.peerId &&
+                                  peerIt->second->roomId == room->id;
+            if (lease.online && !hasLiveSession) {
+                lease.online = false;
+                lease.offlineSince = now;
+                lease.expiresAt = now + RECONNECT_LEASE_TIMEOUT_SEC;
+                LOG_INFO("[server] Online lease peer=%u room=%u vip=%s has no live session, marking offline for resume timeout",
+                         lease.peerId, room->id, ipToString(lease.virtualIP).c_str());
+                changed = true;
+            } else if (!lease.online && lease.expiresAt == 0) {
+                lease.offlineSince = now;
+                lease.expiresAt = now + RECONNECT_LEASE_TIMEOUT_SEC;
+                LOG_INFO("[server] Offline lease peer=%u room=%u vip=%s had no expiry, assigning resume timeout",
+                         lease.peerId, room->id, ipToString(lease.virtualIP).c_str());
+                changed = true;
+            }
             if (!lease.online && lease.expiresAt > 0 && now > lease.expiresAt) {
                 uint32_t peerId = lease.peerId;
+                uint32_t virtualIP = lease.virtualIP;
                 ByteBuffer notify;
                 notify.writeU32(peerId);
                 broadcastToRoom(room->id, MSG_PEER_LEFT, notify, peerId);
                 room->leases.erase(room->leases.begin() + i);
                 if (m_peerMap.find(peerId) == m_peerMap.end())
                     releasePeerId(peerId);
+                LOG_INFO("[server] Offline lease expired peer=%u room=%u vip=%s, removed",
+                         peerId, room->id, ipToString(virtualIP).c_str());
                 changed = true;
                 continue;
             }
@@ -1189,6 +1215,7 @@ void SignalServer::onCreateRoom(ClientSession& c, const uint8_t* p, size_t len) 
 void SignalServer::onJoinRoom(ClientSession& c, const uint8_t* p, size_t len) {
     if (c.peerId == 0) { sendError(c.tcpFd, "Not logged in"); return; }
     if (c.roomId != 0) { sendError(c.tcpFd, "Already in a room"); return; }
+    cleanupExpiredLeases(time(nullptr));
 
     ByteBuffer bb(p, len);
     uint32_t roomId = bb.readU32();
@@ -1217,6 +1244,7 @@ void SignalServer::onAuthResponse(ClientSession& c, const uint8_t* p, size_t len
         sendError(c.tcpFd, "Unexpected auth response");
         return;
     }
+    cleanupExpiredLeases(time(nullptr));
 
     Room* room = m_rooms.getRoom(c.pendingJoinRoomId);
     if (!room) {
@@ -1486,6 +1514,7 @@ void SignalServer::broadcastRoomListPush() {
 }
 
 void SignalServer::onListRooms(ClientSession& c) {
+    cleanupExpiredLeases(time(nullptr));
     auto rooms = m_rooms.listRooms();
     LOG_DETAIL("[server] ListRooms request from peer %u, rooms=%zu", c.peerId, rooms.size());
     ByteBuffer resp = buildRoomListPayload();
