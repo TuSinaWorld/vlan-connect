@@ -8,11 +8,15 @@ namespace VLan {
 CliTunnelManager::CliTunnelManager()
     : m_tun(nullptr), m_udpFd(SOCK_INVALID), m_localUdpPort(0),
       m_serverIP(0), m_serverPort(0), m_myPeerId(0), m_myVirtualIP(0),
-      m_secureUdpEnabled(false), m_secureSessionId(0)
+      m_dataPlaneState(DataPlaneState::Stopped),
+      m_securityMode(DataPlaneSecurityMode::Unconfigured),
+      m_secureSessionId(0)
 {}
 
 CliTunnelManager::~CliTunnelManager() {
+    stopDataPlane();
     removeAllPeers();
+    clearSecurityContext();
     if (m_udpFd != SOCK_INVALID) {
         sock_close(m_udpFd);
         m_udpFd = SOCK_INVALID;
@@ -52,12 +56,62 @@ void CliTunnelManager::setServerEndpoint(uint32_t ip, uint16_t port) {
     m_serverPort = port;
 }
 
-void CliTunnelManager::setSecureSession(uint32_t sessionId, const Buffer& master) {
+void CliTunnelManager::configurePlaintextSession() {
+    if (!dataPlaneCanReconfigure(m_dataPlaneState)) {
+        LOG_ERR("[tunnel] Refusing to change security while data plane is running");
+        return;
+    }
+    clearSecurityContext();
+    m_securityMode = DataPlaneSecurityMode::Plaintext;
+}
+
+bool CliTunnelManager::installSecureSession(uint32_t sessionId, const Buffer& master) {
+    if (!dataPlaneCanReconfigure(m_dataPlaneState)) {
+        LOG_ERR("[tunnel] Refusing to change security while data plane is running");
+        return false;
+    }
+    clearSecurityContext();
+    if (sessionId == 0 || master.size() != SECURE_KEY_SIZE) {
+        LOG_ERR("[tunnel] Invalid secure data-plane session");
+        return false;
+    }
     m_secureSessionId = sessionId;
     m_secureMaster = master;
-    m_secureUdpEnabled = (sessionId != 0 && master.size() == 32);
-    if (m_secureUdpEnabled)
-        m_udpCipher.init(m_secureMaster.data(), true, "udp");
+    m_udpCipher.init(m_secureMaster.data(), true, "udp");
+    m_securityMode = DataPlaneSecurityMode::Secure;
+    return true;
+}
+
+void CliTunnelManager::clearSecurityContext() {
+    if (!dataPlaneCanReconfigure(m_dataPlaneState)) {
+        LOG_ERR("[tunnel] Refusing to clear security while data plane is running");
+        return;
+    }
+    m_udpCipher.reset();
+    m_secureSessionId = 0;
+    if (!m_secureMaster.empty()) {
+        crypto_wipe(m_secureMaster.data(), m_secureMaster.size());
+        m_secureMaster.clear();
+    }
+    m_securityMode = DataPlaneSecurityMode::Unconfigured;
+}
+
+bool CliTunnelManager::startDataPlane() {
+    if (m_dataPlaneState == DataPlaneState::Running)
+        return true;
+    if (!m_tun || !m_tun->isRunning() ||
+        m_securityMode == DataPlaneSecurityMode::Unconfigured) {
+        LOG_ERR("[tunnel] Cannot start unconfigured data plane");
+        return false;
+    }
+    m_dataPlaneState = DataPlaneState::Running;
+    return true;
+}
+
+void CliTunnelManager::stopDataPlane() {
+    m_dataPlaneState = DataPlaneState::Stopped;
+    if (m_tun)
+        m_tun->recvQueue().popAll();
 }
 
 uint64_t CliTunnelManager::tunnelKey(uint32_t peerId, TrafficClass cls) {
@@ -66,8 +120,14 @@ uint64_t CliTunnelManager::tunnelKey(uint32_t peerId, TrafficClass cls) {
 
 void CliTunnelManager::udpSend(const uint8_t* data, size_t len,
                                uint32_t dstIP, uint16_t dstPort) {
+    if (!dataPlaneAllowsTraffic(m_dataPlaneState, m_securityMode) ||
+        m_udpFd == SOCK_INVALID) {
+        return;
+    }
     Buffer wrapped;
-    if (m_secureUdpEnabled) {
+    if (m_securityMode == DataPlaneSecurityMode::Secure) {
+        if (m_secureSessionId == 0 || m_secureMaster.size() != SECURE_KEY_SIZE)
+            return;
         std::vector<uint8_t> enc = m_udpCipher.encrypt(data, len);
         wrapped.resize(1 + SECURE_SESSION_ID_SIZE + enc.size());
         wrapped[0] = UDP_ENCRYPTED;
@@ -203,7 +263,7 @@ CliKcpTunnel* CliTunnelManager::createKcpTunnel(CliPeerConnection* peer,
 
     CliKcpTunnel* kcp = new CliKcpTunnel(conv, sender, addr, port, fecMode,
                                          mtu, profile, trafficClass,
-                                         m_secureUdpEnabled);
+                                         m_securityMode == DataPlaneSecurityMode::Secure);
     peer->setKcpTunnel(trafficClass, kcp);
     peer->setTransport(trafficClass, type);
     m_kcpByPeerClass[tunnelKey(peer->peerId(), trafficClass)] = kcp;
@@ -231,7 +291,7 @@ CliRawUdpTunnel* CliTunnelManager::createRawUdpTunnel(CliPeerConnection* peer,
 
     CliRawUdpTunnel* tunnel = new CliRawUdpTunnel(sender, addr, port, fecMode,
                                                   mtu, trafficClass,
-                                                  m_secureUdpEnabled);
+                                                  m_securityMode == DataPlaneSecurityMode::Secure);
     peer->setRawUdpTunnel(trafficClass, tunnel);
     peer->setTransport(trafficClass, TRANSPORT_RELAY_RAW_UDP);
     m_rawByPeerClass[tunnelKey(peer->peerId(), trafficClass)] = tunnel;
@@ -256,10 +316,13 @@ void CliTunnelManager::onUdpReadable() {
         int n = recvfrom(m_udpFd, buf, sizeof(buf), 0,
                          (struct sockaddr*)&senderAddr, &addrLen);
         if (n <= 0) break;
+        if (!dataPlaneAllowsTraffic(m_dataPlaneState, m_securityMode)) {
+            continue;
+        }
 
         uint8_t pktType = static_cast<uint8_t>(buf[0]);
         Buffer plain;
-        if (m_secureUdpEnabled) {
+        if (m_securityMode == DataPlaneSecurityMode::Secure) {
             if (pktType != UDP_ENCRYPTED)
                 continue;
             if (n < static_cast<int>(1 + SECURE_SESSION_ID_SIZE + SECURE_FRAME_OVERHEAD))
@@ -316,11 +379,18 @@ void CliTunnelManager::onUdpReadable() {
 void CliTunnelManager::processTunPackets() {
     if (!m_tun) return;
     auto packets = m_tun->recvQueue().popAll();
+    if (m_dataPlaneState != DataPlaneState::Running ||
+        m_securityMode == DataPlaneSecurityMode::Unconfigured) {
+        return;
+    }
     for (auto& pkt : packets)
         routeFromTun(pkt);
 }
 
 void CliTunnelManager::routeFromTun(const Buffer& ipPacket) {
+    if (!dataPlaneAllowsTraffic(m_dataPlaneState, m_securityMode)) {
+        return;
+    }
     if (ipPacket.size() < 20) return;
     uint32_t dstIP = extractDstIP(ipPacket.data(), ipPacket.size());
 
@@ -334,14 +404,25 @@ void CliTunnelManager::routeFromTun(const Buffer& ipPacket) {
 }
 
 void CliTunnelManager::routeToTun(const Buffer& ipPacket) {
+    if (!dataPlaneAllowsTraffic(m_dataPlaneState, m_securityMode)) {
+        return;
+    }
     if (m_tun) m_tun->writePacket(ipPacket);
 }
 
 void CliTunnelManager::onPeerDataReceived(uint32_t, const Buffer& ipPacket) {
+    if (m_dataPlaneState != DataPlaneState::Running ||
+        m_securityMode == DataPlaneSecurityMode::Unconfigured) {
+        return;
+    }
     routeToTun(ipPacket);
 }
 
 void CliTunnelManager::updateKcp() {
+    if (m_dataPlaneState != DataPlaneState::Running ||
+        m_securityMode == DataPlaneSecurityMode::Unconfigured) {
+        return;
+    }
     std::vector<uint64_t> kcpKeys;
     kcpKeys.reserve(m_kcpByPeerClass.size());
     for (auto& kv : m_kcpByPeerClass)
@@ -366,12 +447,18 @@ void CliTunnelManager::updateKcp() {
 }
 
 void CliTunnelManager::markTransportDead(uint32_t peerId, TrafficClass cls) {
+    if (m_dataPlaneState != DataPlaneState::Running)
+        return;
     int idx = static_cast<int>(cls);
     if (idx < 0 || idx > 2) cls = TRAFFIC_UDP;
     m_pendingTransportDead.insert(tunnelKey(peerId, cls));
 }
 
 void CliTunnelManager::flushPendingTransportDead() {
+    if (m_dataPlaneState != DataPlaneState::Running) {
+        m_pendingTransportDead.clear();
+        return;
+    }
     if (m_pendingTransportDead.empty())
         return;
 
@@ -389,6 +476,10 @@ void CliTunnelManager::flushPendingTransportDead() {
 }
 
 void CliTunnelManager::sendUdpKeepalive() {
+    if (m_dataPlaneState != DataPlaneState::Running ||
+        m_securityMode == DataPlaneSecurityMode::Unconfigured) {
+        return;
+    }
     if (m_serverIP == 0 || m_serverPort == 0) return;
     UdpHeader hdr;
     hdr.type = UDP_KEEPALIVE;

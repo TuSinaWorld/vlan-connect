@@ -197,15 +197,23 @@ public:
     }
 
     ~SecureFrameCipher() {
+        reset();
+    }
+
+    void reset() {
         crypto_wipe(m_sendKey, sizeof(m_sendKey));
         crypto_wipe(m_recvKey, sizeof(m_recvKey));
         crypto_wipe(m_sendNonceSeed, sizeof(m_sendNonceSeed));
         crypto_wipe(m_recvNonceSeed, sizeof(m_recvNonceSeed));
         crypto_wipe(m_replayBitmap, sizeof(m_replayBitmap));
+        m_sendCounter = 0;
+        m_recvMaxCounter = 0;
+        m_recvStarted = false;
     }
 
     void init(const uint8_t master[SECURE_KEY_SIZE], bool clientSide,
               const char* context = "signal") {
+        reset();
         uint8_t c2s[SECURE_KEY_SIZE], s2c[SECURE_KEY_SIZE];
         uint8_t c2sNonce[SECURE_KEY_SIZE], s2cNonce[SECURE_KEY_SIZE];
         std::string prefix = std::string("VLan-") + (context ? context : "signal");

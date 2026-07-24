@@ -61,7 +61,13 @@ public:
 
     void setMyPeerId(uint32_t id)   { m_myPeerId = id; }
     void setMyVirtualIP(uint32_t ip) { m_myVirtualIP = ip; }
-    void setSecureSession(uint32_t sessionId, const QByteArray& master);
+    void configurePlaintextSession();
+    bool installSecureSession(uint32_t sessionId, const QByteArray& master);
+    void clearSecurityContext();
+    bool startDataPlane();
+    void stopDataPlane();
+    DataPlaneState dataPlaneState() const { return m_dataPlaneState; }
+    DataPlaneSecurityMode securityMode() const { return m_securityMode; }
     void resetTrafficCounters();
     void trafficCounters(quint64* uploadBytes, quint64* downloadBytes) const;
     void addTunDownloadBytes(quint64 bytes);
@@ -117,7 +123,9 @@ private:
     uint32_t     m_myVirtualIP;
     quint64      m_tunUploadBytes;
     quint64      m_tunDownloadBytes;
-    bool         m_secureUdpEnabled;
+    quint64      m_tunGeneration;
+    DataPlaneState m_dataPlaneState;
+    DataPlaneSecurityMode m_securityMode;
     uint32_t     m_secureSessionId;
     QByteArray   m_secureMaster;
     SecureFrameCipher m_udpCipher;

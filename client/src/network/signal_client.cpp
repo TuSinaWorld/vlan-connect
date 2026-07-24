@@ -1,7 +1,10 @@
 #include "signal_client.h"
 #include "net_common.h"
+#include "signal_message_validator.h"
+#include "tcp_frame_probe.h"
 #include "../ui/log_manager.h"
 #include "../ui/ui_strings.h"
+#include <QPointer>
 #include <QTimer>
 #include <cstring>
 
@@ -10,7 +13,8 @@ namespace VLan {
 SignalClient::SignalClient(QObject* parent)
     : QObject(parent), m_myPeerId(0), m_serverPort(0), m_connectTimeoutMs(8000),
       m_lastRecvTime(0), m_pingSentTime(0),
-      m_serverAuthRequired(false), m_secureReady(false), m_secureSessionId(0)
+      m_serverAuthRequired(false), m_secureReady(false),
+      m_fatalDisconnectPending(false), m_secureSessionId(0)
 {
     memset(m_clientNonce, 0, sizeof(m_clientNonce));
     memset(m_serverNonce, 0, sizeof(m_serverNonce));
@@ -39,6 +43,24 @@ SignalClient::~SignalClient() {
     disconnect();
 }
 
+void SignalClient::resetSecureState() {
+    m_secureReady = false;
+    m_serverAuthRequired = false;
+    m_secureSessionId = 0;
+    m_secureCipher.reset();
+    if (!m_secureMaster.isEmpty()) {
+        crypto_wipe(
+            reinterpret_cast<uint8_t*>(m_secureMaster.data()),
+            static_cast<size_t>(m_secureMaster.size()));
+        m_secureMaster.clear();
+    }
+    crypto_wipe(m_clientNonce, sizeof(m_clientNonce));
+    crypto_wipe(m_serverNonce, sizeof(m_serverNonce));
+    crypto_wipe(m_clientPrivKey, sizeof(m_clientPrivKey));
+    crypto_wipe(m_clientPubKey, sizeof(m_clientPubKey));
+    crypto_wipe(m_serverPubKey, sizeof(m_serverPubKey));
+}
+
 void SignalClient::connectToServer(const QString& host, quint16 port,
                                    int timeoutMs) {
     if (m_socket->state() != QAbstractSocket::UnconnectedState) {
@@ -48,10 +70,8 @@ void SignalClient::connectToServer(const QString& host, quint16 port,
     m_serverPort       = port;
     m_connectTimeoutMs = timeoutMs;
     m_myPeerId         = 0;
-    m_serverAuthRequired = false;
-    m_secureReady = false;
-    m_secureSessionId = 0;
-    m_secureMaster.clear();
+    resetSecureState();
+    m_fatalDisconnectPending = false;
     m_recvBuf.clear();
     m_socket->connectToHost(host, port);
     m_connectTimer->start(timeoutMs);
@@ -72,6 +92,7 @@ void SignalClient::disconnect() {
     m_recvTimeoutTimer->stop();
     if (m_socket->state() != QAbstractSocket::UnconnectedState)
         m_socket->abort();
+    resetSecureState();
     m_myPeerId = 0;
 }
 
@@ -162,10 +183,22 @@ void SignalClient::requestRelay(uint32_t targetPeerId) {
     sendMsg(MSG_REQUEST_RELAY, bb);
 }
 
+void SignalClient::sendRelayData(uint32_t srcPeerId, uint32_t dstPeerId,
+                                 TrafficClass cls, const QByteArray& data) {
+    ByteBuffer bb;
+    bb.writeU32(srcPeerId);
+    bb.writeU32(dstPeerId);
+    bb.writeU8(static_cast<uint8_t>(cls));
+    if (!data.isEmpty())
+        bb.writeBytes(data.constData(), static_cast<size_t>(data.size()));
+    sendMsg(MSG_TCP_RELAY_DATA, bb);
+}
+
 // Socket events
 
 void SignalClient::onConnected() {
     m_connectTimer->stop();
+    m_fatalDisconnectPending = false;
     m_socket->setSocketOption(QAbstractSocket::LowDelayOption, 1);
     m_lastRecvTime = currentTimeMs();
     m_recvTimeoutTimer->start(5000);
@@ -176,6 +209,7 @@ void SignalClient::onDisconnected() {
     m_connectTimer->stop();
     m_pingTimer->stop();
     m_recvTimeoutTimer->stop();
+    resetSecureState();
     emit disconnected();
 }
 
@@ -186,14 +220,18 @@ void SignalClient::onSocketError(QAbstractSocket::SocketError err) {
     m_recvTimeoutTimer->stop();
     QString reason = m_socket->errorString();
     if (m_socket->state() != QAbstractSocket::ConnectedState) {
+        QPointer<SignalClient> guard(this);
         m_socket->abort();
+        if (guard.isNull()) return;
         emit connectFailed(reason);
     }
 }
 
 void SignalClient::onConnectTimeout() {
     if (m_socket->state() != QAbstractSocket::ConnectedState) {
+        QPointer<SignalClient> guard(this);
         m_socket->abort();
+        if (guard.isNull()) return;
         emit connectFailed(UiStrings::text("error.connectTimeout")
                            .arg(m_connectTimeoutMs / 1000));
     }
@@ -209,30 +247,53 @@ void SignalClient::onReadyRead() {
         return;
     }
 
-    while (m_recvBuf.size() >= static_cast<int>(sizeof(TcpMsgHeader))) {
-        const TcpMsgHeader* hdr =
-            reinterpret_cast<const TcpMsgHeader*>(m_recvBuf.constData());
-        uint16_t payloadLen = ntohs(hdr->length);
-
-        if (payloadLen > MAX_TCP_MSG_PAYLOAD) {
+    static const int FRAME_HEADER_SIZE = 3;
+    while (m_recvBuf.size() >= FRAME_HEADER_SIZE) {
+        const TcpFrameProbeResult frame = probeTcpFrame(
+            reinterpret_cast<const uint8_t*>(m_recvBuf.constData()),
+            static_cast<size_t>(m_recvBuf.size()));
+        if (frame.status == TcpFrameProbeStatus::Malformed) {
             handleStreamCorruption();
             return;
         }
+        if (frame.status == TcpFrameProbeStatus::NeedMore)
+            break;
 
-        int frameLen = static_cast<int>(sizeof(TcpMsgHeader)) + payloadLen;
-        if (m_recvBuf.size() < frameLen) break;
-
-        processMessage(hdr->msgType,
-                       reinterpret_cast<const uint8_t*>(m_recvBuf.constData()) + sizeof(TcpMsgHeader),
-                       payloadLen);
+        const uint8_t msgType = frame.msgType;
+        const uint16_t payloadLen = frame.payloadLength;
+        const int frameLen = static_cast<int>(frame.frameLength);
+        const QByteArray payload =
+            m_recvBuf.mid(FRAME_HEADER_SIZE, payloadLen);
         m_recvBuf.remove(0, frameLen);
+
+        QPointer<SignalClient> guard(this);
+        const uint8_t* payloadData = payloadLen > 0
+            ? reinterpret_cast<const uint8_t*>(payload.constData()) : nullptr;
+        if (!processMessage(msgType, payloadData, payloadLen))
+            return;
+        if (guard.isNull() ||
+            m_socket->state() != QAbstractSocket::ConnectedState)
+            return;
     }
 }
 
 void SignalClient::handleStreamCorruption() {
-        LogManager::instance().logError(QString("[signal] %1").arg(UiStrings::text("error.streamCorrupt")));
+    handleMalformedFrame(0, 0, "stream-corruption", 0);
+}
+
+void SignalClient::handleMalformedFrame(uint8_t msgType, size_t len,
+                                        const char* error, size_t offset) {
+    if (m_fatalDisconnectPending) return;
+    m_fatalDisconnectPending = true;
+    LogManager::instance().logError(
+        QString("[signal] Invalid frame type=0x%1 len=%2 error=%3 offset=%4")
+            .arg(msgType, 2, 16, QLatin1Char('0'))
+            .arg(static_cast<qulonglong>(len))
+            .arg(QString::fromLatin1(error ? error : "unknown"))
+            .arg(static_cast<qulonglong>(offset)));
     m_recvBuf.clear();
-    m_socket->abort();
+    if (m_socket->state() != QAbstractSocket::UnconnectedState)
+        m_socket->abort();
 }
 
 void SignalClient::onRecvTimeoutCheck() {
@@ -346,277 +407,340 @@ void SignalClient::sendMsg(uint8_t msgType) {
 
 // Incoming message dispatch
 
-void SignalClient::processMessage(uint8_t msgType,
+bool SignalClient::processMessage(uint8_t msgType,
                                   const uint8_t* payload, size_t len)
 {
-    ByteBuffer bb(payload, len);
+    try {
+        MessageValidationResult validation =
+            validateServerSignalPayload(msgType, payload, len);
+        if (validation.status == MessageValidationStatus::Malformed) {
+            if (validation.error == MessageValidationError::InvalidVersion) {
+                uint16_t receivedVersion = 0;
+                if (msgType == MSG_SERVER_HELLO && len >= 2) {
+                    receivedVersion = static_cast<uint16_t>(
+                        (static_cast<uint16_t>(payload[0]) << 8) |
+                         static_cast<uint16_t>(payload[1]));
+                } else if (msgType == MSG_LOGIN_RESP && len >= 6) {
+                    receivedVersion = static_cast<uint16_t>(
+                        (static_cast<uint16_t>(payload[4]) << 8) |
+                         static_cast<uint16_t>(payload[5]));
+                }
+                QPointer<SignalClient> guard(this);
+                emit serverError(UiStrings::text("error.protocolMismatch")
+                                 .arg(PROTOCOL_VERSION)
+                                 .arg(receivedVersion));
+                if (guard.isNull()) return false;
+            }
+            handleMalformedFrame(msgType, len,
+                                 messageValidationErrorName(validation.error),
+                                 validation.offset);
+            return false;
+        }
+        if (validation.status == MessageValidationStatus::UnknownType) {
+            LogManager::instance().logDetail(
+                QString("[signal] Ignoring unknown outer type=0x%1 len=%2")
+                    .arg(msgType, 2, 16, QLatin1Char('0'))
+                    .arg(static_cast<qulonglong>(len)));
+            return true;
+        }
 
-    if (g_verboseLog)
-        LogManager::instance().logDetail(QString("[signal] processMessage type=0x%1 len=%2").arg(msgType, 0, 16).arg(len));
+        std::vector<uint8_t> plain;
+        if (msgType == MSG_ENCRYPTED) {
+            if (!m_secureReady ||
+                !m_secureCipher.decrypt(payload, len, &plain) ||
+                plain.empty()) {
+                handleMalformedFrame(msgType, len, "decrypt-failed", 0);
+                return false;
+            }
+            msgType = plain[0];
+            payload = plain.size() > 1 ? plain.data() + 1 : nullptr;
+            len = plain.size() > 1 ? plain.size() - 1 : 0;
+            validation = validateServerSignalPayload(msgType, payload, len);
+            if (validation.status == MessageValidationStatus::Malformed) {
+                if (validation.error ==
+                    MessageValidationError::InvalidVersion) {
+                    uint16_t receivedVersion = 0;
+                    if (msgType == MSG_LOGIN_RESP && len >= 6) {
+                        receivedVersion = static_cast<uint16_t>(
+                            (static_cast<uint16_t>(payload[4]) << 8) |
+                             static_cast<uint16_t>(payload[5]));
+                    }
+                    QPointer<SignalClient> guard(this);
+                    emit serverError(
+                        UiStrings::text("error.protocolMismatch")
+                            .arg(PROTOCOL_VERSION)
+                            .arg(receivedVersion));
+                    if (guard.isNull()) return false;
+                }
+                handleMalformedFrame(msgType, len,
+                                     messageValidationErrorName(validation.error),
+                                     validation.offset);
+                return false;
+            }
+        } else if (m_secureReady) {
+            handleMalformedFrame(msgType, len, "plaintext-in-secure-mode", 0);
+            return false;
+        }
 
-    if (msgType == MSG_SERVER_HELLO) {
-        uint16_t serverVersion = bb.readU16();
-        bool authRequired = bb.remaining() > 0 ? (bb.readU8() != 0) : false;
-        LogManager::instance().logDetail(QString("[signal] SERVER_HELLO version=%1 authRequired=%2 len=%3")
-                                         .arg(serverVersion).arg(authRequired).arg(len));
-        if (serverVersion != PROTOCOL_VERSION) {
-            emit serverError(UiStrings::text("error.protocolMismatch")
-                             .arg(PROTOCOL_VERSION).arg(serverVersion));
-            m_socket->abort();
-            return;
+        if (g_verboseLog) {
+            LogManager::instance().logDetail(
+                QString("[signal] Received type=0x%1 len=%2")
+                    .arg(msgType, 2, 16, QLatin1Char('0'))
+                    .arg(static_cast<qulonglong>(len)));
         }
-        m_serverAuthRequired = authRequired;
-        if (!authRequired) {
-            m_pingTimer->start(KEEPALIVE_INTERVAL_MS);
-            emit connected();
-            return;
-        }
-        if (bb.remaining() < 48) {
-            emit serverError(UiStrings::text("error.invalidServerHello"));
-            m_socket->abort();
-            return;
-        }
-        bb.readBytes(m_serverNonce, 16);
-        bb.readBytes(m_serverPubKey, 32);
-        if (m_serverPassword.isEmpty()) {
-            LogManager::instance().logDetail(QStringLiteral("[signal] Server auth password required"));
-            emit serverPasswordRequired();
-        } else {
-            LogManager::instance().logDetail(QStringLiteral("[signal] Sending server auth proof"));
-            sendServerAuth();
-        }
-        return;
-    }
 
-    if (msgType == MSG_SERVER_AUTH_OK) {
-        LogManager::instance().logDetail(QString("[signal] SERVER_AUTH_OK len=%1").arg(len));
-        if (m_secureMaster.size() != 32 || bb.remaining() < 36) {
-            emit serverError(UiStrings::text("error.invalidAuthResponse"));
-            m_socket->abort();
-            return;
+        if (validation.status == MessageValidationStatus::UnknownType) {
+            LogManager::instance().logDetail(
+                QString("[signal] Ignoring unknown type=0x%1 len=%2")
+                    .arg(msgType, 2, 16, QLatin1Char('0'))
+                    .arg(static_cast<qulonglong>(len)));
+            return true;
         }
-        m_secureSessionId = bb.readU32();
-        QByteArray serverProof(32, '\0');
-        bb.readBytes(serverProof.data(), 32);
 
-        QByteArray inter = PayloadCipher::computeIntermediate(m_serverPassword);
-        QByteArray authHash = PayloadCipher::hashFromIntermediate(inter);
-        uint8_t expected[32];
-        computeServerAuthProof(expected,
-                               reinterpret_cast<const uint8_t*>(m_secureMaster.constData()),
-                               reinterpret_cast<const uint8_t*>(authHash.constData()));
-        if (crypto_verify32(expected, reinterpret_cast<const uint8_t*>(serverProof.constData())) != 0) {
-            emit serverError(UiStrings::text("error.serverProofFailed"));
-            m_socket->abort();
+        ByteBuffer bb(payload, len);
+
+        if (msgType == MSG_SERVER_HELLO) {
+            const uint16_t serverVersion = bb.readU16();
+            const bool authRequired = bb.readU8() != 0;
+            if (serverVersion != PROTOCOL_VERSION) {
+                QPointer<SignalClient> guard(this);
+                emit serverError(UiStrings::text("error.protocolMismatch")
+                                 .arg(PROTOCOL_VERSION).arg(serverVersion));
+                if (guard.isNull()) return false;
+                handleMalformedFrame(msgType, len, "invalid-version", 0);
+                return false;
+            }
+            m_serverAuthRequired = authRequired;
+            if (!authRequired) {
+                m_pingTimer->start(KEEPALIVE_INTERVAL_MS);
+                emit connected();
+                return true;
+            }
+            bb.readBytes(m_serverNonce, 16);
+            bb.readBytes(m_serverPubKey, 32);
+            if (m_serverPassword.isEmpty())
+                emit serverPasswordRequired();
+            else
+                sendServerAuth();
+            return true;
+        }
+
+        if (msgType == MSG_SERVER_AUTH_OK) {
+            if (m_secureMaster.size() != 32) {
+                QPointer<SignalClient> guard(this);
+                emit serverError(UiStrings::text("error.invalidAuthResponse"));
+                if (guard.isNull()) return false;
+                handleMalformedFrame(msgType, len, "auth-state-invalid", 0);
+                return false;
+            }
+
+            const uint32_t sessionId = bb.readU32();
+            QByteArray serverProof(32, '\0');
+            bb.readBytes(serverProof.data(), 32);
+
+            QByteArray inter = PayloadCipher::computeIntermediate(m_serverPassword);
+            QByteArray authHash = PayloadCipher::hashFromIntermediate(inter);
+            uint8_t expected[32];
+            computeServerAuthProof(
+                expected,
+                reinterpret_cast<const uint8_t*>(m_secureMaster.constData()),
+                reinterpret_cast<const uint8_t*>(authHash.constData()));
+            const bool proofValid =
+                crypto_verify32(expected,
+                    reinterpret_cast<const uint8_t*>(serverProof.constData())) == 0;
             crypto_wipe(expected, sizeof(expected));
             crypto_wipe(reinterpret_cast<uint8_t*>(inter.data()), inter.size());
             crypto_wipe(reinterpret_cast<uint8_t*>(authHash.data()), authHash.size());
-            return;
-        }
-        m_secureCipher.init(reinterpret_cast<const uint8_t*>(m_secureMaster.constData()), true, "signal");
-        m_secureReady = true;
-        LogManager::instance().logDetail(QString("[signal] Secure session established session=%1")
-                                         .arg(m_secureSessionId));
-        m_pingTimer->start(KEEPALIVE_INTERVAL_MS);
-        emit secureSessionEstablished(m_secureSessionId, m_secureMaster);
-        emit connected();
-        crypto_wipe(expected, sizeof(expected));
-        crypto_wipe(reinterpret_cast<uint8_t*>(inter.data()), inter.size());
-        crypto_wipe(reinterpret_cast<uint8_t*>(authHash.data()), authHash.size());
-        return;
-    }
 
-    if (msgType == MSG_ENCRYPTED) {
-        if (!m_secureReady) {
-            LogManager::instance().logError(QStringLiteral("[signal] Encrypted frame before secure session"));
-            handleStreamCorruption();
-            return;
-        }
-        std::vector<uint8_t> plain;
-        if (!m_secureCipher.decrypt(payload, len, &plain) || plain.empty()) {
-            LogManager::instance().logError(QString("[signal] Cannot decrypt frame len=%1").arg(len));
-            handleStreamCorruption();
-            return;
-        }
-        msgType = plain[0];
-        payload = plain.size() > 1 ? plain.data() + 1 : nullptr;
-        len = plain.size() > 1 ? plain.size() - 1 : 0;
-        LogManager::instance().logDetail(QString("[signal] Decrypted frame type=0x%1 bodyLen=%2")
-                                         .arg(msgType, 2, 16, QLatin1Char('0')).arg(len));
-        bb = len > 0 ? ByteBuffer(payload, len) : ByteBuffer();
-    } else if (m_secureReady) {
-        LogManager::instance().logError(QString("[signal] Plaintext frame 0x%1 received in secure mode")
-                                        .arg(msgType, 2, 16, QLatin1Char('0')));
-        handleStreamCorruption();
-        return;
-    }
+            if (!proofValid) {
+                QPointer<SignalClient> guard(this);
+                emit serverError(UiStrings::text("error.serverProofFailed"));
+                if (guard.isNull()) return false;
+                handleMalformedFrame(msgType, len, "invalid-server-proof", 0);
+                return false;
+            }
 
-    switch (msgType) {
-    case MSG_LOGIN_RESP: {
-        m_myPeerId = bb.readU32();
-        uint16_t serverVersion = bb.remaining() >= 2 ? bb.readU16() : 1;
-        bool resumeAccepted = bb.remaining() > 0 ? (bb.readU8() != 0) : false;
-        LogManager::instance().logDetail(QString("[signal] LOGIN_RESP peerId=%1 serverVersion=%2 resume=%3").arg(m_myPeerId).arg(serverVersion).arg(resumeAccepted));
-        if (serverVersion != PROTOCOL_VERSION) {
-            LogManager::instance().logError(QString("[signal] Protocol version mismatch: client=%1 server=%2").arg(PROTOCOL_VERSION).arg(serverVersion));
+            m_secureSessionId = sessionId;
+            m_secureCipher.init(
+                reinterpret_cast<const uint8_t*>(m_secureMaster.constData()),
+                true, "signal");
+            m_secureReady = true;
+            m_pingTimer->start(KEEPALIVE_INTERVAL_MS);
+            QPointer<SignalClient> guard(this);
+            emit secureSessionEstablished(m_secureSessionId, m_secureMaster);
+            if (guard.isNull() ||
+                guard->m_socket->state() != QAbstractSocket::ConnectedState)
+                return false;
+            emit connected();
+            return true;
         }
-        emit loginResponse(m_myPeerId, resumeAccepted);
-        break;
-    }
-    case MSG_ROOM_CREATED: {
-        uint32_t roomId = bb.readU32();
-        uint32_t vip    = bb.readU32();
-        RoomTrafficPolicy tcpPolicy = normalizeTrafficPolicy(
-            bb.readU8(), bb.readU8(), bb.readU8(), makeDefaultTcpPolicy());
-        RoomTrafficPolicy udpPolicy = normalizeTrafficPolicy(
-            bb.readU8(), bb.readU8(), bb.readU8(), makeDefaultUdpPolicy());
-        bool passwordProtected = bb.remaining() > 0 ? (bb.readU8() != 0) : false;
-        uint16_t mtu = bb.remaining() >= 2 ? normalizeRoomMtu(bb.readU16()) : ROOM_MTU_DEFAULT;
-        QByteArray leaseToken;
-        if (bb.remaining() >= RECONNECT_TOKEN_SIZE) {
-            leaseToken.resize(RECONNECT_TOKEN_SIZE);
-            bb.readBytes(leaseToken.data(), RECONNECT_TOKEN_SIZE);
+
+        switch (msgType) {
+        case MSG_LOGIN_RESP: {
+            const uint32_t peerId = bb.readU32();
+            const uint16_t serverVersion = bb.readU16();
+            const bool resumeAccepted = bb.readU8() != 0;
+            if (serverVersion != PROTOCOL_VERSION) {
+                QPointer<SignalClient> guard(this);
+                emit serverError(UiStrings::text("error.protocolMismatch")
+                                 .arg(PROTOCOL_VERSION).arg(serverVersion));
+                if (guard.isNull()) return false;
+                handleMalformedFrame(msgType, len, "invalid-version", 4);
+                return false;
+            }
+            m_myPeerId = peerId;
+            emit loginResponse(peerId, resumeAccepted);
+            return true;
         }
-        LogManager::instance().logDetail(QString("[signal] ROOM_CREATED roomId=%1 vip=%2 tcp=%3/%4 udp=%5/%6 mtu=%7 password=%8")
-            .arg(roomId).arg(virtualIPToString(vip))
-            .arg(tcpPolicy.transportMode).arg(tcpPolicy.fecMode)
-            .arg(udpPolicy.transportMode).arg(udpPolicy.fecMode)
-            .arg(mtu).arg(passwordProtected));
-        emit roomCreated(roomId, vip, tcpPolicy, udpPolicy, mtu, passwordProtected, leaseToken);
-        break;
-    }
-    case MSG_JOIN_RESP: {
-        uint32_t roomId = bb.readU32();
-        uint32_t vip    = bb.readU32();
-        RoomTrafficPolicy tcpPolicy = normalizeTrafficPolicy(
-            bb.readU8(), bb.readU8(), bb.readU8(), makeDefaultTcpPolicy());
-        RoomTrafficPolicy udpPolicy = normalizeTrafficPolicy(
-            bb.readU8(), bb.readU8(), bb.readU8(), makeDefaultUdpPolicy());
-        bool passwordProtected = bb.remaining() > 0 ? (bb.readU8() != 0) : false;
-        uint16_t mtu = bb.remaining() >= 2 ? normalizeRoomMtu(bb.readU16()) : ROOM_MTU_DEFAULT;
-        uint8_t  count  = bb.readU8();
-        QList<PeerInfo> members;
-        for (uint8_t i = 0; i < count; ++i) {
-            PeerInfo pi;
-            pi.peerId     = bb.readU32();
-            pi.virtualIP  = bb.readU32();
-            pi.name       = bb.readString();
-            pi.transport  = TRANSPORT_NONE;
-            members.append(pi);
-        }
-        QByteArray leaseToken;
-        if (bb.remaining() >= RECONNECT_TOKEN_SIZE) {
-            leaseToken.resize(RECONNECT_TOKEN_SIZE);
-            bb.readBytes(leaseToken.data(), RECONNECT_TOKEN_SIZE);
-        }
-        LogManager::instance().logDetail(QString("[signal] JOIN_RESP roomId=%1 vip=%2 tcp=%3/%4 udp=%5/%6 mtu=%7 password=%8 members=%9")
-            .arg(roomId).arg(virtualIPToString(vip))
-            .arg(tcpPolicy.transportMode).arg(tcpPolicy.fecMode)
-            .arg(udpPolicy.transportMode).arg(udpPolicy.fecMode)
-            .arg(mtu).arg(passwordProtected).arg(count));
-        m_pendingAuthHash.clear();
-        emit joinResponse(roomId, vip, tcpPolicy, udpPolicy, mtu, passwordProtected, members, leaseToken);
-        break;
-    }
-    case MSG_PEER_JOINED: {
-        PeerInfo pi;
-        pi.peerId     = bb.readU32();
-        pi.virtualIP  = bb.readU32();
-        pi.name       = bb.readString();
-        pi.transport  = TRANSPORT_NONE;
-        LogManager::instance().logDetail(QString("[signal] PEER_JOINED peerId=%1 vip=%2 name=%3").arg(pi.peerId).arg(virtualIPToString(pi.virtualIP)).arg(QString::fromStdString(pi.name)));
-        emit peerJoined(pi);
-        break;
-    }
-    case MSG_PEER_RESUMED: {
-        PeerInfo pi;
-        pi.peerId     = bb.readU32();
-        pi.virtualIP  = bb.readU32();
-        pi.name       = bb.readString();
-        pi.transport  = TRANSPORT_NONE;
-        LogManager::instance().logDetail(QString("[signal] PEER_RESUMED peerId=%1 vip=%2 name=%3").arg(pi.peerId).arg(virtualIPToString(pi.virtualIP)).arg(QString::fromStdString(pi.name)));
-        emit peerResumed(pi);
-        break;
-    }
-    case MSG_PEER_LEFT: {
-        uint32_t peerId = bb.readU32();
-        LogManager::instance().logDetail(QString("[signal] PEER_LEFT peerId=%1").arg(peerId));
-        emit peerLeft(peerId);
-        break;
-    }
-    case MSG_LOGOUT_ACK: {
-        LogManager::instance().logDetail(QStringLiteral("[signal] LOGOUT_ACK"));
-        m_myPeerId = 0;
-        emit logoutAck();
-        break;
-    }
-    case MSG_ROOM_LIST:
-    case MSG_ROOM_LIST_PUSH: {
-        uint16_t count = bb.readU16();
-        QList<RoomListItem> rooms;
-        for (uint16_t i = 0; i < count; ++i) {
-            RoomListItem ri;
-            ri.roomId      = bb.readU32();
-            std::string nm = bb.readString();
-            strncpy(ri.roomName, nm.c_str(), MAX_ROOM_NAME_LEN);
-            ri.roomName[MAX_ROOM_NAME_LEN] = '\0';
-            ri.playerCount = bb.readU8();
-            ri.maxPlayers  = bb.readU8();
-            ri.tcpPolicy = normalizeTrafficPolicy(
+        case MSG_ROOM_CREATED: {
+            const uint32_t roomId = bb.readU32();
+            const uint32_t vip = bb.readU32();
+            const RoomTrafficPolicy tcpPolicy = normalizeTrafficPolicy(
                 bb.readU8(), bb.readU8(), bb.readU8(), makeDefaultTcpPolicy());
-            ri.udpPolicy = normalizeTrafficPolicy(
+            const RoomTrafficPolicy udpPolicy = normalizeTrafficPolicy(
                 bb.readU8(), bb.readU8(), bb.readU8(), makeDefaultUdpPolicy());
-            ri.passwordProtected = bb.remaining() > 0 ? bb.readU8() : 0;
-            ri.mtu = bb.remaining() >= 2 ? normalizeRoomMtu(bb.readU16()) : ROOM_MTU_DEFAULT;
-            rooms.append(ri);
+            const bool passwordProtected = bb.readU8() != 0;
+            const uint16_t mtu = bb.readU16();
+            QByteArray leaseToken(RECONNECT_TOKEN_SIZE, '\0');
+            bb.readBytes(leaseToken.data(), RECONNECT_TOKEN_SIZE);
+            emit roomCreated(roomId, vip, tcpPolicy, udpPolicy, mtu,
+                             passwordProtected, leaseToken);
+            return true;
         }
-        LogManager::instance().logDetail(QString("[signal] %1 count=%2")
-            .arg(msgType == MSG_ROOM_LIST_PUSH ? "ROOM_LIST_PUSH" : "ROOM_LIST")
-            .arg(count));
-        emit roomList(rooms);
-        break;
-    }
-    case MSG_RELAY_READY: {
-        uint32_t peerId = bb.readU32();
-        LogManager::instance().logDetail(QString("[signal] RELAY_READY peerId=%1").arg(peerId));
-        emit relayReady(peerId);
-        break;
-    }
-    case MSG_PONG: {
-        if (m_pingSentTime != 0) {
-            int rtt = static_cast<int>(currentTimeMs() - m_pingSentTime);
-            m_pingSentTime = 0;
-            LogManager::instance().logDetail(QString("[signal] PONG rtt=%1 ms").arg(rtt));
-            emit serverRttUpdated(rtt);
-        }
-        break;
-    }
-    case MSG_AUTH_CHALLENGE: {
-        if (m_pendingAuthHash.size() == 32 && bb.remaining() >= 32) {
-            QByteArray challenge(32, '\0');
-            bb.readBytes(challenge.data(), 32);
-            QByteArray response = PayloadCipher::challengeResponse(
-                m_pendingAuthHash, challenge);
-            ByteBuffer respBuf;
-            respBuf.writeBytes(response.constData(), 32);
-            sendMsg(MSG_AUTH_RESPONSE, respBuf);
-            LogManager::instance().logDetail(QString("[signal] AUTH_CHALLENGE received, response sent"));
-        } else {
-            LogManager::instance().logError(QString("[signal] AUTH_CHALLENGE but no pending auth hash"));
+        case MSG_JOIN_RESP: {
+            const uint32_t roomId = bb.readU32();
+            const uint32_t vip = bb.readU32();
+            const RoomTrafficPolicy tcpPolicy = normalizeTrafficPolicy(
+                bb.readU8(), bb.readU8(), bb.readU8(), makeDefaultTcpPolicy());
+            const RoomTrafficPolicy udpPolicy = normalizeTrafficPolicy(
+                bb.readU8(), bb.readU8(), bb.readU8(), makeDefaultUdpPolicy());
+            const bool passwordProtected = bb.readU8() != 0;
+            const uint16_t mtu = bb.readU16();
+            const uint8_t count = bb.readU8();
+            QList<PeerInfo> members;
+            for (uint8_t i = 0; i < count; ++i) {
+                PeerInfo info;
+                info.peerId = bb.readU32();
+                info.virtualIP = bb.readU32();
+                info.name = bb.readString();
+                info.transport = TRANSPORT_NONE;
+                members.append(info);
+            }
+            QByteArray leaseToken(RECONNECT_TOKEN_SIZE, '\0');
+            bb.readBytes(leaseToken.data(), RECONNECT_TOKEN_SIZE);
             m_pendingAuthHash.clear();
+            emit joinResponse(roomId, vip, tcpPolicy, udpPolicy, mtu,
+                              passwordProtected, members, leaseToken);
+            return true;
         }
-        break;
-    }
-    case MSG_ERROR: {
-        std::string errMsg = bb.readString();
-        LogManager::instance().logDetail(QString("[signal] ERROR: %1").arg(QString::fromStdString(errMsg)));
-        m_pendingAuthHash.clear();
-        emit serverError(QString::fromStdString(errMsg));
-        break;
-    }
-    default:
-        LogManager::instance().logDetail(QString("[signal] Unknown message type: 0x%1").arg(msgType, 0, 16));
-        break;
+        case MSG_PEER_JOINED:
+        case MSG_PEER_RESUMED: {
+            PeerInfo info;
+            info.peerId = bb.readU32();
+            info.virtualIP = bb.readU32();
+            info.name = bb.readString();
+            info.transport = TRANSPORT_NONE;
+            if (msgType == MSG_PEER_JOINED)
+                emit peerJoined(info);
+            else
+                emit peerResumed(info);
+            return true;
+        }
+        case MSG_PEER_LEFT:
+            emit peerLeft(bb.readU32());
+            return true;
+
+        case MSG_LOGOUT_ACK:
+            m_myPeerId = 0;
+            emit logoutAck();
+            return true;
+
+        case MSG_ROOM_LIST:
+        case MSG_ROOM_LIST_PUSH: {
+            const uint16_t count = bb.readU16();
+            QList<RoomListItem> rooms;
+            rooms.reserve(count);
+            for (uint16_t i = 0; i < count; ++i) {
+                RoomListItem info;
+                info.roomId = bb.readU32();
+                const std::string name = bb.readString();
+                strncpy(info.roomName, name.c_str(), MAX_ROOM_NAME_LEN);
+                info.roomName[MAX_ROOM_NAME_LEN] = '\0';
+                info.playerCount = bb.readU8();
+                info.maxPlayers = bb.readU8();
+                info.tcpPolicy = normalizeTrafficPolicy(
+                    bb.readU8(), bb.readU8(), bb.readU8(),
+                    makeDefaultTcpPolicy());
+                info.udpPolicy = normalizeTrafficPolicy(
+                    bb.readU8(), bb.readU8(), bb.readU8(),
+                    makeDefaultUdpPolicy());
+                info.passwordProtected = bb.readU8();
+                info.mtu = bb.readU16();
+                rooms.append(info);
+            }
+            emit roomList(rooms);
+            return true;
+        }
+        case MSG_RELAY_READY:
+            emit relayReady(bb.readU32());
+            return true;
+
+        case MSG_TCP_RELAY_DATA: {
+            const uint32_t srcPeerId = bb.readU32();
+            bb.readU32();
+            const TrafficClass cls =
+                static_cast<TrafficClass>(bb.readU8());
+            const size_t dataLen = bb.remaining();
+            const char* dataStart = reinterpret_cast<const char*>(
+                payload + len - dataLen);
+            emit relayDataReceived(
+                srcPeerId, cls,
+                QByteArray(dataStart, static_cast<int>(dataLen)));
+            return true;
+        }
+
+        case MSG_PONG:
+            if (m_pingSentTime != 0) {
+                const int rtt =
+                    static_cast<int>(currentTimeMs() - m_pingSentTime);
+                m_pingSentTime = 0;
+                emit serverRttUpdated(rtt);
+            }
+            return true;
+
+        case MSG_AUTH_CHALLENGE:
+            if (m_pendingAuthHash.size() == CIPHER_KEY_SIZE) {
+                QByteArray challenge(CIPHER_CHALLENGE_SIZE, '\0');
+                bb.readBytes(challenge.data(), CIPHER_CHALLENGE_SIZE);
+                const QByteArray response = PayloadCipher::challengeResponse(
+                    m_pendingAuthHash, challenge);
+                ByteBuffer responseBody;
+                responseBody.writeBytes(response.constData(), response.size());
+                sendMsg(MSG_AUTH_RESPONSE, responseBody);
+            } else {
+                m_pendingAuthHash.clear();
+                LogManager::instance().logError(
+                    QString("[signal] Unexpected auth challenge type=0x%1 len=%2")
+                        .arg(msgType, 2, 16, QLatin1Char('0'))
+                        .arg(static_cast<qulonglong>(len)));
+            }
+            return true;
+
+        case MSG_ERROR: {
+            const QString message = QString::fromStdString(bb.readString());
+            m_pendingAuthHash.clear();
+            emit serverError(message);
+            return true;
+        }
+        default:
+            return true;
+        }
+    } catch (const std::exception&) {
+        handleMalformedFrame(msgType, len, "parser-exception", 0);
+        return false;
+    } catch (...) {
+        handleMalformedFrame(msgType, len, "unknown-parser-exception", 0);
+        return false;
     }
 }
 

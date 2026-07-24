@@ -44,7 +44,13 @@ public:
 
     void setMyPeerId(uint32_t id)    { m_myPeerId = id; }
     void setMyVirtualIP(uint32_t ip) { m_myVirtualIP = ip; }
-    void setSecureSession(uint32_t sessionId, const Buffer& master);
+    void configurePlaintextSession();
+    bool installSecureSession(uint32_t sessionId, const Buffer& master);
+    void clearSecurityContext();
+    bool startDataPlane();
+    void stopDataPlane();
+    DataPlaneState dataPlaneState() const { return m_dataPlaneState; }
+    DataPlaneSecurityMode securityMode() const { return m_securityMode; }
 
     void onUdpReadable();
     void processTunPackets();
@@ -77,7 +83,8 @@ private:
     uint16_t m_serverPort;
     uint32_t m_myPeerId;
     uint32_t m_myVirtualIP;
-    bool     m_secureUdpEnabled;
+    DataPlaneState m_dataPlaneState;
+    DataPlaneSecurityMode m_securityMode;
     uint32_t m_secureSessionId;
     Buffer   m_secureMaster;
     SecureFrameCipher m_udpCipher;

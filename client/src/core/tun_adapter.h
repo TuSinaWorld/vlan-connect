@@ -6,11 +6,7 @@
 #include <QString>
 #include <QMutex>
 #include <atomic>
-#include <windows.h>
-
-/* Forward-declare WinTun opaque types */
-typedef void* WINTUN_ADAPTER_HANDLE;
-typedef void* WINTUN_SESSION_HANDLE;
+#include "wintun_api.h"
 
 namespace VLan {
 
@@ -27,6 +23,7 @@ class TunAdapter : public QThread {
     Q_OBJECT
 public:
     explicit TunAdapter(QObject* parent = nullptr);
+    TunAdapter(WintunApi* api, QObject* parent);
     ~TunAdapter();
 
     bool initialize(const QString& adapterName = QStringLiteral("VLan"));
@@ -48,11 +45,14 @@ private:
     bool loadWinTun();
     void unloadWinTun();
 
-    HMODULE              m_dll;
+    WintunApi*            m_api;
+    bool                  m_ownsApi;
+    bool                  m_apiLoaded;
     WINTUN_ADAPTER_HANDLE m_adapter;
     WINTUN_SESSION_HANDLE m_session;
     HANDLE               m_readEvent;
     std::atomic<bool>    m_running;
+    std::atomic<bool>    m_acceptIo;
     bool                 m_firewallRuleActive;
     bool                 m_broadcastRouteActive;
     QMutex               m_writeMutex;
@@ -60,26 +60,6 @@ private:
     uint32_t m_ip;
     uint32_t m_mask;
 
-    /* Function pointers loaded from wintun.dll */
-    typedef WINTUN_ADAPTER_HANDLE (WINAPI *FnCreateAdapter)(LPCWSTR, LPCWSTR, const GUID*);
-    typedef void    (WINAPI *FnCloseAdapter)(WINTUN_ADAPTER_HANDLE);
-    typedef WINTUN_SESSION_HANDLE (WINAPI *FnStartSession)(WINTUN_ADAPTER_HANDLE, DWORD);
-    typedef void    (WINAPI *FnEndSession)(WINTUN_SESSION_HANDLE);
-    typedef HANDLE  (WINAPI *FnGetReadWaitEvent)(WINTUN_SESSION_HANDLE);
-    typedef BYTE*   (WINAPI *FnReceivePacket)(WINTUN_SESSION_HANDLE, DWORD*);
-    typedef void    (WINAPI *FnReleaseReceivePacket)(WINTUN_SESSION_HANDLE, const BYTE*);
-    typedef BYTE*   (WINAPI *FnAllocateSendPacket)(WINTUN_SESSION_HANDLE, DWORD);
-    typedef void    (WINAPI *FnSendPacket)(WINTUN_SESSION_HANDLE, const BYTE*);
-
-    FnCreateAdapter        m_fnCreate;
-    FnCloseAdapter         m_fnClose;
-    FnStartSession         m_fnStartSession;
-    FnEndSession           m_fnEndSession;
-    FnGetReadWaitEvent     m_fnGetReadWaitEvent;
-    FnReceivePacket        m_fnReceivePacket;
-    FnReleaseReceivePacket m_fnReleaseReceivePacket;
-    FnAllocateSendPacket   m_fnAllocateSendPacket;
-    FnSendPacket           m_fnSendPacket;
 };
 
 } // namespace VLan

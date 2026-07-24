@@ -54,6 +54,8 @@ public:
     void logout();
     void listRooms();
     void requestRelay(uint32_t targetPeerId);
+    void sendRelayData(uint32_t srcPeerId, uint32_t dstPeerId,
+                       TrafficClass cls, const Buffer& data);
     void sendPing();
 
     void onReadable();
@@ -80,6 +82,9 @@ public:
     std::function<void(uint32_t peerId)> onPeerLeft;
     std::function<void(const std::vector<CliRoomListItem>&, bool)> onRoomList;
     std::function<void(uint32_t peerId)> onRelayReady;
+    std::function<void(uint32_t srcPeerId,
+                       TrafficClass cls,
+                       Buffer data)> onRelayData;
     std::function<void()> onLogoutAck;
     std::function<void()> onServerPasswordRequired;
     std::function<void(uint32_t sessionId, const Buffer& master)> onSecureSessionEstablished;
@@ -92,9 +97,13 @@ public:
 private:
     void sendMsg(uint8_t msgType, const ByteBuffer& body);
     void sendMsg(uint8_t msgType);
-    void processMessage(uint8_t msgType, const uint8_t* payload, size_t len);
+    bool processMessage(uint8_t msgType, const uint8_t* payload, size_t len);
     void sendClientHello();
     void sendServerAuth();
+    void resetSecureState();
+    void failSignalFrame(uint8_t msgType, size_t len,
+                         const char* error, size_t offset);
+    void notifyDisconnectedOnce();
 
     TcpConnection m_conn;
     uint32_t      m_myPeerId;
@@ -105,6 +114,7 @@ private:
     std::string   m_serverPassword;
     bool          m_serverAuthRequired;
     bool          m_secureReady;
+    bool          m_disconnectNotified;
     uint32_t      m_secureSessionId;
     uint8_t       m_clientNonce[16];
     uint8_t       m_serverNonce[16];
@@ -126,7 +136,10 @@ public:
     void disconnect();
     bool isConnected() const { return m_established; }
     socket_t fd() const { return m_conn.fd; }
-    void setSecureSession(uint32_t sessionId, const Buffer& master);
+    void configurePlaintextSession();
+    bool installSecureSession(uint32_t sessionId, const Buffer& master);
+    void clearSecurityContext();
+    DataPlaneSecurityMode securityMode() const { return m_securityMode; }
 
     void sendRelayData(uint32_t srcPeerId, uint32_t dstPeerId,
                        TrafficClass cls, const Buffer& data);
@@ -143,8 +156,10 @@ public:
 private:
     void sendMsg(uint8_t msgType, const ByteBuffer& body);
     void sendMsg(uint8_t msgType);
-    void processMessage(uint8_t msgType, const uint8_t* payload, size_t len);
+    bool processMessage(uint8_t msgType, const uint8_t* payload, size_t len);
     void scheduleReconnect();
+    void failDataChannelFrame(uint8_t msgType, size_t len,
+                              const char* error, size_t offset);
 
     TcpConnection m_conn;
     std::string   m_host;
@@ -153,7 +168,7 @@ private:
     bool          m_established;
     bool          m_needReconnect;
     uint32_t      m_reconnectTime;
-    bool          m_secureEnabled;
+    DataPlaneSecurityMode m_securityMode;
     uint32_t      m_secureSessionId;
     Buffer        m_secureMaster;
     SecureFrameCipher m_cipher;

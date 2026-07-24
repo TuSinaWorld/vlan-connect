@@ -28,6 +28,12 @@ public:
     void stop();
 
 private:
+    enum class DisconnectReason {
+        Network,
+        Takeover,
+        LogoutComplete
+    };
+
     int  createTcpListener(uint16_t port);
     int  createUdpSocket(uint16_t port);
     void epollAdd(int fd, uint32_t events);
@@ -37,10 +43,23 @@ private:
     void handlePendingData(int fd);
     void handleClientData(int fd);
     void handleDataChannelData(int fd);
+    void processDataRecvBuffer(ClientSession& client);
     void handleClientDisconnect(int fd);
     void handleDataChannelDisconnect(int fd);
     void handleUdpPacket(int fd);
     void checkTimeouts();
+    void destroyClient(int fd, DisconnectReason reason);
+    void closeDataChannel(ClientSession& c);
+    void unbindClientIndexes(ClientSession& c);
+    ClientSession* findClientOwnerByPeerId(uint32_t peerId);
+    ClientSession* findClientOwnerBySecureSessionId(uint32_t sessionId);
+    ClientSession* findClientOwnerByDataFd(int dataFd);
+    ClientSession* findClientByPeerId(uint32_t peerId);
+    ClientSession* findClientBySecureSessionId(uint32_t sessionId);
+    ClientSession* findClientByDataFd(int dataFd);
+    bool bindPeerIndex(ClientSession& c, uint32_t peerId);
+    bool bindSecureSessionIndex(ClientSession& c, uint32_t sessionId);
+    bool bindDataFdIndex(ClientSession& c, int dataFd);
 
     void processMessage(ClientSession& client, uint8_t msgType,
                         const uint8_t* payload, size_t len);
@@ -70,7 +89,7 @@ private:
     void sendMsg(int fd, uint8_t msgType);
     void sendClientMsg(ClientSession& c, uint8_t msgType, const ByteBuffer& body);
     void sendClientMsg(ClientSession& c, uint8_t msgType);
-    void sendDataMsg(ClientSession& c, uint8_t msgType, const ByteBuffer& body);
+    bool sendDataMsg(ClientSession& c, uint8_t msgType, const ByteBuffer& body);
     void sendError(int fd, const std::string& text);
     void broadcastToRoom(uint32_t roomId, uint8_t msgType,
                          const ByteBuffer& body, uint32_t excludePeerId = 0);
@@ -97,7 +116,7 @@ private:
                           const struct sockaddr_in& dstAddr);
 
     void flushSendBuf(ClientSession& c);
-    void flushDataSendBuf(ClientSession& c);
+    bool flushDataSendBuf(ClientSession& c);
     void epollMod(int fd, uint32_t events);
     void handleWritable(int fd);
 
@@ -114,14 +133,14 @@ private:
 
     std::map<int, ClientSession>       m_clients;
     std::map<int, PendingConn>         m_pending;
-    std::map<int, ClientSession*>      m_dataFdMap;
-    std::map<uint32_t, ClientSession*> m_peerMap;
+    std::map<int, int>                 m_dataFdMap;
+    std::map<uint32_t, int>            m_peerMap;
     RoomManager                        m_rooms;
     uint32_t                           m_nextPeerId;
     std::set<uint32_t>                 m_freePeerIds;
     bool                               m_authEnabled;
     uint8_t                            m_serverAuthHash[32];
-    std::map<uint32_t, ClientSession*> m_secureSessionMap;
+    std::map<uint32_t, int>            m_secureSessionMap;
 };
 
 } // namespace VLan

@@ -13,6 +13,135 @@
 
 namespace VLan {
 
+enum class SessionState : uint8_t {
+    AwaitHello = 0,
+    AwaitServerAuth,
+    AwaitLogin,
+    LoggedIn,
+    AwaitRoomPassword,
+    ResumePending,
+    InRoom,
+    Closing
+};
+
+inline const char* sessionStateName(SessionState state) {
+    switch (state) {
+    case SessionState::AwaitHello:        return "AwaitHello";
+    case SessionState::AwaitServerAuth:   return "AwaitServerAuth";
+    case SessionState::AwaitLogin:        return "AwaitLogin";
+    case SessionState::LoggedIn:          return "LoggedIn";
+    case SessionState::AwaitRoomPassword: return "AwaitRoomPassword";
+    case SessionState::ResumePending:     return "ResumePending";
+    case SessionState::InRoom:            return "InRoom";
+    case SessionState::Closing:           return "Closing";
+    }
+    return "Unknown";
+}
+
+inline bool sessionHasPeerIdentity(SessionState state) {
+    return state == SessionState::LoggedIn ||
+           state == SessionState::AwaitRoomPassword ||
+           state == SessionState::ResumePending ||
+           state == SessionState::InRoom;
+}
+
+inline bool sessionCanBindDataChannel(SessionState state) {
+    return sessionHasPeerIdentity(state);
+}
+
+inline bool isClientHandshakeMessage(uint8_t msgType) {
+    return msgType == MSG_CLIENT_HELLO ||
+           msgType == MSG_SERVER_AUTH ||
+           msgType == MSG_LOGIN;
+}
+
+inline bool isKnownClientSignalMessage(uint8_t msgType) {
+    switch (msgType) {
+    case MSG_CLIENT_HELLO:
+    case MSG_SERVER_AUTH:
+    case MSG_LOGIN:
+    case MSG_CREATE_ROOM:
+    case MSG_JOIN_ROOM:
+    case MSG_RESUME_ROOM:
+    case MSG_LEAVE_ROOM:
+    case MSG_LOGOUT:
+    case MSG_LIST_ROOMS:
+    case MSG_REQUEST_RELAY:
+    case MSG_AUTH_RESPONSE:
+    case MSG_PING:
+    case MSG_TCP_RELAY_DATA:
+    case MSG_ENCRYPTED:
+        return true;
+    default:
+        return false;
+    }
+}
+
+enum class SessionMessageAction : uint8_t {
+    Dispatch = 0,
+    SendStateError,
+    Close,
+    IgnoreUnknown
+};
+
+inline bool isClientSignalMessageAllowed(SessionState state, uint8_t msgType) {
+    switch (state) {
+    case SessionState::AwaitHello:
+        return msgType == MSG_CLIENT_HELLO;
+    case SessionState::AwaitServerAuth:
+        return msgType == MSG_SERVER_AUTH;
+    case SessionState::AwaitLogin:
+        return msgType == MSG_LOGIN || msgType == MSG_PING;
+    case SessionState::LoggedIn:
+        return msgType == MSG_CREATE_ROOM || msgType == MSG_JOIN_ROOM ||
+               msgType == MSG_LIST_ROOMS || msgType == MSG_LOGOUT ||
+               msgType == MSG_PING;
+    case SessionState::AwaitRoomPassword:
+        return msgType == MSG_AUTH_RESPONSE || msgType == MSG_LIST_ROOMS ||
+               msgType == MSG_LOGOUT || msgType == MSG_PING;
+    case SessionState::ResumePending:
+        return msgType == MSG_RESUME_ROOM || msgType == MSG_LIST_ROOMS ||
+               msgType == MSG_LOGOUT || msgType == MSG_PING;
+    case SessionState::InRoom:
+        return msgType == MSG_LEAVE_ROOM || msgType == MSG_LOGOUT ||
+               msgType == MSG_LIST_ROOMS || msgType == MSG_REQUEST_RELAY ||
+               msgType == MSG_PING || msgType == MSG_TCP_RELAY_DATA;
+    case SessionState::Closing:
+        return false;
+    }
+    return false;
+}
+
+inline SessionMessageAction classifyClientSignalMessage(
+    SessionState state, uint8_t msgType)
+{
+    if (!isKnownClientSignalMessage(msgType))
+        return SessionMessageAction::IgnoreUnknown;
+    if (isClientSignalMessageAllowed(state, msgType))
+        return SessionMessageAction::Dispatch;
+    if (isClientHandshakeMessage(msgType))
+        return SessionMessageAction::Close;
+    return SessionMessageAction::SendStateError;
+}
+
+template <typename Key>
+inline bool bindUniqueSessionIndex(std::map<Key, int>& index,
+                                   const Key& key, int signalFd) {
+    typename std::map<Key, int>::iterator it = index.find(key);
+    if (it != index.end() && it->second != signalFd)
+        return false;
+    index[key] = signalFd;
+    return true;
+}
+
+template <typename Key>
+inline void unbindSessionIndex(std::map<Key, int>& index,
+                               const Key& key, int signalFd) {
+    typename std::map<Key, int>::iterator it = index.find(key);
+    if (it != index.end() && it->second == signalFd)
+        index.erase(it);
+}
+
 struct ClientSession {
     int              tcpFd;
     int              dataFd;
@@ -29,7 +158,7 @@ struct ClientSession {
     time_t           lastPing;
     time_t           dataLastPing;
     bool             alive;
-    bool             helloDone;
+    SessionState     state;
     bool             serverAuthOk;
     bool             secureEnabled;
     uint32_t         secureSessionId;
@@ -42,12 +171,11 @@ struct ClientSession {
     SecureFrameCipher secureCipher;
     SecureFrameCipher dataCipher;
     SecureFrameCipher udpCipher;
+    time_t           helloDeadline;
     time_t           authDeadline;
 
     uint32_t         pendingJoinRoomId;
     uint8_t          authChallenge[32];
-    bool             awaitingAuth;
-    bool             resumeAccepted;
     uint32_t         resumeRoomId;
     uint32_t         resumePeerId;
     uint8_t          resumeToken[RECONNECT_TOKEN_SIZE];
@@ -56,10 +184,9 @@ struct ClientSession {
         : tcpFd(-1), dataFd(-1), peerId(0), virtualIP(0), roomId(0),
           udpAddrKnown(false),
           lastPing(0), dataLastPing(0), alive(true),
-          helloDone(false), serverAuthOk(false), secureEnabled(false),
-          secureSessionId(0), authDeadline(0),
-          pendingJoinRoomId(0), awaitingAuth(false),
-          resumeAccepted(false), resumeRoomId(0), resumePeerId(0) {
+          state(SessionState::AwaitHello), serverAuthOk(false), secureEnabled(false),
+          secureSessionId(0), helloDeadline(0), authDeadline(0),
+          pendingJoinRoomId(0), resumeRoomId(0), resumePeerId(0) {
         memset(&udpAddr, 0, sizeof(udpAddr));
         memset(clientNonce, 0, sizeof(clientNonce));
         memset(serverNonce, 0, sizeof(serverNonce));

@@ -24,6 +24,8 @@ CliTunAdapter::~CliTunAdapter() {
 }
 
 bool CliTunAdapter::initialize(const std::string& adapterName) {
+    if (m_dll || m_adapter || m_session || m_readThread.joinable())
+        return false;
     HMODULE dll = LoadLibraryW(L"wintun.dll");
     if (!dll) {
         LOG_ERR("Failed to load wintun.dll");
@@ -57,6 +59,8 @@ bool CliTunAdapter::initialize(const std::string& adapterName) {
     m_adapter = m_fnCreate(wname.c_str(), L"VLan", nullptr);
     if (!m_adapter) {
         LOG_ERR("WintunCreateAdapter failed (need admin?)");
+        FreeLibrary(dll);
+        m_dll = nullptr;
         return false;
     }
     return true;
@@ -108,13 +112,23 @@ bool CliTunAdapter::configureIP(uint32_t ip, uint32_t mask, int mtu) {
 }
 
 bool CliTunAdapter::startSession() {
-    if (!m_adapter) return false;
+    if (!m_adapter || m_session || m_readThread.joinable() ||
+        !m_fnStartSession || !m_fnEndSession ||
+        !m_fnGetReadWaitEvent) {
+        return false;
+    }
     m_session = m_fnStartSession(m_adapter, 0x400000);
     if (!m_session) {
         LOG_ERR("WintunStartSession failed");
         return false;
     }
     m_readEvent = m_fnGetReadWaitEvent(m_session);
+    if (!m_readEvent) {
+        LOG_ERR("WintunGetReadWaitEvent failed");
+        m_fnEndSession(m_session);
+        m_session = nullptr;
+        return false;
+    }
     m_running = true;
     m_readThread = std::thread(&CliTunAdapter::readLoop, this);
     return true;
@@ -125,9 +139,19 @@ void CliTunAdapter::shutdown() {
     if (m_readEvent) SetEvent((HANDLE)m_readEvent);
     if (m_readThread.joinable()) m_readThread.join();
 
-    if (m_session) { m_fnEndSession(m_session); m_session = nullptr; }
-    if (m_adapter) { m_fnClose(m_adapter); m_adapter = nullptr; }
-    if (m_dll) { FreeLibrary((HMODULE)m_dll); m_dll = nullptr; }
+    {
+        std::lock_guard<std::mutex> lock(m_writeMutex);
+        if (m_session && m_fnEndSession) {
+            m_fnEndSession(m_session);
+            m_session = nullptr;
+        }
+        m_readEvent = nullptr;
+        if (m_adapter && m_fnClose) {
+            m_fnClose(m_adapter);
+            m_adapter = nullptr;
+        }
+        if (m_dll) { FreeLibrary((HMODULE)m_dll); m_dll = nullptr; }
+    }
 
     if (m_broadcastRouteActive) {
         m_broadcastRouteActive = false;
@@ -143,21 +167,30 @@ void CliTunAdapter::readLoop() {
     while (m_running) {
         DWORD waitResult = WaitForSingleObject((HANDLE)m_readEvent, 500);
         if (!m_running) break;
-        if (waitResult != WAIT_OBJECT_0) continue;
+        if (waitResult == WAIT_TIMEOUT) continue;
+        if (waitResult == WAIT_FAILED) {
+            LOG_ERR("Wintun read wait failed (error %lu)", GetLastError());
+            break;
+        }
+        if (waitResult != WAIT_OBJECT_0) break;
 
-        DWORD packetSize = 0;
-        BYTE* packet = m_fnReceivePacket(m_session, &packetSize);
-        while (packet) {
-            m_recvQueue.push(Buffer(packet, packet + packetSize));
+        while (m_running) {
+            DWORD packetSize = 0;
+            BYTE* packet = m_fnReceivePacket(m_session, &packetSize);
+            if (!packet) break;
+            Buffer received(packet, packet + packetSize);
             m_fnReleaseReceivePacket(m_session, packet);
-            packet = m_fnReceivePacket(m_session, &packetSize);
+            if (!m_running) break;
+            m_recvQueue.push(received);
         }
     }
+    m_running = false;
 }
 
 bool CliTunAdapter::writePacket(const uint8_t* data, size_t len) {
-    if (!m_session) return false;
     std::lock_guard<std::mutex> lock(m_writeMutex);
+    if (!m_running || !m_session || !m_fnAllocateSendPacket || !m_fnSendPacket)
+        return false;
 
     BYTE* buf = m_fnAllocateSendPacket(m_session, static_cast<DWORD>(len));
     if (!buf) return false;

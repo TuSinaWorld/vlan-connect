@@ -81,6 +81,8 @@ RoomManager::RoomManager(QObject* parent)
     connect(m_signal, &SignalClient::peerResumed,   this, &RoomManager::onPeerResumed);
     connect(m_signal, &SignalClient::peerLeft,      this, &RoomManager::onPeerLeft);
     connect(m_signal, &SignalClient::relayReady,    this, &RoomManager::onRelayReady);
+    connect(m_signal, &SignalClient::relayDataReceived,
+            this, &RoomManager::onDataChannelRelayReceived);
     connect(m_signal, &SignalClient::logoutAck,     this, &RoomManager::onLogoutAck);
     connect(m_signal, &SignalClient::serverPasswordRequired,
             this, &RoomManager::serverPasswordRequired);
@@ -169,11 +171,12 @@ void RoomManager::connectAndLogin(const QString& playerName) {
         if (!(m_wasInRoom && hasUsableResumeLease() && previousName == playerName))
             clearResumeLease();
     }
+    teardownTun();
     if (m_tunnel)
-        m_tunnel->setSecureSession(0, QByteArray());
+        m_tunnel->clearSecurityContext();
     if (m_dataChannel) {
         m_dataChannel->disconnect();
-        m_dataChannel->setSecureSession(0, QByteArray());
+        m_dataChannel->clearSecurityContext();
     }
     if (m_signal)
         m_signal->setServerPassword(m_serverPassword);
@@ -187,12 +190,11 @@ void RoomManager::disconnectFromServer() {
     clearResumeLease();
     m_playerName.clear();
     m_serverPassword.clear();
-    if (m_dataChannel) {
-        m_dataChannel->disconnect();
-        m_dataChannel->setSecureSession(0, QByteArray());
-    }
+    teardownTun();
+    if (m_dataChannel)
+        m_dataChannel->clearSecurityContext();
     if (m_tunnel)
-        m_tunnel->setSecureSession(0, QByteArray());
+        m_tunnel->clearSecurityContext();
     if (!m_signal)
         return;
 
@@ -362,6 +364,8 @@ void RoomManager::joinRoom(uint32_t roomId, const QString& password) {
 }
 
 void RoomManager::leaveRoom() {
+    if (m_tunnel)
+        m_tunnel->stopDataPlane();
     m_signal->leaveRoom();
     teardownTun();
     m_pendingResumeRoom = false;
@@ -430,7 +434,9 @@ void RoomManager::onSignalDisconnected() {
 
     teardownTun();
     if (m_tunnel)
-        m_tunnel->setSecureSession(0, QByteArray());
+        m_tunnel->clearSecurityContext();
+    if (m_dataChannel)
+        m_dataChannel->clearSecurityContext();
     if (m_roomListTimer)
         m_roomListTimer->stop();
     m_currentRoomId = 0;
@@ -514,10 +520,16 @@ void RoomManager::rebuildPeerTransports(uint32_t peerId) {
 }
 
 void RoomManager::onSecureSessionEstablished(uint32_t sessionId, QByteArray master) {
+    bool installed = true;
     if (m_tunnel)
-        m_tunnel->setSecureSession(sessionId, master);
+        installed = m_tunnel->installSecureSession(sessionId, master) && installed;
     if (m_dataChannel)
-        m_dataChannel->setSecureSession(sessionId, master);
+        installed = m_dataChannel->installSecureSession(sessionId, master) && installed;
+    if (!installed)
+        emit errorOccurred(QStringLiteral("Failed to install secure data-plane session."));
+    if (!master.isEmpty())
+        crypto_wipe(reinterpret_cast<uint8_t*>(master.data()),
+                    static_cast<size_t>(master.size()));
 }
 
 void RoomManager::onLoginResponse(uint32_t peerId, bool resumeAccepted) {
@@ -526,8 +538,13 @@ void RoomManager::onLoginResponse(uint32_t peerId, bool resumeAccepted) {
     m_tunnel->setMyPeerId(peerId);
     if (m_roomListTimer)
         m_roomListTimer->start();
-    if (m_signal->secureEnabled())
-        m_tunnel->setSecureSession(m_signal->secureSessionId(), m_signal->secureMaster());
+    bool securityReady = true;
+    if (m_signal->secureEnabled()) {
+        securityReady = m_tunnel->installSecureSession(
+            m_signal->secureSessionId(), m_signal->secureMaster());
+    } else {
+        m_tunnel->configurePlaintextSession();
+    }
 
     bool canResume = m_wasInRoom && hasUsableResumeLease();
     if (m_wantReconnect || canResume) {
@@ -556,9 +573,17 @@ void RoomManager::onLoginResponse(uint32_t peerId, bool resumeAccepted) {
         connect(m_dataChannel, &DataChannel::relayDataReceived,
                 this, &RoomManager::onDataChannelRelayReceived);
     }
-    if (m_signal->secureEnabled())
-        m_dataChannel->setSecureSession(m_signal->secureSessionId(), m_signal->secureMaster());
-    m_dataChannel->connectToServer(m_serverHost, m_port, peerId);
+    if (m_signal->secureEnabled()) {
+        securityReady = m_dataChannel->installSecureSession(
+            m_signal->secureSessionId(), m_signal->secureMaster()) && securityReady;
+    } else {
+        m_dataChannel->configurePlaintextSession();
+    }
+    if (!securityReady) {
+        emit errorOccurred(QStringLiteral("Failed to configure data-plane security."));
+        disconnectFromServer();
+        return;
+    }
 }
 
 void RoomManager::onRoomCreated(uint32_t roomId, uint32_t virtualIP,
@@ -754,8 +779,15 @@ void RoomManager::setupTcpRelayTunnel(uint32_t peerId, TrafficClass cls) {
     uint32_t myId = myPeerId();
     peer->setTcpRelaySender([this, myId](uint32_t dstPeerId, TrafficClass trafficClass,
                                          const QByteArray& data) {
-        if (m_dataChannel && m_dataChannel->isConnected()) {
-            m_dataChannel->sendRelayData(myId, dstPeerId, trafficClass, data);
+        if (m_tunnel->dataPlaneState() == DataPlaneState::Running &&
+            m_tunnel->securityMode() != DataPlaneSecurityMode::Unconfigured) {
+            if (m_dataChannel && m_dataChannel->isConnected()) {
+                m_dataChannel->sendRelayData(
+                    myId, dstPeerId, trafficClass, data);
+            } else if (m_signal && m_signal->isConnected()) {
+                m_signal->sendRelayData(
+                    myId, dstPeerId, trafficClass, data);
+            }
         }
     });
     peer->setTransport(cls, TRANSPORT_RELAY_TCP);
@@ -772,6 +804,10 @@ void RoomManager::setupTcpRelayTunnel(uint32_t peerId, TrafficClass cls) {
 }
 
 void RoomManager::handleTcpRelayReceived(uint32_t srcPeerId, TrafficClass cls, QByteArray data) {
+    if (m_tunnel->dataPlaneState() != DataPlaneState::Running ||
+        m_tunnel->securityMode() == DataPlaneSecurityMode::Unconfigured) {
+        return;
+    }
     PeerConnection* peer = m_tunnel->peerById(srcPeerId);
     if (!peer) return;
     peer->onTcpRelayDataReceived(cls);
@@ -829,6 +865,16 @@ void RoomManager::setupTun() {
         return;
     }
     m_tunnel->setTunAdapter(m_tun);
+    if (!m_tunnel->startDataPlane()) {
+        emit errorOccurred(QStringLiteral("Data-plane security is not configured."));
+        m_tunnel->setTunAdapter(nullptr);
+        m_tun->shutdown();
+        delete m_tun;
+        m_tun = nullptr;
+        return;
+    }
+    if (m_dataChannel && myPeerId() != 0)
+        m_dataChannel->connectToServer(m_serverHost, m_port, myPeerId());
     m_tunnel->resetTrafficCounters();
     m_lastUploadBytes = 0;
     m_lastDownloadBytes = 0;
@@ -840,6 +886,8 @@ void RoomManager::setupTun() {
 }
 
 void RoomManager::teardownTun() {
+    if (m_tunnel)
+        m_tunnel->stopDataPlane();
     m_pendingRebuild.clear();
     if (m_latencyTimer)
         m_latencyTimer->stop();
@@ -855,16 +903,15 @@ void RoomManager::teardownTun() {
         delete m_tcpRelayTimer;
         m_tcpRelayTimer = nullptr;
     }
-    if (m_dataChannel) {
+    if (m_dataChannel)
         m_dataChannel->disconnect();
-        delete m_dataChannel;
-        m_dataChannel = nullptr;
-    }
     m_roomPasswordProtected = false;
     m_roomPassword.clear();
-    m_tunnel->removeAllPeers();
+    if (m_tunnel)
+        m_tunnel->removeAllPeers();
     if (m_tun) {
-        m_tunnel->setTunAdapter(nullptr);
+        if (m_tunnel)
+            m_tunnel->setTunAdapter(nullptr);
         m_tun->shutdown();
         delete m_tun;
         m_tun = nullptr;

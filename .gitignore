@@ -9,6 +9,7 @@
 /client/.vs/
 /client/*.VC.db
 /client/*.VC.db.temp
+/client/*.VC.opendb
 /client/*.VC.opendb.temp
 /client/GeneratedFiles/
 

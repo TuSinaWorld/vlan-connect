@@ -9,18 +9,26 @@ on:
 permissions:
   contents: read
 
+env:
+  LINUX_BUILD_IMAGE: ubuntu:20.04
+
 jobs:
   server-linux:
     name: Server Linux
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Build server
-        run: make
-        working-directory: server
+      - name: Build and verify server compatibility
+        shell: bash
+        run: |
+          docker run --rm \
+            --volume "${GITHUB_WORKSPACE}:/workspace" \
+            --workdir /workspace \
+            "${LINUX_BUILD_IMAGE}" \
+            bash .github/scripts/build-linux-glibc231.sh server x86_64
 
       - name: Upload server artifact
         if: ${{ vars.UPLOAD_BUILD_ARTIFACTS == 'true' }}
@@ -32,15 +40,20 @@ jobs:
 
   cli-linux:
     name: CLI Linux
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Build CLI
-        run: make
-        working-directory: client-cli/linux
+      - name: Build and verify CLI compatibility
+        shell: bash
+        run: |
+          docker run --rm \
+            --volume "${GITHUB_WORKSPACE}:/workspace" \
+            --workdir /workspace \
+            "${LINUX_BUILD_IMAGE}" \
+            bash .github/scripts/build-linux-glibc231.sh cli x86_64
 
       - name: Upload CLI Linux artifact
         if: ${{ vars.UPLOAD_BUILD_ARTIFACTS == 'true' }}

@@ -17,6 +17,7 @@ permissions:
 env:
   WINTUN_URL: https://www.wintun.net/builds/wintun-0.14.1.zip
   WINTUN_AMD64_SHA256: E5DA8447DC2C320EDC0FC52FA01885C103DE8C118481F683643CACC3220DAFCE
+  LINUX_BUILD_IMAGE: ubuntu:20.04
 
 jobs:
   create-release:
@@ -73,6 +74,11 @@ jobs:
           vlan-cli-windows-x86_64.zip
           LICENSE.txt
           NOTICE.txt
+
+          ## Linux Compatibility
+
+          Linux binaries are built against the glibc 2.31 toolchain baseline
+          and are intended for Debian 11, Ubuntu 20.04, and newer releases.
 
           Optional manual Windows Qt GUI package:
 
@@ -149,9 +155,14 @@ jobs:
         with:
           ref: ${{ needs.create-release.outputs.tag }}
 
-      - name: Build server
-        run: make
-        working-directory: server
+      - name: Build and verify server compatibility
+        shell: bash
+        run: |
+          docker run --rm \
+            --volume "${GITHUB_WORKSPACE}:/workspace" \
+            --workdir /workspace \
+            "${LINUX_BUILD_IMAGE}" \
+            bash .github/scripts/build-linux-glibc231.sh server "${{ matrix.arch }}"
 
       - name: Package and upload server
         env:
@@ -183,6 +194,8 @@ jobs:
           Corresponding source archive asset: vlan-connect-source-${RELEASE_TAG}.tar.gz
 
           This binary package was built from the source identified above.
+          Linux ABI baseline: GLIBC_2.31, GLIBCXX_3.4.28, CXXABI_1.3.12.
+          Intended minimum distributions: Debian 11 or Ubuntu 20.04.
           EOF
 
           cat > "$stage/THIRD-PARTY-LICENSES.txt" <<EOF
@@ -232,9 +245,14 @@ jobs:
         with:
           ref: ${{ needs.create-release.outputs.tag }}
 
-      - name: Build CLI
-        run: make
-        working-directory: client-cli/linux
+      - name: Build and verify CLI compatibility
+        shell: bash
+        run: |
+          docker run --rm \
+            --volume "${GITHUB_WORKSPACE}:/workspace" \
+            --workdir /workspace \
+            "${LINUX_BUILD_IMAGE}" \
+            bash .github/scripts/build-linux-glibc231.sh cli "${{ matrix.arch }}"
 
       - name: Package and upload CLI Linux
         env:
@@ -267,6 +285,8 @@ jobs:
           Corresponding source archive asset: vlan-connect-source-${RELEASE_TAG}.tar.gz
 
           This binary package was built from the source identified above.
+          Linux ABI baseline: GLIBC_2.31, GLIBCXX_3.4.28, CXXABI_1.3.12.
+          Intended minimum distributions: Debian 11 or Ubuntu 20.04.
           EOF
 
           cat > "$stage/THIRD-PARTY-LICENSES.txt" <<EOF

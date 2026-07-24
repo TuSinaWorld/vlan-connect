@@ -1,5 +1,7 @@
 #include "cli_net.h"
 #include "cli_log.h"
+#include "signal_message_validator.h"
+#include "tcp_frame_probe.h"
 #include <cstring>
 #include <algorithm>
 
@@ -13,7 +15,8 @@ namespace VLan {
 
 CliSignalClient::CliSignalClient()
     : m_myPeerId(0), m_pingSentTime(0), m_connectStartTime(0), m_hasPendingAuth(false),
-      m_serverAuthRequired(false), m_secureReady(false), m_secureSessionId(0)
+      m_serverAuthRequired(false), m_secureReady(false),
+      m_disconnectNotified(false), m_secureSessionId(0)
 {
     memset(m_pendingAuthHash, 0, CIPHER_KEY_SIZE);
     memset(m_clientNonce, 0, sizeof(m_clientNonce));
@@ -25,18 +28,33 @@ CliSignalClient::CliSignalClient()
 
 CliSignalClient::~CliSignalClient() { disconnect(); }
 
-bool CliSignalClient::connectTo(const std::string& ip, uint16_t port) {
-    m_myPeerId = 0;
+void CliSignalClient::resetSecureState() {
     m_serverAuthRequired = false;
     m_secureReady = false;
     m_secureSessionId = 0;
-    m_secureMaster.clear();
+    m_secureCipher.reset();
+    if (!m_secureMaster.empty()) {
+        crypto_wipe(m_secureMaster.data(), m_secureMaster.size());
+        m_secureMaster.clear();
+    }
+    crypto_wipe(m_clientNonce, sizeof(m_clientNonce));
+    crypto_wipe(m_serverNonce, sizeof(m_serverNonce));
+    crypto_wipe(m_clientPrivKey, sizeof(m_clientPrivKey));
+    crypto_wipe(m_clientPubKey, sizeof(m_clientPubKey));
+    crypto_wipe(m_serverPubKey, sizeof(m_serverPubKey));
+}
+
+bool CliSignalClient::connectTo(const std::string& ip, uint16_t port) {
+    m_myPeerId = 0;
+    resetSecureState();
+    m_disconnectNotified = false;
     m_connectStartTime = currentTimeMs();
     return m_conn.connectTo(ip, port);
 }
 
 void CliSignalClient::disconnect() {
     m_conn.reset();
+    resetSecureState();
     m_myPeerId = 0;
 }
 
@@ -117,6 +135,17 @@ void CliSignalClient::requestRelay(uint32_t targetPeerId) {
     ByteBuffer bb;
     bb.writeU32(targetPeerId);
     sendMsg(MSG_REQUEST_RELAY, bb);
+}
+
+void CliSignalClient::sendRelayData(uint32_t srcPeerId, uint32_t dstPeerId,
+                                    TrafficClass cls, const Buffer& data) {
+    ByteBuffer bb;
+    bb.writeU32(srcPeerId);
+    bb.writeU32(dstPeerId);
+    bb.writeU8(static_cast<uint8_t>(cls));
+    if (!data.empty())
+        bb.writeBytes(data.data(), data.size());
+    sendMsg(MSG_TCP_RELAY_DATA, bb);
 }
 
 void CliSignalClient::sendPing() {
@@ -215,8 +244,8 @@ void CliSignalClient::onWritable() {
             sendClientHello();
         } else {
             LOG_ERR("Signal connect failed: error %d", err);
-            if (onConnectFailed) onConnectFailed("connect error");
             m_conn.reset();
+            if (onConnectFailed) onConnectFailed("connect error");
         }
         return;
     }
@@ -228,43 +257,69 @@ void CliSignalClient::onReadable() {
     if (n <= 0) {
         LOG_INFO("Signal TCP disconnected");
         m_conn.reset();
-        if (onDisconnected) onDisconnected();
+        resetSecureState();
+        notifyDisconnectedOnce();
         return;
     }
 
     if (m_conn.recvBuf.size() > 1024 * 1024) {
-        LOG_ERR("Signal TCP stream corrupted");
-        m_conn.reset();
-        if (onDisconnected) onDisconnected();
+        failSignalFrame(0, m_conn.recvBuf.size(),
+                        "receive-buffer-too-large", 0);
         return;
     }
 
-    while (m_conn.recvBuf.size() >= sizeof(TcpMsgHeader)) {
-        const TcpMsgHeader* hdr =
-            reinterpret_cast<const TcpMsgHeader*>(m_conn.recvBuf.data());
-        uint16_t payloadLen = ntohs(hdr->length);
-        if (payloadLen > MAX_TCP_MSG_PAYLOAD) {
-            LOG_ERR("Signal TCP stream corrupted (payload too large)");
-            m_conn.reset();
-            if (onDisconnected) onDisconnected();
+    static const size_t FRAME_HEADER_SIZE = 3;
+    while (m_conn.recvBuf.size() >= FRAME_HEADER_SIZE) {
+        const TcpFrameProbeResult frame = probeTcpFrame(
+            m_conn.recvBuf.data(), m_conn.recvBuf.size());
+        if (frame.status == TcpFrameProbeStatus::Malformed) {
+            failSignalFrame(frame.msgType, frame.payloadLength,
+                            "payload-too-large", 0);
             return;
         }
-        size_t frameLen = sizeof(TcpMsgHeader) + payloadLen;
-        if (m_conn.recvBuf.size() < frameLen) break;
+        if (frame.status == TcpFrameProbeStatus::NeedMore)
+            break;
 
-        processMessage(hdr->msgType,
-                       m_conn.recvBuf.data() + sizeof(TcpMsgHeader), payloadLen);
+        const uint8_t msgType = frame.msgType;
+        const uint16_t payloadLen = frame.payloadLength;
+        const size_t frameLen = frame.frameLength;
+        Buffer payload;
+        if (payloadLen > 0) {
+            payload.assign(m_conn.recvBuf.begin() + FRAME_HEADER_SIZE,
+                           m_conn.recvBuf.begin() + frameLen);
+        }
         m_conn.recvBuf.erase(m_conn.recvBuf.begin(),
                              m_conn.recvBuf.begin() + frameLen);
+        const uint8_t* payloadData =
+            payload.empty() ? nullptr : payload.data();
+        if (!processMessage(msgType, payloadData, payload.size()))
+            return;
+        if (!m_conn.connected)
+            return;
     }
+}
+
+void CliSignalClient::notifyDisconnectedOnce() {
+    if (m_disconnectNotified) return;
+    m_disconnectNotified = true;
+    if (onDisconnected) onDisconnected();
+}
+
+void CliSignalClient::failSignalFrame(uint8_t msgType, size_t len,
+                                      const char* error, size_t offset) {
+    LOG_ERR("[signal] Invalid frame type=0x%02x len=%zu error=%s offset=%zu",
+            msgType, len, error ? error : "unknown", offset);
+    m_conn.reset();
+    resetSecureState();
+    notifyDisconnectedOnce();
 }
 
 void CliSignalClient::checkTimeouts() {
     if (!m_conn.connected && m_conn.connecting) {
         if (currentTimeMs() - m_connectStartTime > 8000) {
             LOG_ERR("Signal connect timeout");
-            if (onConnectFailed) onConnectFailed("connect timeout");
             m_conn.reset();
+            if (onConnectFailed) onConnectFailed("connect timeout");
         }
         return;
     }
@@ -273,242 +328,300 @@ void CliSignalClient::checkTimeouts() {
         if (elapsed > static_cast<uint32_t>(TCP_RECV_TIMEOUT_MS)) {
             LOG_ERR("Signal TCP recv timeout (%u ms)", elapsed);
             m_conn.reset();
-            if (onDisconnected) onDisconnected();
+            resetSecureState();
+            notifyDisconnectedOnce();
         }
     }
 }
 
-void CliSignalClient::processMessage(uint8_t msgType, const uint8_t* payload, size_t len) {
-    ByteBuffer bb(payload, len);
-    LOG_DBG("[signal] msg type=0x%02x len=%zu", msgType, len);
+bool CliSignalClient::processMessage(uint8_t msgType,
+                                     const uint8_t* payload, size_t len) {
+    try {
+        MessageValidationResult validation =
+            validateServerSignalPayload(msgType, payload, len);
+        if (validation.status == MessageValidationStatus::Malformed) {
+            if (validation.error == MessageValidationError::InvalidVersion &&
+                onServerError)
+                onServerError("protocol version mismatch");
+            failSignalFrame(msgType, len,
+                            messageValidationErrorName(validation.error),
+                            validation.offset);
+            return false;
+        }
+        if (validation.status == MessageValidationStatus::UnknownType) {
+            LOG_DBG("[signal] Ignoring unknown outer type=0x%02x len=%zu",
+                    msgType, len);
+            return true;
+        }
 
-    if (msgType == MSG_SERVER_HELLO) {
-        uint16_t serverVersion = bb.readU16();
-        bool authRequired = bb.remaining() > 0 ? (bb.readU8() != 0) : false;
-        if (serverVersion != PROTOCOL_VERSION) {
-            if (onServerError) onServerError("protocol version mismatch");
-            m_conn.reset();
-            return;
+        std::vector<uint8_t> plain;
+        if (msgType == MSG_ENCRYPTED) {
+            if (!m_secureReady ||
+                !m_secureCipher.decrypt(payload, len, &plain) ||
+                plain.empty()) {
+                failSignalFrame(msgType, len, "decrypt-failed", 0);
+                return false;
+            }
+            msgType = plain[0];
+            payload = plain.size() > 1 ? plain.data() + 1 : nullptr;
+            len = plain.size() > 1 ? plain.size() - 1 : 0;
+            validation = validateServerSignalPayload(msgType, payload, len);
+            if (validation.status == MessageValidationStatus::Malformed) {
+                if (validation.error ==
+                        MessageValidationError::InvalidVersion &&
+                    onServerError) {
+                    onServerError("protocol version mismatch");
+                }
+                failSignalFrame(msgType, len,
+                                messageValidationErrorName(validation.error),
+                                validation.offset);
+                return false;
+            }
+        } else if (m_secureReady) {
+            failSignalFrame(msgType, len, "plaintext-in-secure-mode", 0);
+            return false;
         }
-        m_serverAuthRequired = authRequired;
-        if (!authRequired) {
-            if (onConnected) onConnected();
-            return;
-        }
-        if (bb.remaining() < 48) {
-            if (onServerError) onServerError("invalid server auth hello");
-            m_conn.reset();
-            return;
-        }
-        bb.readBytes(m_serverNonce, 16);
-        bb.readBytes(m_serverPubKey, 32);
-        if (m_serverPassword.empty()) {
-            if (onServerPasswordRequired) onServerPasswordRequired();
-        } else {
-            sendServerAuth();
-        }
-        return;
-    }
 
-    if (msgType == MSG_SERVER_AUTH_OK) {
-        if (m_secureMaster.size() != 32 || bb.remaining() < 36) {
-            if (onServerError) onServerError("invalid server auth response");
-            m_conn.reset();
-            return;
-        }
-        m_secureSessionId = bb.readU32();
-        uint8_t serverProof[32];
-        bb.readBytes(serverProof, 32);
+        LOG_DBG("[signal] Received type=0x%02x len=%zu", msgType, len);
+        if (validation.status == MessageValidationStatus::UnknownType)
+            return true;
 
-        uint8_t intermediate[CIPHER_KEY_SIZE];
-        uint8_t authHash[CIPHER_KEY_SIZE];
-        computeIntermediate(reinterpret_cast<const uint8_t*>(m_serverPassword.data()),
-                            m_serverPassword.size(), intermediate);
-        authHashFromIntermediate(intermediate, authHash);
-        uint8_t expected[32];
-        computeServerAuthProof(expected, m_secureMaster.data(), authHash);
-        if (crypto_verify32(expected, serverProof) != 0) {
-            if (onServerError) onServerError("server auth proof failed");
-            m_conn.reset();
+        ByteBuffer bb(payload, len);
+        if (msgType == MSG_SERVER_HELLO) {
+            const uint16_t serverVersion = bb.readU16();
+            const bool authRequired = bb.readU8() != 0;
+            if (serverVersion != PROTOCOL_VERSION) {
+                if (onServerError) onServerError("protocol version mismatch");
+                failSignalFrame(msgType, len, "invalid-version", 0);
+                return false;
+            }
+            m_serverAuthRequired = authRequired;
+            if (!authRequired) {
+                if (onConnected) onConnected();
+                return true;
+            }
+            bb.readBytes(m_serverNonce, 16);
+            bb.readBytes(m_serverPubKey, 32);
+            if (m_serverPassword.empty()) {
+                if (onServerPasswordRequired) onServerPasswordRequired();
+            } else {
+                sendServerAuth();
+            }
+            return true;
+        }
+
+        if (msgType == MSG_SERVER_AUTH_OK) {
+            if (m_secureMaster.size() != SECURE_KEY_SIZE) {
+                if (onServerError) onServerError("invalid server auth response");
+                failSignalFrame(msgType, len, "auth-state-invalid", 0);
+                return false;
+            }
+            const uint32_t sessionId = bb.readU32();
+            uint8_t serverProof[SECURE_KEY_SIZE];
+            bb.readBytes(serverProof, sizeof(serverProof));
+            uint8_t intermediate[CIPHER_KEY_SIZE];
+            uint8_t authHash[CIPHER_KEY_SIZE];
+            uint8_t expected[SECURE_KEY_SIZE];
+            computeIntermediate(
+                reinterpret_cast<const uint8_t*>(m_serverPassword.data()),
+                m_serverPassword.size(), intermediate);
+            authHashFromIntermediate(intermediate, authHash);
+            computeServerAuthProof(expected, m_secureMaster.data(), authHash);
+            const bool proofValid =
+                crypto_verify32(expected, serverProof) == 0;
             crypto_wipe(intermediate, sizeof(intermediate));
             crypto_wipe(authHash, sizeof(authHash));
             crypto_wipe(expected, sizeof(expected));
-            return;
-        }
-        m_secureCipher.init(m_secureMaster.data(), true, "signal");
-        m_secureReady = true;
-        if (onSecureSessionEstablished)
-            onSecureSessionEstablished(m_secureSessionId, m_secureMaster);
-        if (onConnected) onConnected();
-        crypto_wipe(intermediate, sizeof(intermediate));
-        crypto_wipe(authHash, sizeof(authHash));
-        crypto_wipe(expected, sizeof(expected));
-        return;
-    }
+            crypto_wipe(serverProof, sizeof(serverProof));
 
-    std::vector<uint8_t> plain;
-    if (msgType == MSG_ENCRYPTED) {
-        if (!m_secureReady ||
-            !m_secureCipher.decrypt(payload, len, &plain) || plain.empty()) {
-            m_conn.reset();
-            if (onDisconnected) onDisconnected();
-            return;
+            if (!proofValid) {
+                if (onServerError) onServerError("server auth proof failed");
+                failSignalFrame(msgType, len, "invalid-server-proof", 0);
+                return false;
+            }
+            m_secureSessionId = sessionId;
+            m_secureCipher.init(m_secureMaster.data(), true, "signal");
+            m_secureReady = true;
+            if (onSecureSessionEstablished)
+                onSecureSessionEstablished(m_secureSessionId, m_secureMaster);
+            if (!m_conn.connected) return false;
+            if (onConnected) onConnected();
+            return true;
         }
-        msgType = plain[0];
-        payload = plain.size() > 1 ? plain.data() + 1 : nullptr;
-        len = plain.size() > 1 ? plain.size() - 1 : 0;
-        bb = len > 0 ? ByteBuffer(payload, len) : ByteBuffer();
-    } else if (m_secureReady) {
-        m_conn.reset();
-        if (onDisconnected) onDisconnected();
-        return;
-    }
 
-    switch (msgType) {
-    case MSG_LOGIN_RESP: {
-        m_myPeerId = bb.readU32();
-        uint16_t ver = bb.remaining() >= 2 ? bb.readU16() : 1;
-        bool resumeAccepted = bb.remaining() > 0 ? (bb.readU8() != 0) : false;
-        LOG_INFO("Login OK, peerId=%u serverVersion=%u resume=%u",
-                 m_myPeerId, ver, resumeAccepted ? 1 : 0);
-        if (ver != PROTOCOL_VERSION)
-            LOG_ERR("Protocol version mismatch: client=%u server=%u", PROTOCOL_VERSION, ver);
-        if (onLoginResponse) onLoginResponse(m_myPeerId, resumeAccepted);
-        break;
-    }
-    case MSG_ROOM_CREATED: {
-        uint32_t roomId = bb.readU32();
-        uint32_t vip    = bb.readU32();
-        RoomTrafficPolicy tcpPolicy = normalizeTrafficPolicy(
-            bb.readU8(), bb.readU8(), bb.readU8(), makeDefaultTcpPolicy());
-        RoomTrafficPolicy udpPolicy = normalizeTrafficPolicy(
-            bb.readU8(), bb.readU8(), bb.readU8(), makeDefaultUdpPolicy());
-        bool passwordProtected = bb.remaining() > 0 ? (bb.readU8() != 0) : false;
-        uint16_t mtu = bb.remaining() >= 2 ? normalizeRoomMtu(bb.readU16()) : ROOM_MTU_DEFAULT;
-        Buffer leaseToken;
-        if (bb.remaining() >= RECONNECT_TOKEN_SIZE) {
-            leaseToken.resize(RECONNECT_TOKEN_SIZE);
-            bb.readBytes(leaseToken.data(), RECONNECT_TOKEN_SIZE);
+        switch (msgType) {
+        case MSG_LOGIN_RESP: {
+            const uint32_t peerId = bb.readU32();
+            const uint16_t serverVersion = bb.readU16();
+            const bool resumeAccepted = bb.readU8() != 0;
+            if (serverVersion != PROTOCOL_VERSION) {
+                if (onServerError) onServerError("protocol version mismatch");
+                failSignalFrame(msgType, len, "invalid-version", 4);
+                return false;
+            }
+            m_myPeerId = peerId;
+            if (onLoginResponse) onLoginResponse(peerId, resumeAccepted);
+            return true;
         }
-        if (onRoomCreated) onRoomCreated(roomId, vip, tcpPolicy, udpPolicy, mtu, passwordProtected, leaseToken);
-        break;
-    }
-    case MSG_JOIN_RESP: {
-        uint32_t roomId = bb.readU32();
-        uint32_t vip    = bb.readU32();
-        RoomTrafficPolicy tcpPolicy = normalizeTrafficPolicy(
-            bb.readU8(), bb.readU8(), bb.readU8(), makeDefaultTcpPolicy());
-        RoomTrafficPolicy udpPolicy = normalizeTrafficPolicy(
-            bb.readU8(), bb.readU8(), bb.readU8(), makeDefaultUdpPolicy());
-        bool passwordProtected = bb.remaining() > 0 ? (bb.readU8() != 0) : false;
-        uint16_t mtu = bb.remaining() >= 2 ? normalizeRoomMtu(bb.readU16()) : ROOM_MTU_DEFAULT;
-        uint8_t count = bb.readU8();
-        std::vector<PeerInfo> members;
-        for (uint8_t i = 0; i < count; ++i) {
-            PeerInfo pi;
-            pi.peerId     = bb.readU32();
-            pi.virtualIP  = bb.readU32();
-            pi.name       = bb.readString();
-            pi.transport  = TRANSPORT_NONE;
-            members.push_back(pi);
+        case MSG_ROOM_CREATED: {
+            const uint32_t roomId = bb.readU32();
+            const uint32_t virtualIP = bb.readU32();
+            const RoomTrafficPolicy tcpPolicy = normalizeTrafficPolicy(
+                bb.readU8(), bb.readU8(), bb.readU8(),
+                makeDefaultTcpPolicy());
+            const RoomTrafficPolicy udpPolicy = normalizeTrafficPolicy(
+                bb.readU8(), bb.readU8(), bb.readU8(),
+                makeDefaultUdpPolicy());
+            const bool passwordProtected = bb.readU8() != 0;
+            const uint16_t mtu = bb.readU16();
+            Buffer leaseToken(RECONNECT_TOKEN_SIZE);
+            bb.readBytes(leaseToken.data(), leaseToken.size());
+            if (onRoomCreated)
+                onRoomCreated(roomId, virtualIP, tcpPolicy, udpPolicy, mtu,
+                              passwordProtected, leaseToken);
+            return true;
         }
-        Buffer leaseToken;
-        if (bb.remaining() >= RECONNECT_TOKEN_SIZE) {
-            leaseToken.resize(RECONNECT_TOKEN_SIZE);
-            bb.readBytes(leaseToken.data(), RECONNECT_TOKEN_SIZE);
-        }
-        m_hasPendingAuth = false;
-        if (onJoinResponse) onJoinResponse(roomId, vip, tcpPolicy, udpPolicy, mtu, passwordProtected, members, leaseToken);
-        break;
-    }
-    case MSG_PEER_JOINED: {
-        PeerInfo pi;
-        pi.peerId     = bb.readU32();
-        pi.virtualIP  = bb.readU32();
-        pi.name       = bb.readString();
-        pi.transport  = TRANSPORT_NONE;
-        if (onPeerJoined) onPeerJoined(pi);
-        break;
-    }
-    case MSG_PEER_RESUMED: {
-        PeerInfo pi;
-        pi.peerId     = bb.readU32();
-        pi.virtualIP  = bb.readU32();
-        pi.name       = bb.readString();
-        pi.transport  = TRANSPORT_NONE;
-        LOG_INFO("[signal] PEER_RESUMED peerId=%u ip=%s name=%s",
-                 pi.peerId, ipToString(pi.virtualIP).c_str(), pi.name.c_str());
-        if (onPeerResumed) onPeerResumed(pi);
-        break;
-    }
-    case MSG_PEER_LEFT: {
-        uint32_t peerId = bb.readU32();
-        if (onPeerLeft) onPeerLeft(peerId);
-        break;
-    }
-    case MSG_LOGOUT_ACK: {
-        m_myPeerId = 0;
-        if (onLogoutAck) onLogoutAck();
-        break;
-    }
-    case MSG_ROOM_LIST:
-    case MSG_ROOM_LIST_PUSH: {
-        uint16_t count = bb.readU16();
-        std::vector<CliRoomListItem> rooms;
-        for (uint16_t i = 0; i < count; ++i) {
-            CliRoomListItem ri;
-            ri.roomId        = bb.readU32();
-            ri.roomName      = bb.readString();
-            ri.playerCount   = bb.readU8();
-            ri.maxPlayers    = bb.readU8();
-            ri.tcpPolicy = normalizeTrafficPolicy(
-                bb.readU8(), bb.readU8(), bb.readU8(), makeDefaultTcpPolicy());
-            ri.udpPolicy = normalizeTrafficPolicy(
-                bb.readU8(), bb.readU8(), bb.readU8(), makeDefaultUdpPolicy());
-            ri.passwordProtected = bb.remaining() > 0 ? bb.readU8() : 0;
-            ri.mtu = bb.remaining() >= 2 ? normalizeRoomMtu(bb.readU16()) : ROOM_MTU_DEFAULT;
-            rooms.push_back(ri);
-        }
-        if (onRoomList) onRoomList(rooms, msgType == MSG_ROOM_LIST_PUSH);
-        break;
-    }
-    case MSG_RELAY_READY: {
-        uint32_t peerId = bb.readU32();
-        if (onRelayReady) onRelayReady(peerId);
-        break;
-    }
-    case MSG_PONG: {
-        if (m_pingSentTime != 0) {
-            int rtt = static_cast<int>(currentTimeMs() - m_pingSentTime);
-            m_pingSentTime = 0;
-            if (onServerRtt) onServerRtt(rtt);
-        }
-        break;
-    }
-    case MSG_AUTH_CHALLENGE: {
-        if (m_hasPendingAuth && bb.remaining() >= 32) {
-            uint8_t challenge[CIPHER_CHALLENGE_SIZE];
-            bb.readBytes(challenge, 32);
-            uint8_t response[CIPHER_KEY_SIZE];
-            computeChallengeResponse(m_pendingAuthHash, challenge, response);
-            sendAuthResponse(response);
-            LOG_INFO("Auth challenge received, response sent");
-        } else {
-            LOG_ERR("Auth challenge but no pending auth hash");
+        case MSG_JOIN_RESP: {
+            const uint32_t roomId = bb.readU32();
+            const uint32_t virtualIP = bb.readU32();
+            const RoomTrafficPolicy tcpPolicy = normalizeTrafficPolicy(
+                bb.readU8(), bb.readU8(), bb.readU8(),
+                makeDefaultTcpPolicy());
+            const RoomTrafficPolicy udpPolicy = normalizeTrafficPolicy(
+                bb.readU8(), bb.readU8(), bb.readU8(),
+                makeDefaultUdpPolicy());
+            const bool passwordProtected = bb.readU8() != 0;
+            const uint16_t mtu = bb.readU16();
+            const uint8_t count = bb.readU8();
+            std::vector<PeerInfo> members;
+            members.reserve(count);
+            for (uint8_t i = 0; i < count; ++i) {
+                PeerInfo info;
+                info.peerId = bb.readU32();
+                info.virtualIP = bb.readU32();
+                info.name = bb.readString();
+                info.transport = TRANSPORT_NONE;
+                members.push_back(info);
+            }
+            Buffer leaseToken(RECONNECT_TOKEN_SIZE);
+            bb.readBytes(leaseToken.data(), leaseToken.size());
             m_hasPendingAuth = false;
+            if (onJoinResponse)
+                onJoinResponse(roomId, virtualIP, tcpPolicy, udpPolicy, mtu,
+                               passwordProtected, members, leaseToken);
+            return true;
         }
-        break;
-    }
-    case MSG_ERROR: {
-        std::string errMsg = bb.readString();
-        LOG_ERR("Server error: %s", errMsg.c_str());
-        m_hasPendingAuth = false;
-        if (onServerError) onServerError(errMsg);
-        break;
-    }
-    default:
-        LOG_DBG("[signal] Unknown message type: 0x%02x", msgType);
-        break;
+        case MSG_PEER_JOINED:
+        case MSG_PEER_RESUMED: {
+            PeerInfo info;
+            info.peerId = bb.readU32();
+            info.virtualIP = bb.readU32();
+            info.name = bb.readString();
+            info.transport = TRANSPORT_NONE;
+            if (msgType == MSG_PEER_JOINED) {
+                if (onPeerJoined) onPeerJoined(info);
+            } else {
+                if (onPeerResumed) onPeerResumed(info);
+            }
+            return true;
+        }
+        case MSG_PEER_LEFT: {
+            const uint32_t peerId = bb.readU32();
+            if (onPeerLeft) onPeerLeft(peerId);
+            return true;
+        }
+        case MSG_LOGOUT_ACK:
+            m_myPeerId = 0;
+            if (onLogoutAck) onLogoutAck();
+            return true;
+
+        case MSG_ROOM_LIST:
+        case MSG_ROOM_LIST_PUSH: {
+            const uint16_t count = bb.readU16();
+            std::vector<CliRoomListItem> rooms;
+            rooms.reserve(count);
+            for (uint16_t i = 0; i < count; ++i) {
+                CliRoomListItem info;
+                info.roomId = bb.readU32();
+                info.roomName = bb.readString();
+                info.playerCount = bb.readU8();
+                info.maxPlayers = bb.readU8();
+                info.tcpPolicy = normalizeTrafficPolicy(
+                    bb.readU8(), bb.readU8(), bb.readU8(),
+                    makeDefaultTcpPolicy());
+                info.udpPolicy = normalizeTrafficPolicy(
+                    bb.readU8(), bb.readU8(), bb.readU8(),
+                    makeDefaultUdpPolicy());
+                info.passwordProtected = bb.readU8();
+                info.mtu = bb.readU16();
+                rooms.push_back(info);
+            }
+            if (onRoomList)
+                onRoomList(rooms, msgType == MSG_ROOM_LIST_PUSH);
+            return true;
+        }
+        case MSG_RELAY_READY: {
+            const uint32_t peerId = bb.readU32();
+            if (onRelayReady) onRelayReady(peerId);
+            return true;
+        }
+        case MSG_TCP_RELAY_DATA: {
+            const uint32_t srcPeerId = bb.readU32();
+            bb.readU32();
+            const TrafficClass cls =
+                static_cast<TrafficClass>(bb.readU8());
+            const size_t dataLen = bb.remaining();
+            Buffer data;
+            if (dataLen > 0) {
+                const uint8_t* dataStart =
+                    payload + len - dataLen;
+                data.assign(dataStart, dataStart + dataLen);
+            }
+            if (onRelayData)
+                onRelayData(srcPeerId, cls, data);
+            return true;
+        }
+        case MSG_PONG:
+            if (m_pingSentTime != 0) {
+                const int rtt =
+                    static_cast<int>(currentTimeMs() - m_pingSentTime);
+                m_pingSentTime = 0;
+                if (onServerRtt) onServerRtt(rtt);
+            }
+            return true;
+
+        case MSG_AUTH_CHALLENGE:
+            if (m_hasPendingAuth) {
+                uint8_t challenge[CIPHER_CHALLENGE_SIZE];
+                uint8_t response[CIPHER_KEY_SIZE];
+                bb.readBytes(challenge, sizeof(challenge));
+                computeChallengeResponse(
+                    m_pendingAuthHash, challenge, response);
+                sendAuthResponse(response);
+                crypto_wipe(challenge, sizeof(challenge));
+                crypto_wipe(response, sizeof(response));
+            } else {
+                m_hasPendingAuth = false;
+                LOG_ERR("[signal] Unexpected auth challenge type=0x%02x len=%zu",
+                        msgType, len);
+            }
+            return true;
+
+        case MSG_ERROR: {
+            const std::string message = bb.readString();
+            m_hasPendingAuth = false;
+            if (onServerError) onServerError(message);
+            return true;
+        }
+        default:
+            return true;
+        }
+    } catch (const std::exception&) {
+        failSignalFrame(msgType, len, "parser-exception", 0);
+        return false;
+    } catch (...) {
+        failSignalFrame(msgType, len, "unknown-parser-exception", 0);
+        return false;
     }
 }
 
@@ -517,12 +630,20 @@ void CliSignalClient::processMessage(uint8_t msgType, const uint8_t* payload, si
 CliDataChannel::CliDataChannel()
     : m_port(0), m_peerId(0), m_established(false),
       m_needReconnect(false), m_reconnectTime(0),
-      m_secureEnabled(false), m_secureSessionId(0)
+      m_securityMode(DataPlaneSecurityMode::Unconfigured),
+      m_secureSessionId(0)
 {}
 
-CliDataChannel::~CliDataChannel() { disconnect(); }
+CliDataChannel::~CliDataChannel() {
+    disconnect();
+    clearSecurityContext();
+}
 
 bool CliDataChannel::connectTo(const std::string& ip, uint16_t port, uint32_t peerId) {
+    if (m_securityMode == DataPlaneSecurityMode::Unconfigured) {
+        LOG_ERR("[datachannel] Refusing connection with unconfigured security mode");
+        return false;
+    }
     m_host = ip;
     m_port = port;
     m_peerId = peerId;
@@ -539,17 +660,56 @@ void CliDataChannel::disconnect() {
     m_port = 0;
 }
 
-void CliDataChannel::setSecureSession(uint32_t sessionId, const Buffer& master) {
+void CliDataChannel::configurePlaintextSession() {
+    if (m_conn.fd != SOCK_INVALID) {
+        LOG_ERR("[datachannel] Cannot change security mode while connected");
+        return;
+    }
+    if (!m_secureMaster.empty())
+        crypto_wipe(m_secureMaster.data(), m_secureMaster.size());
+    m_secureMaster.clear();
+    m_secureSessionId = 0;
+    m_cipher.reset();
+    m_securityMode = DataPlaneSecurityMode::Plaintext;
+}
+
+bool CliDataChannel::installSecureSession(uint32_t sessionId,
+                                          const Buffer& master) {
+    if (m_conn.fd != SOCK_INVALID) {
+        LOG_ERR("[datachannel] Cannot change security mode while connected");
+        return false;
+    }
+    if (sessionId == 0 || master.size() != SECURE_KEY_SIZE) {
+        clearSecurityContext();
+        return false;
+    }
+    if (!m_secureMaster.empty())
+        crypto_wipe(m_secureMaster.data(), m_secureMaster.size());
     m_secureSessionId = sessionId;
     m_secureMaster = master;
-    m_secureEnabled = (sessionId != 0 && master.size() == 32);
-    if (m_secureEnabled)
-        m_cipher.init(m_secureMaster.data(), true, "data");
+    m_cipher.init(m_secureMaster.data(), true, "data");
+    m_securityMode = DataPlaneSecurityMode::Secure;
+    return true;
+}
+
+void CliDataChannel::clearSecurityContext() {
+    if (m_conn.fd != SOCK_INVALID) {
+        LOG_ERR("[datachannel] Refusing to clear security while connected");
+        return;
+    }
+    if (!m_secureMaster.empty())
+        crypto_wipe(m_secureMaster.data(), m_secureMaster.size());
+    m_secureMaster.clear();
+    m_secureSessionId = 0;
+    m_cipher.reset();
+    m_securityMode = DataPlaneSecurityMode::Unconfigured;
 }
 
 void CliDataChannel::sendRelayData(uint32_t srcPeerId, uint32_t dstPeerId,
                                    TrafficClass cls, const Buffer& data) {
-    if (!m_established) return;
+    if (!m_established ||
+        m_securityMode == DataPlaneSecurityMode::Unconfigured)
+        return;
     ByteBuffer bb;
     bb.writeU32(srcPeerId);
     bb.writeU32(dstPeerId);
@@ -576,7 +736,7 @@ void CliDataChannel::onWritable() {
             m_conn.lastRecvTime = currentTimeMs();
 
             ByteBuffer bb;
-            if (m_secureEnabled) {
+            if (m_securityMode == DataPlaneSecurityMode::Secure) {
                 ByteBuffer inner;
                 inner.writeU32(m_peerId);
                 std::vector<uint8_t> enc = m_cipher.encrypt(inner.data(), inner.size());
@@ -585,8 +745,11 @@ void CliDataChannel::onWritable() {
                 bb.writeBytes(sid, SECURE_SESSION_ID_SIZE);
                 if (!enc.empty())
                     bb.writeBytes(enc.data(), enc.size());
-            } else {
+            } else if (m_securityMode == DataPlaneSecurityMode::Plaintext) {
                 bb.writeU32(m_peerId);
+            } else {
+                m_conn.reset();
+                return;
             }
             m_conn.sendTcpMsg(MSG_DATA_CHANNEL_INIT, bb);
             LOG_DBG("[datachannel] TCP connected, sent INIT for peer %u", m_peerId);
@@ -611,70 +774,138 @@ void CliDataChannel::onReadable() {
         return;
     }
 
-    while (m_conn.recvBuf.size() >= sizeof(TcpMsgHeader)) {
-        const TcpMsgHeader* hdr =
-            reinterpret_cast<const TcpMsgHeader*>(m_conn.recvBuf.data());
-        uint16_t payloadLen = ntohs(hdr->length);
-        if (payloadLen > MAX_TCP_MSG_PAYLOAD) {
-            m_conn.reset();
-            m_established = false;
+    static const size_t FRAME_HEADER_SIZE = 3;
+    while (m_conn.recvBuf.size() >= FRAME_HEADER_SIZE) {
+        const TcpFrameProbeResult frame = probeTcpFrame(
+            m_conn.recvBuf.data(), m_conn.recvBuf.size());
+        if (frame.status == TcpFrameProbeStatus::Malformed) {
+            failDataChannelFrame(frame.msgType, frame.payloadLength,
+                                 "payload-too-large", 0);
             return;
         }
-        size_t frameLen = sizeof(TcpMsgHeader) + payloadLen;
-        if (m_conn.recvBuf.size() < frameLen) break;
+        if (frame.status == TcpFrameProbeStatus::NeedMore)
+            break;
 
-        processMessage(hdr->msgType,
-                       m_conn.recvBuf.data() + sizeof(TcpMsgHeader), payloadLen);
+        const uint8_t msgType = frame.msgType;
+        const uint16_t payloadLen = frame.payloadLength;
+        const size_t frameLen = frame.frameLength;
+        Buffer payload;
+        if (payloadLen > 0) {
+            payload.assign(m_conn.recvBuf.begin() + FRAME_HEADER_SIZE,
+                           m_conn.recvBuf.begin() + frameLen);
+        }
         m_conn.recvBuf.erase(m_conn.recvBuf.begin(),
                              m_conn.recvBuf.begin() + frameLen);
+        const uint8_t* payloadData =
+            payload.empty() ? nullptr : payload.data();
+        if (!processMessage(msgType, payloadData, payload.size()))
+            return;
+        if (!m_conn.connected)
+            return;
     }
 }
 
-void CliDataChannel::processMessage(uint8_t msgType, const uint8_t* payload, size_t len) {
-    std::vector<uint8_t> plain;
-    if (msgType == MSG_ENCRYPTED) {
-        if (!m_secureEnabled ||
-            !m_cipher.decrypt(payload, len, &plain) || plain.empty())
-            return;
-        msgType = plain[0];
-        payload = plain.size() > 1 ? plain.data() + 1 : nullptr;
-        len = plain.size() > 1 ? plain.size() - 1 : 0;
-    } else if (m_secureEnabled) {
-        m_conn.reset();
-        m_established = false;
-        if (onDisconnectedCb) onDisconnectedCb();
-        if (m_peerId != 0)
-            scheduleReconnect();
-        return;
-    }
+bool CliDataChannel::processMessage(uint8_t msgType,
+                                    const uint8_t* payload, size_t len) {
+    try {
+        MessageValidationResult validation =
+            validateServerDataPayload(msgType, payload, len);
+        if (validation.status == MessageValidationStatus::Malformed) {
+            failDataChannelFrame(
+                msgType, len, messageValidationErrorName(validation.error),
+                validation.offset);
+            return false;
+        }
+        if (validation.status == MessageValidationStatus::UnknownType) {
+            LOG_DBG("[datachannel] Ignoring unknown outer type=0x%02x len=%zu",
+                    msgType, len);
+            return true;
+        }
 
-    switch (msgType) {
-    case MSG_DATA_CHANNEL_ACK:
-        m_established = true;
-        m_conn.lastRecvTime = currentTimeMs();
-        LOG_INFO("Data channel established");
-        if (onConnectedCb) onConnectedCb();
-        break;
-    case MSG_TCP_RELAY_DATA: {
-        if (len < 9) break;
-        ByteBuffer bb(payload, len);
-        uint32_t srcId = bb.readU32();
-        bb.readU32();
-        TrafficClass cls = bb.readU8() == TRAFFIC_TCP ? TRAFFIC_TCP : TRAFFIC_UDP;
-        size_t remaining = bb.remaining();
-        Buffer data(payload + len - remaining, payload + len);
-        if (onRelayData) onRelayData(srcId, cls, data);
-        break;
+        std::vector<uint8_t> plain;
+        if (msgType == MSG_ENCRYPTED) {
+            if (m_securityMode != DataPlaneSecurityMode::Secure ||
+                !m_cipher.decrypt(payload, len, &plain) ||
+                plain.empty()) {
+                failDataChannelFrame(msgType, len, "decrypt-failed", 0);
+                return false;
+            }
+            msgType = plain[0];
+            payload = plain.size() > 1 ? plain.data() + 1 : nullptr;
+            len = plain.size() > 1 ? plain.size() - 1 : 0;
+            validation = validateServerDataPayload(msgType, payload, len);
+            if (validation.status == MessageValidationStatus::Malformed) {
+                failDataChannelFrame(
+                    msgType, len,
+                    messageValidationErrorName(validation.error),
+                    validation.offset);
+                return false;
+            }
+        } else if (m_securityMode == DataPlaneSecurityMode::Secure) {
+            failDataChannelFrame(
+                msgType, len, "plaintext-in-secure-mode", 0);
+            return false;
+        } else if (m_securityMode == DataPlaneSecurityMode::Unconfigured) {
+            failDataChannelFrame(msgType, len, "security-unconfigured", 0);
+            return false;
+        }
+
+        LOG_DBG("[datachannel] Received type=0x%02x len=%zu", msgType, len);
+        if (validation.status == MessageValidationStatus::UnknownType)
+            return true;
+
+        switch (msgType) {
+        case MSG_DATA_CHANNEL_ACK:
+            m_established = true;
+            m_conn.lastRecvTime = currentTimeMs();
+            if (onConnectedCb) onConnectedCb();
+            return true;
+
+        case MSG_TCP_RELAY_DATA: {
+            ByteBuffer bb(payload, len);
+            const uint32_t srcId = bb.readU32();
+            bb.readU32();
+            const TrafficClass trafficClass =
+                static_cast<TrafficClass>(bb.readU8());
+            const size_t dataLen = bb.remaining();
+            Buffer data(payload + len - dataLen, payload + len);
+            if (onRelayData) onRelayData(srcId, trafficClass, data);
+            return true;
+        }
+        case MSG_PONG:
+            return true;
+        default:
+            return true;
+        }
+    } catch (const std::exception&) {
+        failDataChannelFrame(msgType, len, "parser-exception", 0);
+        return false;
+    } catch (...) {
+        failDataChannelFrame(
+            msgType, len, "unknown-parser-exception", 0);
+        return false;
     }
-    case MSG_PONG:
-        break;
-    default:
-        break;
-    }
+}
+
+void CliDataChannel::failDataChannelFrame(uint8_t msgType, size_t len,
+                                          const char* error, size_t offset) {
+    LOG_ERR("[datachannel] Invalid frame type=0x%02x len=%zu error=%s offset=%zu",
+            msgType, len, error ? error : "unknown", offset);
+    const bool wasEstablished = m_established;
+    m_conn.reset();
+    m_established = false;
+    if (wasEstablished && onDisconnectedCb)
+        onDisconnectedCb();
+    if (m_peerId != 0)
+        scheduleReconnect();
 }
 
 void CliDataChannel::sendMsg(uint8_t msgType, const ByteBuffer& body) {
-    if (m_secureEnabled && msgType != MSG_DATA_CHANNEL_INIT) {
+    if (!m_conn.connected ||
+        m_securityMode == DataPlaneSecurityMode::Unconfigured)
+        return;
+    if (m_securityMode == DataPlaneSecurityMode::Secure &&
+        msgType != MSG_DATA_CHANNEL_INIT) {
         std::vector<uint8_t> plain;
         plain.reserve(1 + body.size());
         plain.push_back(msgType);

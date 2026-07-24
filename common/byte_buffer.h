@@ -9,17 +9,32 @@
 
 namespace VLan {
 
+class ByteBufferReadError : public std::runtime_error {
+public:
+    explicit ByteBufferReadError(const char* message)
+        : std::runtime_error(message) {}
+};
+
 class ByteBuffer {
 public:
     ByteBuffer() : m_readPos(0) {}
 
     ByteBuffer(const uint8_t* d, size_t len)
-        : m_data(d, d + len), m_readPos(0) {}
+        : m_readPos(0) {
+        if (len == 0) return;
+        if (d == nullptr)
+            throw ByteBufferReadError("ByteBuffer: null input");
+        m_data.assign(d, d + len);
+    }
 
     ByteBuffer(const char* d, size_t len)
-        : m_data(reinterpret_cast<const uint8_t*>(d),
-                 reinterpret_cast<const uint8_t*>(d) + len),
-          m_readPos(0) {}
+        : m_readPos(0) {
+        if (len == 0) return;
+        if (d == nullptr)
+            throw ByteBufferReadError("ByteBuffer: null input");
+        const uint8_t* bytes = reinterpret_cast<const uint8_t*>(d);
+        m_data.assign(bytes, bytes + len);
+    }
 
     void writeU8(uint8_t v) { m_data.push_back(v); }
 
@@ -91,8 +106,8 @@ public:
 
 private:
     void ensureReadable(size_t n) const {
-        if (m_readPos + n > m_data.size())
-            throw std::runtime_error("ByteBuffer: read beyond end");
+        if (n > remaining())
+            throw ByteBufferReadError("ByteBuffer: read beyond end");
     }
 
     std::vector<uint8_t> m_data;

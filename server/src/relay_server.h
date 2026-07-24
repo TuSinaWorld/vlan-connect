@@ -4,7 +4,6 @@
 #include "protocol.h"
 #include "net_common.h"
 #include "room.h"
-#include <map>
 
 namespace VLan {
 
@@ -20,12 +19,14 @@ class RelayHandler {
 public:
     /*
      * Forward a UDP relay packet to the destination peer.
-     * peerMap: peerId -> ClientSession* (used to look up udpAddr).
+     * src and dst have already been resolved through SignalServer's validated
+     * signal-fd indexes.
      */
     static void processUdpRelay(int udpFd,
                                 const uint8_t* data, size_t len,
                                 const struct sockaddr_in& from,
-                                std::map<uint32_t, ClientSession*>& peerMap);
+                                ClientSession& src,
+                                ClientSession& dst);
 };
 
 } // namespace VLan

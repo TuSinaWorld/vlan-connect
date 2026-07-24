@@ -377,14 +377,20 @@ void CliApp::setupCallbacks() {
         fflush(stdout);
     };
     m_signal.onRelayReady    = [this](uint32_t pid) { onRelayReady(pid); };
+    m_signal.onRelayData     = [this](uint32_t src, TrafficClass cls,
+                                      Buffer data) {
+        handleTcpRelayReceived(src, cls, data);
+    };
     m_signal.onLogoutAck     = [this]() { onLogoutAck(); };
     m_signal.onServerPasswordRequired = [this]() {
         fprintf(stdout, "\n* Server requires auth password. Type: server-password <password>\n> ");
         fflush(stdout);
     };
     m_signal.onSecureSessionEstablished = [this](uint32_t sessionId, const Buffer& master) {
-        m_tunnel.setSecureSession(sessionId, master);
-        m_dataChannel.setSecureSession(sessionId, master);
+        bool installed = m_tunnel.installSecureSession(sessionId, master);
+        installed = m_dataChannel.installSecureSession(sessionId, master) && installed;
+        if (!installed)
+            LOG_ERR("Failed to install secure data-plane session");
     };
     m_signal.onServerError   = [this](const std::string& msg) {
         fprintf(stdout, "* Server error: %s\n> ", msg.c_str());
@@ -824,9 +830,9 @@ void CliApp::doConnect() {
     inet_pton(AF_INET, m_resolvedIP.c_str(), &serverIPn);
     uint32_t serverIP = ntohl(serverIPn);
     m_tunnel.setServerEndpoint(serverIP, m_port);
-    m_dataChannel.disconnect();
-    m_tunnel.setSecureSession(0, Buffer());
-    m_dataChannel.setSecureSession(0, Buffer());
+    teardownTun();
+    m_tunnel.clearSecurityContext();
+    m_dataChannel.clearSecurityContext();
     m_signal.setServerPassword(m_serverPassword);
 
     fprintf(stdout, "* Connecting to %s:%u ...\n", m_resolvedIP.c_str(), m_port);
@@ -1054,9 +1060,9 @@ void CliApp::doLeaveRoom() {
         fflush(stdout);
         return;
     }
+    m_tunnel.stopDataPlane();
     m_signal.leaveRoom();
     teardownTun();
-    m_tunnel.setSecureSession(0, Buffer());
     m_pendingResumeRoom = false;
     clearResumeLease();
     m_currentRoomId = 0;
@@ -1078,6 +1084,9 @@ void CliApp::beginGracefulDisconnect(bool exitAfterDisconnect) {
     clearResumeLease();
     m_manualDisconnecting = true;
     m_exitAfterDisconnect = exitAfterDisconnect;
+    teardownTun();
+    m_dataChannel.clearSecurityContext();
+    m_tunnel.clearSecurityContext();
 
     if (m_signal.isConnected() && m_signal.myPeerId() != 0) {
         if (!m_logoutPending) {
@@ -1094,10 +1103,9 @@ void CliApp::beginGracefulDisconnect(bool exitAfterDisconnect) {
 void CliApp::finishGracefulDisconnect() {
     m_logoutPending = false;
     m_logoutDeadline = 0;
-    m_dataChannel.disconnect();
-    m_dataChannel.setSecureSession(0, Buffer());
-    m_tunnel.setSecureSession(0, Buffer());
     teardownTun();
+    m_dataChannel.clearSecurityContext();
+    m_tunnel.clearSecurityContext();
     if (m_signal.fd() != SOCK_INVALID)
         m_signal.disconnect();
     if (m_exitAfterDisconnect) {
@@ -1152,9 +1160,8 @@ void CliApp::onSignalDisconnected() {
         startResumeLeaseDeadline();
 
     teardownTun();
-    m_dataChannel.disconnect();
-    m_dataChannel.setSecureSession(0, Buffer());
-    m_tunnel.setSecureSession(0, Buffer());
+    m_dataChannel.clearSecurityContext();
+    m_tunnel.clearSecurityContext();
     m_currentRoomId = 0;
     m_myVirtualIP = 0;
     m_roomMtu = ROOM_MTU_DEFAULT;
@@ -1190,6 +1197,21 @@ void CliApp::onLoginResponse(uint32_t peerId, bool resumeAccepted) {
     fprintf(stdout, "* Logged in, peerId=%u\n", peerId);
     fflush(stdout);
     m_tunnel.setMyPeerId(peerId);
+    bool securityReady = true;
+    if (m_signal.secureEnabled()) {
+        securityReady = m_tunnel.installSecureSession(
+            m_signal.secureSessionId(), m_signal.secureMaster());
+        securityReady = m_dataChannel.installSecureSession(
+            m_signal.secureSessionId(), m_signal.secureMaster()) && securityReady;
+    } else {
+        m_tunnel.configurePlaintextSession();
+        m_dataChannel.configurePlaintextSession();
+    }
+    if (!securityReady) {
+        LOG_ERR("Failed to configure data-plane security");
+        beginGracefulDisconnect(false);
+        return;
+    }
 
     bool canResume = m_wasInRoom && hasUsableResumeLease();
     if (m_wantReconnect || canResume) {
@@ -1213,10 +1235,6 @@ void CliApp::onLoginResponse(uint32_t peerId, bool resumeAccepted) {
         }
     }
 
-    /* Connect data channel */
-    if (m_signal.secureEnabled())
-        m_dataChannel.setSecureSession(m_signal.secureSessionId(), m_signal.secureMaster());
-    m_dataChannel.connectTo(m_resolvedIP, m_port, peerId);
 }
 
 void CliApp::onRoomCreated(uint32_t roomId, uint32_t virtualIP,
@@ -1405,13 +1423,25 @@ void CliApp::setupTun() {
         return;
     }
     m_tunnel.setTunAdapter(m_tun);
+    if (!m_tunnel.startDataPlane()) {
+        fprintf(stdout, "* Data-plane security is not configured\n> ");
+        fflush(stdout);
+        m_tunnel.setTunAdapter(nullptr);
+        m_tun->shutdown();
+        delete m_tun;
+        m_tun = nullptr;
+        return;
+    }
+    m_dataChannel.connectTo(m_resolvedIP, m_port, m_signal.myPeerId());
     fprintf(stdout, "* TUN adapter started, IP=%s, MTU=%d\n> ",
             ipToString(m_myVirtualIP).c_str(), mtu);
     fflush(stdout);
 }
 
 void CliApp::teardownTun() {
+    m_tunnel.stopDataPlane();
     m_pendingRebuild.clear();
+    m_dataChannel.disconnect();
     m_tunnel.removeAllPeers();
     if (m_tun) {
         m_tunnel.setTunAdapter(nullptr);
@@ -1477,8 +1507,16 @@ void CliApp::setupTcpRelayTunnel(uint32_t peerId, TrafficClass cls) {
     uint32_t myId = m_signal.myPeerId();
     peer->setTcpRelaySender([this, myId](uint32_t dstPeerId, TrafficClass trafficClass,
                                          const Buffer& data) {
-        if (m_dataChannel.isConnected())
-            m_dataChannel.sendRelayData(myId, dstPeerId, trafficClass, data);
+        if (m_tunnel.dataPlaneState() == DataPlaneState::Running &&
+            m_tunnel.securityMode() != DataPlaneSecurityMode::Unconfigured) {
+            if (m_dataChannel.isConnected()) {
+                m_dataChannel.sendRelayData(
+                    myId, dstPeerId, trafficClass, data);
+            } else if (m_signal.isConnected()) {
+                m_signal.sendRelayData(
+                    myId, dstPeerId, trafficClass, data);
+            }
+        }
     });
     peer->setTransport(cls, TRANSPORT_RELAY_TCP);
 }
@@ -1530,6 +1568,10 @@ void CliApp::handleReconnectRoomList(const std::vector<CliRoomListItem>& rooms) 
 }
 
 void CliApp::handleTcpRelayReceived(uint32_t srcPeerId, TrafficClass cls, Buffer data) {
+    if (m_tunnel.dataPlaneState() != DataPlaneState::Running ||
+        m_tunnel.securityMode() == DataPlaneSecurityMode::Unconfigured) {
+        return;
+    }
     CliPeerConnection* peer = m_tunnel.peerById(srcPeerId);
     if (!peer) return;
     peer->onTcpRelayDataReceived(cls);

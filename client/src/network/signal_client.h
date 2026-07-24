@@ -32,7 +32,7 @@ public:
     bool isConnecting() const;
     bool secureEnabled() const { return m_secureReady; }
     uint32_t secureSessionId() const { return m_secureSessionId; }
-    QByteArray secureMaster() const { return m_secureMaster; }
+    const QByteArray& secureMaster() const { return m_secureMaster; }
 
     void setServerPassword(const QString& password);
     void continueServerAuth();
@@ -56,6 +56,8 @@ public:
     void logout();
     void listRooms();
     void requestRelay(uint32_t targetPeerId);
+    void sendRelayData(uint32_t srcPeerId, uint32_t dstPeerId,
+                       TrafficClass cls, const QByteArray& data);
 
     uint32_t myPeerId() const { return m_myPeerId; }
 
@@ -83,6 +85,9 @@ signals:
     void peerLeft(uint32_t peerId);
     void roomList(QList<RoomListItem> rooms);
     void relayReady(uint32_t peerId);
+    void relayDataReceived(uint32_t srcPeerId,
+                           VLan::TrafficClass cls,
+                           QByteArray data);
     void serverPasswordRequired();
     void secureSessionEstablished(uint32_t sessionId, QByteArray master);
     void serverError(QString message);
@@ -100,10 +105,13 @@ private slots:
 private:
     void sendMsg(uint8_t msgType, const ByteBuffer& body);
     void sendMsg(uint8_t msgType);
-    void processMessage(uint8_t msgType, const uint8_t* payload, size_t len);
+    bool processMessage(uint8_t msgType, const uint8_t* payload, size_t len);
     void sendClientHello();
     void sendServerAuth();
+    void resetSecureState();
     void handleStreamCorruption();
+    void handleMalformedFrame(uint8_t msgType, size_t len,
+                              const char* error, size_t offset);
 
     QTcpSocket* m_socket;
     QTimer*     m_pingTimer;
@@ -120,6 +128,7 @@ private:
     QString     m_serverPassword;
     bool        m_serverAuthRequired;
     bool        m_secureReady;
+    bool        m_fatalDisconnectPending;
     uint32_t    m_secureSessionId;
     uint8_t     m_clientNonce[16];
     uint8_t     m_serverNonce[16];

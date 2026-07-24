@@ -51,7 +51,7 @@ static const int TCP_RELAY_DEAD_MS      = 30000;              // peer-level time
 static const int TCP_RECV_TIMEOUT_MS    = 45000;              // client-side no-recv
 
 static const uint32_t PROTOCOL_MAGIC    = 0x564C414E; // "VLAN"
-static const uint16_t PROTOCOL_VERSION  = 6;
+static const uint16_t PROTOCOL_VERSION  = 7;
 
 enum UdpPacketType : uint8_t {
     UDP_KCP_DATA      = 0x01,
@@ -107,6 +107,27 @@ enum TrafficClass : uint8_t {
     TRAFFIC_TCP = 1,
     TRAFFIC_UDP = 2
 };
+
+enum class DataPlaneState : uint8_t {
+    Stopped = 0,
+    Running = 1
+};
+
+enum class DataPlaneSecurityMode : uint8_t {
+    Unconfigured = 0,
+    Plaintext    = 1,
+    Secure       = 2
+};
+
+inline bool dataPlaneAllowsTraffic(DataPlaneState state,
+                                   DataPlaneSecurityMode mode) {
+    return state == DataPlaneState::Running &&
+           mode != DataPlaneSecurityMode::Unconfigured;
+}
+
+inline bool dataPlaneCanReconfigure(DataPlaneState state) {
+    return state == DataPlaneState::Stopped;
+}
 
 enum KcpProfile : uint8_t {
     KCP_PROFILE_REALTIME = 0,

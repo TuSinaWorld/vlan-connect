@@ -14,7 +14,10 @@ TunnelManager::TunnelManager(QObject* parent)
       m_tun(nullptr),
       m_serverUdpPort(0), m_myPeerId(0), m_myVirtualIP(0),
       m_tunUploadBytes(0), m_tunDownloadBytes(0),
-      m_secureUdpEnabled(false), m_secureSessionId(0)
+      m_tunGeneration(0),
+      m_dataPlaneState(DataPlaneState::Stopped),
+      m_securityMode(DataPlaneSecurityMode::Unconfigured),
+      m_secureSessionId(0)
 {
     m_udpSocket = new QUdpSocket(this);
     m_udpSocket->bind(QHostAddress(QHostAddress::Any), quint16(0));
@@ -23,23 +26,33 @@ TunnelManager::TunnelManager(QObject* parent)
     m_kcpTimer = new QTimer(this);
     m_kcpTimer->setTimerType(Qt::PreciseTimer);
     connect(m_kcpTimer, &QTimer::timeout, this, &TunnelManager::onKcpUpdate);
-    m_kcpTimer->start(5);
 
     m_udpKeepaliveTimer = new QTimer(this);
     connect(m_udpKeepaliveTimer, &QTimer::timeout, this, &TunnelManager::onUdpKeepalive);
-    m_udpKeepaliveTimer->start(UDP_KEEPALIVE_INTERVAL_MS);
 }
 
 TunnelManager::~TunnelManager() {
-    m_kcpTimer->stop();
-    m_udpKeepaliveTimer->stop();
+    stopDataPlane();
     qDeleteAll(m_peerById);
+    clearSecurityContext();
 }
 
 void TunnelManager::setTunAdapter(TunAdapter* tun) {
+    if (m_tun)
+        QObject::disconnect(m_tun, nullptr, this, nullptr);
     m_tun = tun;
-    if (tun)
-        connect(tun, &TunAdapter::packetReceived, this, &TunnelManager::onTunPacketReceived);
+    const quint64 generation = ++m_tunGeneration;
+    if (tun) {
+        connect(tun, &TunAdapter::packetReceived, this,
+                [this, tun, generation](QByteArray packet) {
+            if (m_tun != tun || m_tunGeneration != generation ||
+                !dataPlaneAllowsTraffic(
+                    m_dataPlaneState, m_securityMode)) {
+                return;
+            }
+            onTunPacketReceived(packet);
+        });
+    }
 }
 
 void TunnelManager::setServerEndpoint(const QHostAddress& addr, quint16 udpPort) {
@@ -51,12 +64,75 @@ quint16 TunnelManager::localUdpPort() const {
     return m_udpSocket->localPort();
 }
 
-void TunnelManager::setSecureSession(uint32_t sessionId, const QByteArray& master) {
+void TunnelManager::configurePlaintextSession() {
+    if (!dataPlaneCanReconfigure(m_dataPlaneState)) {
+        LogManager::instance().logError("[tunnel] Refusing to change security while data plane is running");
+        return;
+    }
+    clearSecurityContext();
+    m_securityMode = DataPlaneSecurityMode::Plaintext;
+}
+
+bool TunnelManager::installSecureSession(uint32_t sessionId, const QByteArray& master) {
+    if (!dataPlaneCanReconfigure(m_dataPlaneState)) {
+        LogManager::instance().logError("[tunnel] Refusing to change security while data plane is running");
+        return false;
+    }
+    clearSecurityContext();
+    if (sessionId == 0 || master.size() != SECURE_KEY_SIZE) {
+        LogManager::instance().logError("[tunnel] Invalid secure data-plane session");
+        return false;
+    }
     m_secureSessionId = sessionId;
     m_secureMaster = master;
-    m_secureUdpEnabled = (sessionId != 0 && master.size() == 32);
-    if (m_secureUdpEnabled)
-        m_udpCipher.init(reinterpret_cast<const uint8_t*>(m_secureMaster.constData()), true, "udp");
+    m_udpCipher.init(reinterpret_cast<const uint8_t*>(m_secureMaster.constData()), true, "udp");
+    m_securityMode = DataPlaneSecurityMode::Secure;
+    return true;
+}
+
+void TunnelManager::clearSecurityContext() {
+    if (!dataPlaneCanReconfigure(m_dataPlaneState)) {
+        LogManager::instance().logError("[tunnel] Refusing to clear security while data plane is running");
+        return;
+    }
+    m_udpCipher.reset();
+    m_secureSessionId = 0;
+    if (!m_secureMaster.isEmpty()) {
+        crypto_wipe(reinterpret_cast<uint8_t*>(m_secureMaster.data()),
+                    static_cast<size_t>(m_secureMaster.size()));
+        m_secureMaster.clear();
+    }
+    m_securityMode = DataPlaneSecurityMode::Unconfigured;
+}
+
+bool TunnelManager::startDataPlane() {
+    if (m_dataPlaneState == DataPlaneState::Running)
+        return true;
+    if (!m_tun || m_securityMode == DataPlaneSecurityMode::Unconfigured) {
+        LogManager::instance().logError("[tunnel] Cannot start unconfigured data plane");
+        return false;
+    }
+    setTunAdapter(m_tun);
+    m_dataPlaneState = DataPlaneState::Running;
+    m_kcpTimer->start(5);
+    m_udpKeepaliveTimer->start(UDP_KEEPALIVE_INTERVAL_MS);
+    return true;
+}
+
+void TunnelManager::stopDataPlane() {
+    m_dataPlaneState = DataPlaneState::Stopped;
+    if (m_kcpTimer)
+        m_kcpTimer->stop();
+    if (m_udpKeepaliveTimer)
+        m_udpKeepaliveTimer->stop();
+    ++m_tunGeneration;
+    if (m_tun)
+        QObject::disconnect(m_tun, nullptr, this, nullptr);
+    while (m_udpSocket && m_udpSocket->hasPendingDatagrams()) {
+        QByteArray discarded;
+        discarded.resize(static_cast<int>(m_udpSocket->pendingDatagramSize()));
+        m_udpSocket->readDatagram(discarded.data(), discarded.size());
+    }
 }
 
 // ───────── Peer management ─────────
@@ -183,8 +259,9 @@ KcpTunnel* TunnelManager::createKcpTunnel(PeerConnection* peer,
 {
     uint32_t conv = m_myPeerId ^ peer->peerId() ^ (static_cast<uint32_t>(trafficClass) << 24);
     if (conv == 0) conv = 1;
-    KcpTunnel* kcp = new KcpTunnel(conv, m_udpSocket, addr, port, fecMode, mtu,
-                                   profile, trafficClass, m_secureUdpEnabled, this);
+    KcpTunnel* kcp = new KcpTunnel(
+        conv, m_udpSocket, addr, port, fecMode, mtu, profile, trafficClass,
+        m_securityMode == DataPlaneSecurityMode::Secure, this);
     kcp->setDatagramSender([this](const QByteArray& pkt, const QHostAddress& a, quint16 p) {
         sendUdpDatagram(pkt, a, p);
     });
@@ -213,8 +290,9 @@ RawUdpTunnel* TunnelManager::createRawUdpTunnel(PeerConnection* peer,
                                                  uint16_t mtu,
                                                  TrafficClass trafficClass)
 {
-    RawUdpTunnel* tunnel = new RawUdpTunnel(m_udpSocket, addr, port, fecMode, mtu,
-                                            trafficClass, m_secureUdpEnabled, this);
+    RawUdpTunnel* tunnel = new RawUdpTunnel(
+        m_udpSocket, addr, port, fecMode, mtu, trafficClass,
+        m_securityMode == DataPlaneSecurityMode::Secure, this);
     tunnel->setDatagramSender([this](const QByteArray& pkt, const QHostAddress& a, quint16 p) {
         sendUdpDatagram(pkt, a, p);
     });
@@ -235,10 +313,16 @@ RawUdpTunnel* TunnelManager::createRawUdpTunnel(PeerConnection* peer,
 // ───────── TUN -> Network ─────────
 
 void TunnelManager::onTunPacketReceived(QByteArray packet) {
+    if (!dataPlaneAllowsTraffic(m_dataPlaneState, m_securityMode)) {
+        return;
+    }
     routeFromTun(packet);
 }
 
 void TunnelManager::routeFromTun(const QByteArray& ipPacket) {
+    if (!dataPlaneAllowsTraffic(m_dataPlaneState, m_securityMode)) {
+        return;
+    }
     if (ipPacket.size() < 20) return;
     m_tunUploadBytes += static_cast<quint64>(ipPacket.size());
 
@@ -262,10 +346,17 @@ void TunnelManager::routeFromTun(const QByteArray& ipPacket) {
 // ───────── Network -> TUN ─────────
 
 void TunnelManager::onPeerDataReceived(QByteArray ipPacket) {
+    if (m_dataPlaneState != DataPlaneState::Running ||
+        m_securityMode == DataPlaneSecurityMode::Unconfigured) {
+        return;
+    }
     routeToTun(ipPacket);
 }
 
 void TunnelManager::routeToTun(const QByteArray& ipPacket) {
+    if (!dataPlaneAllowsTraffic(m_dataPlaneState, m_securityMode)) {
+        return;
+    }
     if (g_verboseLog)
         LogManager::instance().logDetail(QString("[tunnel] routeToTun size=%1").arg(ipPacket.size()));
     if (m_tun && m_tun->writePacket(ipPacket))
@@ -283,13 +374,22 @@ void TunnelManager::trafficCounters(quint64* uploadBytes, quint64* downloadBytes
 }
 
 void TunnelManager::addTunDownloadBytes(quint64 bytes) {
+    if (m_dataPlaneState != DataPlaneState::Running)
+        return;
     m_tunDownloadBytes += bytes;
 }
 
 void TunnelManager::sendUdpDatagram(const QByteArray& datagram,
                                     const QHostAddress& addr, quint16 port) {
-    if (!m_secureUdpEnabled) {
+    if (!dataPlaneAllowsTraffic(m_dataPlaneState, m_securityMode)) {
+        return;
+    }
+    if (m_securityMode == DataPlaneSecurityMode::Plaintext) {
         m_udpSocket->writeDatagram(datagram, addr, port);
+        return;
+    }
+    if (m_securityMode != DataPlaneSecurityMode::Secure ||
+        m_secureSessionId == 0 || m_secureMaster.size() != SECURE_KEY_SIZE) {
         return;
     }
     std::vector<uint8_t> enc = m_udpCipher.encrypt(
@@ -316,10 +416,13 @@ void TunnelManager::onUdpReadyRead() {
         m_udpSocket->readDatagram(datagram.data(), datagram.size(),
                                   &sender, &senderPort);
 
+        if (!dataPlaneAllowsTraffic(m_dataPlaneState, m_securityMode)) {
+            continue;
+        }
         if (datagram.isEmpty()) continue;
         uint8_t pktType = static_cast<uint8_t>(datagram[0]);
 
-        if (m_secureUdpEnabled) {
+        if (m_securityMode == DataPlaneSecurityMode::Secure) {
             if (pktType != UDP_ENCRYPTED)
                 continue;
             if (datagram.size() < 1 + SECURE_SESSION_ID_SIZE + SECURE_FRAME_OVERHEAD)
@@ -389,6 +492,10 @@ void TunnelManager::onUdpReadyRead() {
 // ───────── KCP periodic update ─────────
 
 void TunnelManager::onKcpUpdate() {
+    if (m_dataPlaneState != DataPlaneState::Running ||
+        m_securityMode == DataPlaneSecurityMode::Unconfigured) {
+        return;
+    }
     QList<uint32_t> peerIds = m_peerById.keys();
     for (uint32_t peerId : peerIds) {
         for (int cls = TRAFFIC_TCP; cls <= TRAFFIC_UDP; ++cls) {
@@ -410,6 +517,8 @@ void TunnelManager::onKcpUpdate() {
 }
 
 void TunnelManager::markTransportDead(uint32_t peerId, TrafficClass cls) {
+    if (m_dataPlaneState != DataPlaneState::Running)
+        return;
     int idx = static_cast<int>(cls);
     if (idx < 0 || idx > 2) cls = TRAFFIC_UDP;
 
@@ -420,6 +529,10 @@ void TunnelManager::markTransportDead(uint32_t peerId, TrafficClass cls) {
 }
 
 void TunnelManager::flushPendingTransportDead() {
+    if (m_dataPlaneState != DataPlaneState::Running) {
+        m_pendingTransportDead.clear();
+        return;
+    }
     if (m_pendingTransportDead.isEmpty())
         return;
 
@@ -436,6 +549,10 @@ void TunnelManager::flushPendingTransportDead() {
 // ───────── UDP keepalive to server ─────────
 
 void TunnelManager::onUdpKeepalive() {
+    if (m_dataPlaneState != DataPlaneState::Running ||
+        m_securityMode == DataPlaneSecurityMode::Unconfigured) {
+        return;
+    }
     if (m_serverAddr.isNull() || m_serverUdpPort == 0) return;
 
     UdpHeader hdr;

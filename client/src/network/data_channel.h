@@ -20,7 +20,10 @@ public:
     void connectToServer(const QString& host, quint16 port, uint32_t peerId);
     void disconnect();
     bool isConnected() const;
-    void setSecureSession(uint32_t sessionId, const QByteArray& master);
+    void configurePlaintextSession();
+    bool installSecureSession(uint32_t sessionId, const QByteArray& master);
+    void clearSecurityContext();
+    DataPlaneSecurityMode securityMode() const { return m_securityMode; }
 
     void sendRelayData(uint32_t srcPeerId, uint32_t dstPeerId,
                        TrafficClass cls, const QByteArray& data);
@@ -41,8 +44,10 @@ private slots:
 private:
     void sendMsg(uint8_t msgType, const ByteBuffer& body);
     void sendMsg(uint8_t msgType);
-    void processMessage(uint8_t msgType, const uint8_t* payload, size_t len);
+    bool processMessage(uint8_t msgType, const uint8_t* payload, size_t len);
     void scheduleReconnect();
+    void handleMalformedFrame(uint8_t msgType, size_t len,
+                              const char* error, size_t offset);
 
     QTcpSocket* m_socket;
     QTimer*     m_keepaliveTimer;
@@ -54,7 +59,7 @@ private:
     uint32_t    m_peerId;
     bool        m_established;
     uint32_t    m_lastRecvTime;
-    bool        m_secureEnabled;
+    DataPlaneSecurityMode m_securityMode;
     uint32_t    m_secureSessionId;
     QByteArray  m_secureMaster;
     SecureFrameCipher m_cipher;
