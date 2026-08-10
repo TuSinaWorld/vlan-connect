@@ -108,6 +108,8 @@ private:
     void sendRawPacket(const Buffer& payload);
     void processFrag(const char* data, int len);
     void cleanupStaleEntries();
+    void removeReassemblyEntry(uint16_t msgId);
+    bool ensureReassemblyCapacity(size_t incomingBytes, bool newMessage);
     int  maxFragmentPayload() const;
 
     UdpSendFunc   m_udpSend;
@@ -126,6 +128,7 @@ private:
     int      m_rttMs;
 
     std::map<uint16_t, ReassemblyEntry> m_reassembly;
+    size_t m_reassemblyBytes;
 
     FecMode         m_fecMode;
     CliFecEncoder*  m_fecEncoder;

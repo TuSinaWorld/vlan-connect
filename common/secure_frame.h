@@ -8,7 +8,6 @@
 #include <cstring>
 #include <string>
 #include <vector>
-#include <random>
 
 #ifdef _WIN32
 #ifndef WIN32_LEAN_AND_MEAN
@@ -43,22 +42,35 @@ static const int SECURE_FRAME_OVERHEAD =
 static const int SERVER_AUTH_TIMEOUT_SEC = 120;
 
 inline bool secureRandomSystem(uint8_t* out, size_t len) {
+    if (!out && len != 0) return false;
+    uint8_t* const outputStart = out;
+    const size_t outputLength = len;
 #ifdef _WIN32
     while (len > 0) {
         ULONG chunk = len > 0x7fffffffUL ? 0x7fffffffUL : static_cast<ULONG>(len);
-        if (BCryptGenRandom(nullptr, out, chunk, BCRYPT_USE_SYSTEM_PREFERRED_RNG) != 0)
+        if (BCryptGenRandom(nullptr, out, chunk,
+                            BCRYPT_USE_SYSTEM_PREFERRED_RNG) != 0) {
+            if (outputStart && outputLength)
+                std::memset(outputStart, 0, outputLength);
             return false;
+        }
         out += chunk;
         len -= chunk;
     }
     return true;
 #else
     int fd = open("/dev/urandom", O_RDONLY);
-    if (fd < 0) return false;
+    if (fd < 0) {
+        if (outputStart && outputLength)
+            std::memset(outputStart, 0, outputLength);
+        return false;
+    }
     while (len > 0) {
         ssize_t n = read(fd, out, len);
         if (n <= 0) {
             close(fd);
+            if (outputStart && outputLength)
+                std::memset(outputStart, 0, outputLength);
             return false;
         }
         out += n;
@@ -69,12 +81,17 @@ inline bool secureRandomSystem(uint8_t* out, size_t len) {
 #endif
 }
 
-inline void secureRandomBytes(uint8_t* out, size_t len) {
-    if (secureRandomSystem(out, len))
-        return;
-    std::random_device rd;
-    for (size_t i = 0; i < len; ++i)
-        out[i] = static_cast<uint8_t>(rd());
+typedef bool (*SecureRandomProvider)(uint8_t*, size_t);
+
+inline bool secureRandomBytesWithProvider(uint8_t* out, size_t len,
+                                          SecureRandomProvider provider) {
+    if (provider && provider(out, len)) return true;
+    if (out && len) std::memset(out, 0, len);
+    return false;
+}
+
+inline bool secureRandomBytes(uint8_t* out, size_t len) {
+    return secureRandomBytesWithProvider(out, len, &secureRandomSystem);
 }
 
 inline uint32_t readU32BE(const uint8_t* p) {

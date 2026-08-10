@@ -50,6 +50,11 @@ public:
         m_data.push_back(static_cast<uint8_t>(v & 0xFF));
     }
 
+    void writeU64(uint64_t v) {
+        for (int shift = 56; shift >= 0; shift -= 8)
+            m_data.push_back(static_cast<uint8_t>((v >> shift) & 0xFF));
+    }
+
     void writeString(const std::string& s) {
         writeU16(static_cast<uint16_t>(s.size()));
         m_data.insert(m_data.end(), s.begin(), s.end());
@@ -80,6 +85,15 @@ public:
                      (static_cast<uint32_t>(m_data[m_readPos + 2]) << 8)  |
                       m_data[m_readPos + 3];
         m_readPos += 4;
+        return v;
+    }
+
+    uint64_t readU64() {
+        ensureReadable(8);
+        uint64_t v = 0;
+        for (int i = 0; i < 8; ++i)
+            v = (v << 8) | static_cast<uint64_t>(m_data[m_readPos + i]);
+        m_readPos += 8;
         return v;
     }
 

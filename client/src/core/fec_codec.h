@@ -56,10 +56,13 @@ private:
 
     void tryDecode(uint8_t groupId);
     void emitOriginalBlock(const QByteArray& block);
+    void removeGroup(uint8_t groupId);
+    bool ensureCapacity(size_t incomingBytes, bool newGroup);
 
     CM256&     m_cm256;
     OutputFunc m_output;
     QMap<uint8_t, FecGroup> m_groups;
+    size_t m_bufferedBytes;
 
     static const uint32_t GROUP_TIMEOUT_MS = 500;
 };

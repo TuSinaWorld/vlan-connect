@@ -4,6 +4,7 @@
 #include "protocol.h"
 #include <cstddef>
 #include <cstdint>
+#include <set>
 
 namespace VLan {
 
@@ -81,6 +82,18 @@ public:
                     static_cast<uint32_t>(m_data[m_pos + 3]);
         }
         m_pos += 4;
+        return true;
+    }
+
+    bool readU64(uint64_t* out) {
+        if (!require(8)) return false;
+        if (out) {
+            uint64_t value = 0;
+            for (int i = 0; i < 8; ++i)
+                value = (value << 8) | static_cast<uint64_t>(m_data[m_pos + i]);
+            *out = value;
+        }
+        m_pos += 8;
         return true;
     }
 
@@ -251,6 +264,27 @@ inline MessageValidationResult validateRelayData(const uint8_t* data, size_t len
     return finish(cursor);
 }
 
+inline bool readRoomListItem(Cursor& cursor, uint32_t* roomIdOut = nullptr) {
+    uint32_t roomId = 0;
+    uint8_t playerCount = 0;
+    uint8_t maxPlayers = 0;
+    const size_t roomOffset = cursor.position();
+    if (!cursor.readU32(&roomId) ||
+        !cursor.readString(1, MAX_ROOM_NAME_LEN, false) ||
+        !cursor.readU8(&playerCount) ||
+        !cursor.readU8(&maxPlayers) ||
+        !cursor.readPolicy() || !cursor.readPolicy() ||
+        !cursor.readBoolean() || !cursor.readMtu())
+        return false;
+    if (roomId == 0 || maxPlayers < 2 ||
+        maxPlayers > MAX_PLAYERS || playerCount > maxPlayers) {
+        cursor.setError(MessageValidationError::InvalidValue, roomOffset);
+        return false;
+    }
+    if (roomIdOut) *roomIdOut = roomId;
+    return true;
+}
+
 } // namespace MessageValidatorDetail
 
 inline const char* messageValidationErrorName(MessageValidationError error) {
@@ -406,33 +440,83 @@ inline MessageValidationResult validateServerSignalPayload(
     case MSG_PONG:
         return fixedSize(len, 0);
 
-    case MSG_ROOM_LIST:
-    case MSG_ROOM_LIST_PUSH: {
+    case MSG_ROOM_LIST: {
+        if (len > ROOM_LIST_PAGE_PAYLOAD) {
+            return MessageValidationResult(MessageValidationStatus::Malformed,
+                                           MessageValidationError::InvalidValue,
+                                           ROOM_LIST_PAGE_PAYLOAD);
+        }
         Cursor cursor(data, len);
+        uint64_t revision = 0;
+        uint16_t pageIndex = 0;
+        uint16_t pageCount = 0;
         uint16_t count = 0;
-        if (!cursor.readU16(&count)) return malformed(cursor);
+        if (!cursor.readU64(&revision) || !cursor.readU16(&pageIndex) ||
+            !cursor.readU16(&pageCount) || !cursor.readU16(&count))
+            return malformed(cursor);
+        if (revision == 0 || pageCount == 0 || pageIndex >= pageCount) {
+            cursor.setError(MessageValidationError::InvalidValue, 0);
+            return malformed(cursor);
+        }
         static const size_t MIN_ROOM_RECORD_SIZE =
             4 + 2 + 1 + 2 + 3 + 3 + 1 + 2;
         if (count > cursor.remaining() / MIN_ROOM_RECORD_SIZE) {
-            cursor.setError(MessageValidationError::InvalidCount, 0);
+            cursor.setError(MessageValidationError::InvalidCount, 12);
             return malformed(cursor);
         }
+        std::set<uint32_t> roomIds;
         for (uint16_t i = 0; i < count; ++i) {
             uint32_t roomId = 0;
-            uint8_t playerCount = 0;
-            uint8_t maxPlayers = 0;
-            const size_t roomOffset = cursor.position();
-            if (!cursor.readU32(&roomId) ||
-                !cursor.readString(1, MAX_ROOM_NAME_LEN, false) ||
-                !cursor.readU8(&playerCount) ||
-                !cursor.readU8(&maxPlayers) ||
-                !cursor.readPolicy() || !cursor.readPolicy() ||
-                !cursor.readBoolean() || !cursor.readMtu())
+            if (!readRoomListItem(cursor, &roomId))
                 return malformed(cursor);
-            if (roomId == 0 || maxPlayers < 2 ||
-                maxPlayers > MAX_PLAYERS || playerCount > maxPlayers) {
+            if (!roomIds.insert(roomId).second) {
                 cursor.setError(MessageValidationError::InvalidValue,
-                                roomOffset);
+                                cursor.position());
+                return malformed(cursor);
+            }
+        }
+        return finish(cursor);
+    }
+
+    case MSG_ROOM_LIST_PUSH: {
+        if (len > ROOM_LIST_PAGE_PAYLOAD) {
+            return MessageValidationResult(MessageValidationStatus::Malformed,
+                                           MessageValidationError::InvalidValue,
+                                           ROOM_LIST_PAGE_PAYLOAD);
+        }
+        Cursor cursor(data, len);
+        uint64_t baseRevision = 0;
+        uint64_t revision = 0;
+        uint16_t count = 0;
+        if (!cursor.readU64(&baseRevision) || !cursor.readU64(&revision) ||
+            !cursor.readU16(&count))
+            return malformed(cursor);
+        if (revision == 0 || revision <= baseRevision || count == 0) {
+            cursor.setError(MessageValidationError::InvalidValue, 0);
+            return malformed(cursor);
+        }
+        std::set<uint32_t> roomIds;
+        for (uint16_t i = 0; i < count; ++i) {
+            uint8_t operation = 0;
+            uint32_t roomId = 0;
+            if (!cursor.readU8(&operation)) return malformed(cursor);
+            if (operation == ROOM_LIST_UPSERT) {
+                if (!readRoomListItem(cursor, &roomId)) return malformed(cursor);
+            } else if (operation == ROOM_LIST_REMOVE) {
+                if (!cursor.readU32(&roomId)) return malformed(cursor);
+                if (roomId == 0) {
+                    cursor.setError(MessageValidationError::InvalidValue,
+                                    cursor.position() - 4);
+                    return malformed(cursor);
+                }
+            } else {
+                cursor.setError(MessageValidationError::InvalidValue,
+                                cursor.position() - 1);
+                return malformed(cursor);
+            }
+            if (!roomIds.insert(roomId).second) {
+                cursor.setError(MessageValidationError::InvalidValue,
+                                cursor.position());
                 return malformed(cursor);
             }
         }

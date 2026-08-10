@@ -3,6 +3,7 @@
 #include "data_channel.h"
 #include "net_common.h"
 #include "payload_cipher.h"
+#include "overlay_packet_validator.h"
 #include "../core/tunnel_manager.h"
 #include "../core/tun_adapter.h"
 #include "../core/kcp_tunnel.h"
@@ -16,14 +17,22 @@ namespace VLan {
 
 namespace {
 
-QByteArray roomPasswordHash(const QString& password) {
-    if (password.isEmpty())
-        return QByteArray();
-    QByteArray intermediate = PayloadCipher::computeIntermediate(password);
+bool roomPasswordHash(const QString& password, QByteArray* hashOut) {
+    if (!hashOut) return false;
+    if (password.isEmpty()) {
+        hashOut->clear();
+        return true;
+    }
+    QByteArray intermediate;
+    if (!PayloadCipher::computeIntermediate(password, &intermediate)) {
+        hashOut->fill('\0', CIPHER_KEY_SIZE);
+        return false;
+    }
     QByteArray hash = PayloadCipher::hashFromIntermediate(intermediate);
     crypto_wipe(reinterpret_cast<uint8_t*>(intermediate.data()),
                 static_cast<size_t>(intermediate.size()));
-    return hash;
+    *hashOut = hash;
+    return true;
 }
 
 const char* trafficClassName(TrafficClass cls) {
@@ -49,6 +58,9 @@ RoomManager::RoomManager(QObject* parent)
       m_dataChannel(nullptr),
       m_tunnel(nullptr),
       m_tun(nullptr),
+      m_resolvedCandidateIndex(0), m_lookupId(-1),
+      m_connectionGeneration(0),
+      m_connectionPhase(ConnectionPhase::Idle),
       m_port(DEFAULT_PORT),
       m_tcpRelayTimer(nullptr), m_latencyTimer(nullptr), m_trafficTimer(nullptr),
       m_roomListTimer(nullptr),
@@ -61,6 +73,8 @@ RoomManager::RoomManager(QObject* parent)
       m_wantReconnect(false), m_reconnectAttempts(0), m_wasInRoom(false),
       m_pendingResumeRoom(false), m_manualDisconnecting(false),
       m_logoutPending(false), m_hasResumeLease(false),
+      m_reconnectScheduled(false), m_roomReady(false),
+      m_tearingDownTun(false),
       m_resumeRoomId(0), m_resumePeerId(0), m_resumeVirtualIP(0),
       m_resumeLeaseDeadlineMs(0),
       m_savedRoomId(0),
@@ -74,6 +88,8 @@ RoomManager::RoomManager(QObject* parent)
 
     connect(m_signal, &SignalClient::connected,     this, &RoomManager::onSignalConnected);
     connect(m_signal, &SignalClient::disconnected,  this, &RoomManager::onSignalDisconnected);
+    connect(m_signal, &SignalClient::connectFailed,
+            this, &RoomManager::onSignalConnectFailed);
     connect(m_signal, &SignalClient::loginResponse, this, &RoomManager::onLoginResponse);
     connect(m_signal, &SignalClient::roomCreated,   this, &RoomManager::onRoomCreated);
     connect(m_signal, &SignalClient::joinResponse,  this, &RoomManager::onJoinResponse);
@@ -89,6 +105,15 @@ RoomManager::RoomManager(QObject* parent)
     connect(m_signal, &SignalClient::secureSessionEstablished,
             this, &RoomManager::onSecureSessionEstablished);
     connect(m_signal, &SignalClient::serverError, this, [this](const QString& msg) {
+        if (m_connectionPhase == ConnectionPhase::Connecting &&
+            m_signal->myPeerId() == 0) {
+            m_signal->disconnect();
+            m_connectionPhase = ConnectionPhase::Idle;
+            emit errorOccurred(msg);
+            emit connectionStatusChanged(false);
+            if (m_wantReconnect) scheduleReconnectAttempt();
+            return;
+        }
         emit errorOccurred(msg);
         if (m_pendingResumeRoom) {
             m_pendingResumeRoom = false;
@@ -116,6 +141,10 @@ RoomManager::RoomManager(QObject* parent)
             return;
         }
         emit roomListUpdated(rooms);
+    });
+    connect(m_signal, &SignalClient::roomListResyncRequired,
+            this, [this]() {
+        if (m_signal && m_signal->isConnected()) m_signal->listRooms();
     });
     connect(m_signal, &SignalClient::serverRttUpdated,
             this, &RoomManager::serverRttUpdated);
@@ -145,6 +174,7 @@ void RoomManager::setServerAddress(const QString& host, quint16 port) {
     m_port = normalizedPort;
     m_resolvedAddr = QHostAddress();
     if (changed) {
+        cancelConnectionAttempt();
         m_serverPassword.clear();
         clearResumeLease();
         if (m_signal)
@@ -184,7 +214,15 @@ void RoomManager::connectAndLogin(const QString& playerName) {
     resolveAndConnect();
 }
 
+bool RoomManager::isConnecting() const {
+    return m_connectionPhase == ConnectionPhase::Resolving ||
+           m_connectionPhase == ConnectionPhase::Connecting ||
+           m_reconnectScheduled ||
+           (m_signal && m_signal->isConnecting());
+}
+
 void RoomManager::disconnectFromServer() {
+    cancelConnectionAttempt();
     m_wantReconnect = false;
     m_pendingResumeRoom = false;
     clearResumeLease();
@@ -217,42 +255,98 @@ void RoomManager::disconnectFromServer() {
 }
 
 void RoomManager::resolveAndConnect() {
+    if (m_lookupId >= 0) {
+        QHostInfo::abortHostLookup(m_lookupId);
+        m_lookupId = -1;
+    }
+    ++m_connectionGeneration;
+    m_reconnectScheduled = false;
+    m_resolvedCandidates.clear();
+    m_resolvedCandidateIndex = 0;
     QHostAddress directAddr(m_serverHost);
-    if (!directAddr.isNull()) {
-        m_resolvedAddr = directAddr;
-        proceedWithConnection();
+    if (!directAddr.isNull() &&
+        directAddr.protocol() == QAbstractSocket::IPv4Protocol) {
+        m_resolvedCandidates.append(directAddr);
+        tryNextResolvedAddress();
         return;
     }
+    m_connectionPhase = ConnectionPhase::Resolving;
     emit statusMessage(UiStrings::text("status.resolvingHost").arg(m_serverHost));
-    QHostInfo::lookupHost(m_serverHost, this, SLOT(onHostResolved(QHostInfo)));
+    m_lookupId = QHostInfo::lookupHost(
+        m_serverHost, this, SLOT(onHostResolved(QHostInfo)));
 }
 
 void RoomManager::onHostResolved(const QHostInfo& hostInfo) {
+    if (hostInfo.lookupId() != m_lookupId ||
+        m_connectionPhase != ConnectionPhase::Resolving)
+        return;
+    m_lookupId = -1;
     if (hostInfo.error() != QHostInfo::NoError || hostInfo.addresses().isEmpty()) {
-        emit errorOccurred(UiStrings::text("status.resolveFailed").arg(hostInfo.errorString()));
-        emit connectionStatusChanged(false);
-        if (m_wantReconnect)
-            scheduleReconnectAttempt();
+        handleConnectionAttemptExhausted(
+            UiStrings::text("status.resolveFailed").arg(hostInfo.errorString()));
         return;
     }
     for (const QHostAddress& addr : hostInfo.addresses()) {
-        if (addr.protocol() == QAbstractSocket::IPv4Protocol) {
-            m_resolvedAddr = addr;
-            break;
-        }
+        if (addr.protocol() == QAbstractSocket::IPv4Protocol &&
+            !m_resolvedCandidates.contains(addr))
+            m_resolvedCandidates.append(addr);
     }
-    if (m_resolvedAddr.isNull())
-        m_resolvedAddr = hostInfo.addresses().first();
+    if (m_resolvedCandidates.isEmpty()) {
+        handleConnectionAttemptExhausted(
+            QStringLiteral("DNS did not return an IPv4 address."));
+        return;
+    }
+    tryNextResolvedAddress();
+}
 
+void RoomManager::proceedWithConnection() {
+    m_connectionPhase = ConnectionPhase::Connecting;
+    m_signal->setServerPassword(m_serverPassword);
+    m_signal->connectToServer(m_resolvedAddr.toString(), m_port);
+}
+
+void RoomManager::tryNextResolvedAddress() {
+    if (m_resolvedCandidateIndex >= m_resolvedCandidates.size()) {
+        handleConnectionAttemptExhausted(
+            QStringLiteral("All resolved IPv4 addresses failed."));
+        return;
+    }
+    m_resolvedAddr = m_resolvedCandidates[m_resolvedCandidateIndex++];
     emit statusMessage(UiStrings::text("status.resolvedHost")
                        .arg(m_serverHost).arg(m_resolvedAddr.toString()));
     proceedWithConnection();
 }
 
-void RoomManager::proceedWithConnection() {
-    m_tunnel->setServerEndpoint(m_resolvedAddr, m_port);
-    m_signal->setServerPassword(m_serverPassword);
-    m_signal->connectToServer(m_serverHost, m_port);
+void RoomManager::onSignalConnectFailed(QString reason) {
+    if (m_connectionPhase != ConnectionPhase::Connecting)
+        return;
+    if (m_resolvedCandidateIndex < m_resolvedCandidates.size()) {
+        tryNextResolvedAddress();
+        return;
+    }
+    handleConnectionAttemptExhausted(reason);
+}
+
+void RoomManager::handleConnectionAttemptExhausted(const QString& reason) {
+    m_connectionPhase = ConnectionPhase::Idle;
+    emit errorOccurred(reason);
+    emit connectionStatusChanged(false);
+    if (m_wantReconnect)
+        scheduleReconnectAttempt();
+}
+
+void RoomManager::cancelConnectionAttempt() {
+    ++m_connectionGeneration;
+    if (m_lookupId >= 0) {
+        QHostInfo::abortHostLookup(m_lookupId);
+        m_lookupId = -1;
+    }
+    m_resolvedCandidates.clear();
+    m_resolvedCandidateIndex = 0;
+    m_reconnectScheduled = false;
+    if (m_signal && m_signal->isConnecting())
+        m_signal->disconnect();
+    m_connectionPhase = ConnectionPhase::Idle;
 }
 
 uint32_t RoomManager::myPeerId() const {
@@ -335,9 +429,16 @@ void RoomManager::createRoom(const QString& roomName, uint8_t maxPlayers,
     m_roomPasswordProtected = passwordProtected;
     m_roomPassword = m_savedRoomPassword;
 
-    QByteArray pwdHash = passwordProtected ? roomPasswordHash(password) : QByteArray();
+    QByteArray pwdHash;
+    if (passwordProtected && !roomPasswordHash(password, &pwdHash)) {
+        emit errorOccurred(QStringLiteral("Room password KDF failed."));
+        return;
+    }
     m_signal->createRoom(roomName, maxPlayers, m_tcpPolicy, m_udpPolicy,
                          normalizedMtu, passwordProtected, pwdHash);
+    if (!pwdHash.isEmpty())
+        crypto_wipe(reinterpret_cast<uint8_t*>(pwdHash.data()),
+                    static_cast<size_t>(pwdHash.size()));
 }
 
 void RoomManager::joinRoom(uint32_t roomId, const QString& password) {
@@ -359,30 +460,28 @@ void RoomManager::joinRoom(uint32_t roomId, const QString& password) {
     }
     m_roomPassword = password;
     m_savedRoomPassword = password;
-    QByteArray authHash = roomPasswordHash(password);
+    QByteArray authHash;
+    if (!roomPasswordHash(password, &authHash)) {
+        emit errorOccurred(QStringLiteral("Room password KDF failed."));
+        return;
+    }
     m_signal->joinRoom(roomId, authHash);
+    if (!authHash.isEmpty())
+        crypto_wipe(reinterpret_cast<uint8_t*>(authHash.data()),
+                    static_cast<size_t>(authHash.size()));
 }
 
 void RoomManager::leaveRoom() {
+    const bool wasReady = m_roomReady;
     if (m_tunnel)
         m_tunnel->stopDataPlane();
-    m_signal->leaveRoom();
+    if (m_currentRoomId != 0)
+        m_signal->leaveRoom();
     teardownTun();
     m_pendingResumeRoom = false;
     clearResumeLease();
-    m_currentRoomId = 0;
-    m_myVirtualIP = 0;
-    m_roomMtu = ROOM_MTU_DEFAULT;
-    m_tcpPolicy = makeDefaultTcpPolicy();
-    m_udpPolicy = makeDefaultUdpPolicy();
-    m_roomPasswordProtected = false;
-    m_roomPassword.clear();
-    m_savedRoomId = 0;
-    m_savedRoomName.clear();
-    m_savedRoomPassword.clear();
-    m_savedRoomPasswordProtected = false;
-    m_wasInRoom = false;
-    emit roomLeft();
+    resetRoomRuntimeState(true);
+    if (wasReady) emit roomLeft();
 }
 
 void RoomManager::refreshRoomList() {
@@ -397,6 +496,11 @@ void RoomManager::onRoomListRefreshTimer() {
 // Signal slots
 
 void RoomManager::onSignalConnected() {
+    m_connectionPhase = ConnectionPhase::Connected;
+    m_reconnectScheduled = false;
+    const QHostAddress actualPeer = m_signal->peerAddress();
+    if (!actualPeer.isNull()) m_resolvedAddr = actualPeer;
+    m_tunnel->setServerEndpoint(m_resolvedAddr, m_port);
     emit statusMessage(UiStrings::text("status.connectedLoggingIn"));
     emit connectionStatusChanged(true);
     bool canResume = m_wasInRoom && hasUsableResumeLease();
@@ -407,7 +511,11 @@ void RoomManager::onSignalConnected() {
 }
 
 void RoomManager::onSignalDisconnected() {
-    bool wasInRoom = (m_currentRoomId != 0);
+    if (m_connectionPhase == ConnectionPhase::Connecting ||
+        m_connectionPhase == ConnectionPhase::Resolving)
+        return;
+    m_connectionPhase = ConnectionPhase::Idle;
+    bool wasInRoom = m_roomReady;
     bool manualDisconnect = m_manualDisconnecting;
 
     if (manualDisconnect) {
@@ -441,6 +549,7 @@ void RoomManager::onSignalDisconnected() {
         m_roomListTimer->stop();
     m_currentRoomId = 0;
     m_myVirtualIP = 0;
+    m_roomReady = false;
     m_roomMtu = ROOM_MTU_DEFAULT;
     m_logoutPending = false;
     if (wasInRoom) emit roomLeft();
@@ -453,7 +562,7 @@ void RoomManager::onSignalDisconnected() {
         m_wantReconnect = true;
         m_reconnectAttempts = 0;
         emit statusMessage(UiStrings::text("status.disconnectedReconnect")
-                           .arg(RECONNECT_INTERVAL_MS / 1000)
+                           .arg(1)
                            .arg(MAX_RECONNECT_ATTEMPTS)
                            .arg(m_wasInRoom ? UiStrings::text("status.rejoinSuffix") : QString()));
         scheduleReconnectAttempt();
@@ -465,23 +574,33 @@ void RoomManager::onSignalDisconnected() {
 }
 
 void RoomManager::scheduleReconnectAttempt() {
-    QTimer::singleShot(RECONNECT_INTERVAL_MS, this, [this]() {
+    if (m_reconnectScheduled || !m_wantReconnect) return;
+    if (m_reconnectAttempts >= MAX_RECONNECT_ATTEMPTS) {
+        m_wantReconnect = false;
+        m_pendingResumeRoom = false;
+        expireResumeLeaseIfNeeded();
+        if (m_wasInRoom && hasUsableResumeLease()) {
+            emit statusMessage(UiStrings::text("status.reconnectStoppedResumeWindow")
+                               .arg(MAX_RECONNECT_ATTEMPTS)
+                               .arg(RECONNECT_LEASE_TIMEOUT_SEC));
+        } else {
+            emit statusMessage(UiStrings::text("status.reconnectFailed")
+                               .arg(MAX_RECONNECT_ATTEMPTS));
+        }
+        return;
+    }
+    const int baseDelay = 1000 << m_reconnectAttempts;
+    const int jitterRange = baseDelay / 5;
+    const int jitter = static_cast<int>(currentTimeMs() %
+        static_cast<uint32_t>(jitterRange * 2 + 1)) - jitterRange;
+    const int delay = baseDelay + jitter;
+    const quint64 generation = ++m_connectionGeneration;
+    m_reconnectScheduled = true;
+    QTimer::singleShot(delay, this, [this, generation]() {
+        if (generation != m_connectionGeneration) return;
+        m_reconnectScheduled = false;
         if (m_signal->isConnected() || m_signal->isConnecting()
             || m_playerName.isEmpty() || !m_wantReconnect) {
-            return;
-        }
-        if (m_reconnectAttempts >= MAX_RECONNECT_ATTEMPTS) {
-            m_wantReconnect = false;
-            m_pendingResumeRoom = false;
-            expireResumeLeaseIfNeeded();
-            if (m_wasInRoom && hasUsableResumeLease()) {
-                emit statusMessage(UiStrings::text("status.reconnectStoppedResumeWindow")
-                                   .arg(MAX_RECONNECT_ATTEMPTS)
-                                   .arg(RECONNECT_LEASE_TIMEOUT_SEC));
-            } else {
-                emit statusMessage(UiStrings::text("status.reconnectFailed")
-                                   .arg(MAX_RECONNECT_ATTEMPTS));
-            }
             return;
         }
         m_reconnectAttempts++;
@@ -538,13 +657,13 @@ void RoomManager::onLoginResponse(uint32_t peerId, bool resumeAccepted) {
     m_tunnel->setMyPeerId(peerId);
     if (m_roomListTimer)
         m_roomListTimer->start();
-    bool securityReady = true;
-    if (m_signal->secureEnabled()) {
-        securityReady = m_tunnel->installSecureSession(
-            m_signal->secureSessionId(), m_signal->secureMaster());
-    } else {
-        m_tunnel->configurePlaintextSession();
+    if (!m_signal->secureEnabled()) {
+        emit errorOccurred(QStringLiteral("不安全服务端被拒绝：服务端未强制鉴权。"));
+        disconnectFromServer();
+        return;
     }
+    bool securityReady = m_tunnel->installSecureSession(
+        m_signal->secureSessionId(), m_signal->secureMaster());
 
     bool canResume = m_wasInRoom && hasUsableResumeLease();
     if (m_wantReconnect || canResume) {
@@ -573,12 +692,8 @@ void RoomManager::onLoginResponse(uint32_t peerId, bool resumeAccepted) {
         connect(m_dataChannel, &DataChannel::relayDataReceived,
                 this, &RoomManager::onDataChannelRelayReceived);
     }
-    if (m_signal->secureEnabled()) {
-        securityReady = m_dataChannel->installSecureSession(
-            m_signal->secureSessionId(), m_signal->secureMaster()) && securityReady;
-    } else {
-        m_dataChannel->configurePlaintextSession();
-    }
+    securityReady = m_dataChannel->installSecureSession(
+        m_signal->secureSessionId(), m_signal->secureMaster()) && securityReady;
     if (!securityReady) {
         emit errorOccurred(QStringLiteral("Failed to configure data-plane security."));
         disconnectFromServer();
@@ -602,8 +717,14 @@ void RoomManager::onRoomCreated(uint32_t roomId, uint32_t virtualIP,
     m_roomPasswordProtected = passwordProtected;
     rememberResumeLease(roomId, myPeerId(), virtualIP, leaseToken);
     m_tunnel->setMyVirtualIP(virtualIP);
+    m_tunnel->setRoomMtu(m_roomMtu);
 
-    setupTun();
+    const TunSetupResult setup = setupTun();
+    if (!setup.success) {
+        rollbackRoomAfterTunFailure(setup);
+        return;
+    }
+    m_roomReady = true;
     m_latencyTimer->start(3000);
     emit roomCreated(roomId);
     emit statusMessage(UiStrings::text("status.roomCreated")
@@ -630,8 +751,14 @@ void RoomManager::onJoinResponse(uint32_t roomId, uint32_t virtualIP,
     m_roomPasswordProtected = passwordProtected;
     rememberResumeLease(roomId, myPeerId(), virtualIP, leaseToken);
     m_tunnel->setMyVirtualIP(virtualIP);
+    m_tunnel->setRoomMtu(m_roomMtu);
 
-    setupTun();
+    const TunSetupResult setup = setupTun();
+    if (!setup.success) {
+        rollbackRoomAfterTunFailure(setup);
+        return;
+    }
+    m_roomReady = true;
     m_latencyTimer->start(3000);
 
     emit roomJoined(roomId);
@@ -816,6 +943,11 @@ void RoomManager::handleTcpRelayReceived(uint32_t srcPeerId, TrafficClass cls, Q
         peer->handleLatencyProbe(cls, data);
         return;
     }
+    if (!validateInboundOverlayIpv4(
+            reinterpret_cast<const uint8_t*>(data.constData()),
+            static_cast<size_t>(data.size()), m_roomMtu,
+            peer->virtualIP(), m_myVirtualIP).isValid())
+        return;
     if (m_tun && m_tun->writePacket(data))
         m_tunnel->addTunDownloadBytes(static_cast<quint64>(data.size()));
 }
@@ -832,10 +964,13 @@ void RoomManager::onDataChannelRelayReceived(uint32_t srcPeerId, TrafficClass cl
     handleTcpRelayReceived(srcPeerId, cls, data);
 }
 
-void RoomManager::setupTun() {
-    if (m_tun) return;
+RoomManager::TunSetupResult RoomManager::setupTun() {
+    if (m_tun)
+        return TunSetupResult(true);
 
     m_tun = new TunAdapter(this);
+    connect(m_tun, &TunAdapter::errorOccurred,
+            this, &RoomManager::onTunRuntimeError);
     connect(m_tun, &TunAdapter::firewallRuleChanged,
             this, [this](bool added, bool success) {
         if (added) {
@@ -849,32 +984,33 @@ void RoomManager::setupTun() {
         }
     });
     if (!m_tun->initialize()) {
-        emit errorOccurred(UiStrings::text("status.tunInitFailed"));
         delete m_tun; m_tun = nullptr;
-        return;
+        return TunSetupResult(false, TunSetupStage::Initialize,
+                              UiStrings::text("status.tunInitFailed"));
     }
     int mtu = static_cast<int>(normalizeRoomMtu(m_roomMtu));
     if (!m_tun->configureIP(m_myVirtualIP, VNET_MASK, mtu)) {
-        emit errorOccurred(UiStrings::text("status.tunIpFailed"));
         delete m_tun; m_tun = nullptr;
-        return;
+        return TunSetupResult(false, TunSetupStage::Address,
+                              UiStrings::text("status.tunIpFailed"));
     }
     if (!m_tun->startSession()) {
-        emit errorOccurred(UiStrings::text("status.tunSessionFailed"));
         delete m_tun; m_tun = nullptr;
-        return;
+        return TunSetupResult(false, TunSetupStage::Session,
+                              UiStrings::text("status.tunSessionFailed"));
     }
     m_tunnel->setTunAdapter(m_tun);
     if (!m_tunnel->startDataPlane()) {
-        emit errorOccurred(QStringLiteral("Data-plane security is not configured."));
         m_tunnel->setTunAdapter(nullptr);
         m_tun->shutdown();
         delete m_tun;
         m_tun = nullptr;
-        return;
+        return TunSetupResult(false, TunSetupStage::DataPlane,
+                              QStringLiteral("Data-plane startup failed."));
     }
     if (m_dataChannel && myPeerId() != 0)
-        m_dataChannel->connectToServer(m_serverHost, m_port, myPeerId());
+        m_dataChannel->connectToServer(
+            m_resolvedAddr.toString(), m_port, myPeerId());
     m_tunnel->resetTrafficCounters();
     m_lastUploadBytes = 0;
     m_lastDownloadBytes = 0;
@@ -883,9 +1019,11 @@ void RoomManager::setupTun() {
     emit tunSpeedUpdated(0, 0);
     emit statusMessage(UiStrings::text("status.tunStarted")
                        .arg(virtualIPToString(m_myVirtualIP)).arg(mtu));
+    return TunSetupResult(true);
 }
 
 void RoomManager::teardownTun() {
+    m_tearingDownTun = true;
     if (m_tunnel)
         m_tunnel->stopDataPlane();
     m_pendingRebuild.clear();
@@ -916,6 +1054,54 @@ void RoomManager::teardownTun() {
         delete m_tun;
         m_tun = nullptr;
     }
+    m_tearingDownTun = false;
+}
+
+void RoomManager::resetRoomRuntimeState(bool clearSavedRoom) {
+    m_currentRoomId = 0;
+    m_myVirtualIP = 0;
+    m_roomMtu = ROOM_MTU_DEFAULT;
+    m_tcpPolicy = makeDefaultTcpPolicy();
+    m_udpPolicy = makeDefaultUdpPolicy();
+    m_roomPasswordProtected = false;
+    m_roomPassword.clear();
+    m_roomReady = false;
+    m_wasInRoom = false;
+    if (m_tunnel) {
+        m_tunnel->setMyVirtualIP(0);
+        m_tunnel->setRoomMtu(ROOM_MTU_DEFAULT);
+    }
+    if (clearSavedRoom) {
+        m_savedRoomId = 0;
+        m_savedRoomName.clear();
+        m_savedRoomPassword.clear();
+        m_savedRoomPasswordProtected = false;
+    }
+}
+
+void RoomManager::rollbackRoomAfterTunFailure(
+    const TunSetupResult& result) {
+    if (m_signal && m_signal->isConnected() && m_currentRoomId != 0)
+        m_signal->leaveRoom();
+    teardownTun();
+    m_pendingResumeRoom = false;
+    clearResumeLease();
+    resetRoomRuntimeState(true);
+    emit errorOccurred(result.error);
+    emit statusMessage(QStringLiteral("Returned to lobby after TUN setup failure."));
+}
+
+void RoomManager::onTunRuntimeError(QString message) {
+    if (m_tearingDownTun || !m_roomReady)
+        return;
+    if (m_signal && m_signal->isConnected() && m_currentRoomId != 0)
+        m_signal->leaveRoom();
+    teardownTun();
+    clearResumeLease();
+    resetRoomRuntimeState(true);
+    emit errorOccurred(message);
+    emit roomLeft();
+    emit statusMessage(QStringLiteral("TUN stopped; returned to lobby."));
 }
 
 void RoomManager::onTcpRelayHealthCheck() {

@@ -154,7 +154,7 @@ CliRawUdpTunnel::CliRawUdpTunnel(UdpSendFunc udpSend,
     : m_udpSend(udpSend), m_peerIP(peerIP), m_peerPort(peerPort),
       m_trafficClass(trafficClass),
       m_relayMode(false), m_relaySrcPeerId(0), m_relayDstPeerId(0),
-      m_nextMsgId(0), m_dead(false), m_rttMs(-1),
+      m_nextMsgId(0), m_dead(false), m_rttMs(-1), m_reassemblyBytes(0),
       m_fecMode(fecMode), m_fecEncoder(nullptr), m_fecDecoder(nullptr),
       m_roomMtu(normalizeRoomMtu(mtu)),
       m_secureFrames(secureFrames)
@@ -181,11 +181,12 @@ CliRawUdpTunnel::~CliRawUdpTunnel() {
 
 int CliRawUdpTunnel::send(const Buffer& ipPacket) {
     if (ipPacket.empty()) return 0;
+    if (ipPacket.size() > m_roomMtu) return -1;
     uint16_t msgId = m_nextMsgId++;
     int totalLen = static_cast<int>(ipPacket.size());
     int maxPayload = maxFragmentPayload();
     int fragTotal = (totalLen + maxPayload - 1) / maxPayload;
-    if (fragTotal > 256) return -1;
+    if (fragTotal <= 0 || fragTotal > 255) return -1;
 
     for (int i = 0; i < fragTotal; ++i) {
         int offset = i * maxPayload;
@@ -263,7 +264,17 @@ void CliRawUdpTunnel::processFrag(const char* data, int len) {
 
     const char* payload = data + sizeof(FragHeader);
     int payloadLen = len - sizeof(FragHeader);
-    if (payloadLen <= 0) return;
+    if (payloadLen <= 0 || fragTotal == 0 || fragIndex >= fragTotal ||
+        totalLen == 0 || totalLen > m_roomMtu)
+        return;
+    const int maxPayload = maxFragmentPayload();
+    const int expectedTotal =
+        (static_cast<int>(totalLen) + maxPayload - 1) / maxPayload;
+    if (expectedTotal != fragTotal) return;
+    const int expectedLength = fragIndex + 1 == fragTotal
+        ? static_cast<int>(totalLen) - maxPayload * (fragTotal - 1)
+        : maxPayload;
+    if (payloadLen != expectedLength) return;
 
     if (fragTotal == 1 && payloadLen == 1 && payload[0] == RAW_UDP_KEEPALIVE_MARKER
         && totalLen == 1)
@@ -290,34 +301,58 @@ void CliRawUdpTunnel::processFrag(const char* data, int len) {
     }
 
     if (fragTotal == 1) {
-        if (m_onData) m_onData(Buffer(payload, payload + payloadLen));
+        if (payloadLen == totalLen && m_onData)
+            m_onData(Buffer(payload, payload + payloadLen));
         return;
     }
 
-    ReassemblyEntry& entry = m_reassembly[msgId];
-    if (entry.fragments.empty()) {
+    std::map<uint16_t, ReassemblyEntry>::iterator existing =
+        m_reassembly.find(msgId);
+    if (existing != m_reassembly.end() &&
+        (existing->second.totalLen != totalLen ||
+         existing->second.fragTotal != fragTotal)) {
+        removeReassemblyEntry(msgId);
+        return;
+    }
+    if (existing == m_reassembly.end()) {
+        if (!ensureReassemblyCapacity(static_cast<size_t>(payloadLen), true))
+            return;
+        ReassemblyEntry entry;
         entry.totalLen = totalLen;
         entry.fragTotal = fragTotal;
         entry.receivedCount = 0;
         entry.createTime = currentTimeMs();
+        m_reassembly[msgId] = entry;
+        existing = m_reassembly.find(msgId);
     }
-    if (entry.fragments.find(fragIndex) == entry.fragments.end()) {
-        entry.fragments[fragIndex] = Buffer(payload, payload + payloadLen);
-        entry.receivedCount++;
+    if (existing->second.fragments.find(fragIndex) ==
+        existing->second.fragments.end()) {
+        if (!ensureReassemblyCapacity(static_cast<size_t>(payloadLen), false))
+            return;
+        existing = m_reassembly.find(msgId);
+        if (existing == m_reassembly.end()) return;
+        existing->second.fragments[fragIndex] =
+            Buffer(payload, payload + payloadLen);
+        existing->second.receivedCount++;
+        m_reassemblyBytes += static_cast<size_t>(payloadLen);
     }
+    existing = m_reassembly.find(msgId);
+    if (existing == m_reassembly.end()) return;
+    ReassemblyEntry& entry = existing->second;
     if (entry.receivedCount >= entry.fragTotal) {
         Buffer assembled;
         assembled.reserve(entry.totalLen);
         for (uint8_t i = 0; i < entry.fragTotal; ++i) {
             auto it = entry.fragments.find(i);
             if (it == entry.fragments.end()) {
-                m_reassembly.erase(msgId);
+                removeReassemblyEntry(msgId);
                 return;
             }
             assembled.insert(assembled.end(), it->second.begin(), it->second.end());
         }
-        m_reassembly.erase(msgId);
-        if (m_onData) m_onData(assembled);
+        const bool exact = assembled.size() == entry.totalLen;
+        removeReassemblyEntry(msgId);
+        if (exact && m_onData) m_onData(assembled);
     }
 }
 
@@ -351,7 +386,41 @@ void CliRawUdpTunnel::cleanupStaleEntries() {
             stale.push_back(it->first);
     }
     for (uint16_t id : stale)
-        m_reassembly.erase(id);
+        removeReassemblyEntry(id);
+}
+
+void CliRawUdpTunnel::removeReassemblyEntry(uint16_t msgId) {
+    std::map<uint16_t, ReassemblyEntry>::iterator it = m_reassembly.find(msgId);
+    if (it == m_reassembly.end()) return;
+    size_t bytes = 0;
+    for (std::map<uint8_t, Buffer>::const_iterator frag =
+             it->second.fragments.begin(); frag != it->second.fragments.end(); ++frag)
+        bytes += frag->second.size();
+    m_reassemblyBytes = bytes > m_reassemblyBytes
+        ? 0 : m_reassemblyBytes - bytes;
+    m_reassembly.erase(it);
+}
+
+bool CliRawUdpTunnel::ensureReassemblyCapacity(size_t incomingBytes,
+                                                bool newMessage) {
+    if (incomingBytes > RAW_UDP_MAX_REASSEMBLY_BYTES) return false;
+    while (!m_reassembly.empty() &&
+           ((newMessage && m_reassembly.size() >=
+               RAW_UDP_MAX_ACTIVE_MESSAGES) ||
+            m_reassemblyBytes + incomingBytes >
+                RAW_UDP_MAX_REASSEMBLY_BYTES)) {
+        std::map<uint16_t, ReassemblyEntry>::const_iterator oldest =
+            m_reassembly.begin();
+        for (std::map<uint16_t, ReassemblyEntry>::const_iterator it =
+                 m_reassembly.begin(); it != m_reassembly.end(); ++it) {
+            if (it->second.createTime < oldest->second.createTime) oldest = it;
+        }
+        removeReassemblyEntry(oldest->first);
+    }
+    return (!newMessage || m_reassembly.size() <
+                RAW_UDP_MAX_ACTIVE_MESSAGES) &&
+           m_reassemblyBytes + incomingBytes <=
+                RAW_UDP_MAX_REASSEMBLY_BYTES;
 }
 
 int CliRawUdpTunnel::maxFragmentPayload() const {

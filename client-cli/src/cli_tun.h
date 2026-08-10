@@ -9,6 +9,31 @@
 
 namespace VLan {
 
+#ifndef _WIN32
+class NetlinkTransport {
+public:
+    virtual ~NetlinkTransport() {}
+    virtual bool transact(const Buffer& request, int* errorCode) = 0;
+};
+
+struct LinuxTunConfiguration {
+    int ifindex;
+    uint32_t ip;
+    uint8_t prefix;
+    bool addressConfigured;
+    bool routeConfigured;
+    LinuxTunConfiguration()
+        : ifindex(0), ip(0), prefix(0),
+          addressConfigured(false), routeConfigured(false) {}
+};
+
+bool configureLinuxTun(NetlinkTransport* transport, int ifindex,
+                       uint32_t ip, uint32_t mask, int mtu,
+                       LinuxTunConfiguration* state, int* errorCode);
+void rollbackLinuxTun(NetlinkTransport* transport,
+                      LinuxTunConfiguration* state);
+#endif
+
 /*
  * Cross-platform TUN adapter interface.
  * - Windows: WinTun (wintun.dll)
@@ -31,13 +56,20 @@ public:
     bool writePacket(const Buffer& pkt) { return writePacket(pkt.data(), pkt.size()); }
 
     ThreadSafeQueue<Buffer>& recvQueue() { return m_recvQueue; }
+    ThreadSafeQueue<std::string>& errorQueue() { return m_errorQueue; }
 
     bool isRunning() const { return m_running.load(); }
+#ifndef _WIN32
+    void setNetlinkTransportForTesting(NetlinkTransport* transport) {
+        m_netlinkTransport = transport;
+    }
+#endif
 
 private:
     void readLoop();
 
     ThreadSafeQueue<Buffer> m_recvQueue;
+    ThreadSafeQueue<std::string> m_errorQueue;
     std::atomic<bool>       m_running;
     std::thread             m_readThread;
     std::mutex              m_writeMutex;
@@ -75,6 +107,11 @@ private:
     bool m_broadcastRouteActive;
 #else
     int m_tunFd;
+    std::string m_interfaceName;
+    int m_interfaceIndex;
+    bool m_addressConfigured;
+    bool m_routeConfigured;
+    NetlinkTransport* m_netlinkTransport;
 #endif
 };
 

@@ -68,22 +68,26 @@ SignalServer::SignalServer()
     : m_epfd(-1), m_tcpListenFd(-1),
       m_udpFd(-1),
       m_running(false), m_nextPeerId(1),
-      m_authEnabled(false)
+      m_authReady(false), m_globalSendBytes(0),
+      m_lastDataDropLog(0), m_suppressedDataDrops(0),
+      m_lastSendRejectLog(0), m_suppressedSendRejects(0),
+      m_roomListRevision(1)
 {
     memset(m_serverAuthHash, 0, sizeof(m_serverAuthHash));
 }
 
 SignalServer::~SignalServer() { stop(); }
 
-void SignalServer::setAuthPassword(const std::string& password) {
+bool SignalServer::setAuthPassword(const std::string& password) {
     memset(m_serverAuthHash, 0, sizeof(m_serverAuthHash));
-    if (password.empty()) {
-        m_authEnabled = false;
-        return;
-    }
-    hashPassword(reinterpret_cast<const uint8_t*>(password.data()),
-                 password.size(), m_serverAuthHash);
-    m_authEnabled = true;
+    m_authReady = false;
+    if (password.size() < 8 || password.size() > 256)
+        return false;
+    if (!hashPassword(reinterpret_cast<const uint8_t*>(password.data()),
+                      password.size(), m_serverAuthHash))
+        return false;
+    m_authReady = true;
+    return true;
 }
 
 // ───────── Socket helpers ─────────
@@ -103,10 +107,72 @@ void SignalServer::releasePeerId(uint32_t peerId) {
     m_freePeerIds.insert(peerId);
 }
 
-void SignalServer::generateLeaseToken(uint8_t token[RECONNECT_TOKEN_SIZE]) {
-    secureRandomBytes(token, RECONNECT_TOKEN_SIZE);
-    if (tokenIsZero(token))
-        token[0] = 1;
+bool SignalServer::generateLeaseToken(uint8_t token[RECONNECT_TOKEN_SIZE]) {
+    if (!secureRandomBytes(token, RECONNECT_TOKEN_SIZE))
+        return false;
+    if (tokenIsZero(token)) {
+        crypto_wipe(token, RECONNECT_TOKEN_SIZE);
+        return false;
+    }
+    return true;
+}
+
+bool SignalServer::takeIpToken(uint32_t ip,
+                               TokenBucket IpState::* bucketMember,
+                               double burst, double refillSeconds) {
+    const time_t now = time(nullptr);
+    IpState& state = m_ipStates[ip];
+    TokenBucket& bucket = state.*bucketMember;
+    if (bucket.updated == 0) {
+        bucket.tokens = burst;
+        bucket.updated = now;
+    } else if (now > bucket.updated) {
+        bucket.tokens = std::min(
+            burst, bucket.tokens +
+            static_cast<double>(now - bucket.updated) / refillSeconds);
+        bucket.updated = now;
+    }
+    state.lastActivity = now;
+    if (bucket.tokens < 1.0) return false;
+    bucket.tokens -= 1.0;
+    return true;
+}
+
+void SignalServer::removePending(
+    std::map<int, PendingConn>::iterator it, bool closeFd) {
+    if (it == m_pending.end()) return;
+    const uint32_t ip = it->second.remoteIpv4;
+    std::map<uint32_t, IpState>::iterator ipIt = m_ipStates.find(ip);
+    if (ipIt != m_ipStates.end()) {
+        if (ipIt->second.pending > 0) --ipIt->second.pending;
+        ipIt->second.lastActivity = time(nullptr);
+    }
+    const int fd = it->first;
+    epollDel(fd);
+    if (closeFd) close(fd);
+    m_pending.erase(it);
+}
+
+void SignalServer::releaseClientIp(ClientSession& c) {
+    std::map<uint32_t, IpState>::iterator it =
+        m_ipStates.find(c.remoteIpv4);
+    if (it == m_ipStates.end()) return;
+    if (it->second.clients > 0) --it->second.clients;
+    it->second.lastActivity = time(nullptr);
+    c.remoteIpv4 = 0;
+}
+
+void SignalServer::cleanupIpStates(time_t now) {
+    for (std::map<uint32_t, IpState>::iterator it = m_ipStates.begin();
+         it != m_ipStates.end(); ) {
+        if (it->second.clients == 0 && it->second.pending == 0 &&
+            it->second.lastActivity > 0 &&
+            now - it->second.lastActivity >= 600) {
+            it = m_ipStates.erase(it);
+        } else {
+            ++it;
+        }
+    }
 }
 
 ClientSession* SignalServer::findClientOwnerByPeerId(uint32_t peerId) {
@@ -128,7 +194,7 @@ ClientSession* SignalServer::findClientByPeerId(uint32_t peerId) {
     if (!client ||
         !client->alive ||
         !client->serverAuthOk ||
-        (m_authEnabled && !client->secureEnabled) ||
+        !client->secureEnabled ||
         !sessionHasPeerIdentity(client->state)) {
         return nullptr;
     }
@@ -183,8 +249,7 @@ ClientSession* SignalServer::findClientByDataFd(int dataFd) {
     if (!client ||
         !client->alive ||
         client->peerId == 0 ||
-        (m_authEnabled &&
-         (!client->serverAuthOk || !client->secureEnabled)) ||
+        (!client->serverAuthOk || !client->secureEnabled) ||
         !sessionCanBindDataChannel(client->state)) {
         return nullptr;
     }
@@ -231,13 +296,17 @@ void SignalServer::unbindClientIndexes(ClientSession& c) {
 }
 
 void SignalServer::closeDataChannel(ClientSession& c) {
-    if (c.dataFd < 0) return;
+    if (c.dataFd < 0) {
+        clearSendBuffer(c, true);
+        c.dataRecvBuf.clear();
+        return;
+    }
     int dataFd = c.dataFd;
     unbindSessionIndex(m_dataFdMap, dataFd, c.tcpFd);
     c.dataFd = -1;
     epollDel(dataFd);
     close(dataFd);
-    c.dataSendBuf.clear();
+    clearSendBuffer(c, true);
     c.dataRecvBuf.clear();
 }
 
@@ -402,6 +471,10 @@ void SignalServer::epollDel(int fd) {
 
 bool SignalServer::init(uint16_t port)
 {
+    if (!m_authReady) {
+        LOG_ERROR("[server] Authentication is not initialized");
+        return false;
+    }
     m_epfd = epoll_create1(0);
     if (m_epfd < 0) { LOG_ERROR("epoll_create1 failed"); return false; }
 
@@ -421,13 +494,13 @@ bool SignalServer::init(uint16_t port)
 
 // ───────── Main loop ─────────
 
-void SignalServer::run() {
+void SignalServer::run(const volatile sig_atomic_t* stopRequested) {
     m_running = true;
     const int MAX_EV = 128;
     struct epoll_event events[MAX_EV];
     time_t lastCheck = time(nullptr);
 
-    while (m_running) {
+    while (m_running && (!stopRequested || !*stopRequested)) {
         int n = epoll_wait(m_epfd, events, MAX_EV, 200);
         for (int i = 0; i < n; ++i) {
             int fd = events[i].data.fd;
@@ -437,7 +510,7 @@ void SignalServer::run() {
                 handleUdpPacket(fd);
             } else if (m_pending.count(fd)) {
                 if (events[i].events & (EPOLLERR | EPOLLHUP)) {
-                    epollDel(fd); close(fd); m_pending.erase(fd);
+                    removePending(m_pending.find(fd), true);
                 } else if (events[i].events & EPOLLIN) {
                     handlePendingData(fd);
                 }
@@ -485,6 +558,8 @@ void SignalServer::stop() {
     m_dataFdMap.clear();
     m_peerMap.clear();
     m_secureSessionMap.clear();
+    m_ipStates.clear();
+    m_globalSendBytes = 0;
     if (m_epfd >= 0) { close(m_epfd); m_epfd = -1; }
 }
 
@@ -496,13 +571,25 @@ void SignalServer::handleTcpAccept() {
     int fd = accept(m_tcpListenFd, (struct sockaddr*)&addr, &addrLen);
     if (fd < 0) return;
 
+    const uint32_t remoteIp = ntohl(addr.sin_addr.s_addr);
+    IpState& ipState = m_ipStates[remoteIp];
+    ipState.lastActivity = time(nullptr);
+    if (m_pending.size() >= m_limits.maxPending ||
+        ipState.pending >= m_limits.maxPendingPerIp ||
+        !takeIpToken(remoteIp, &IpState::accepts, 16.0, 1.0)) {
+        close(fd);
+        return;
+    }
+
     setNonBlocking(fd);
     setTcpNoDelay(fd);
     epollAdd(fd, EPOLLIN | EPOLLERR | EPOLLHUP);
 
     PendingConn& pc = m_pending[fd];
     pc.fd      = fd;
+    pc.remoteIpv4 = remoteIp;
     pc.created = time(nullptr);
+    ++ipState.pending;
     LOG_INFO("[server] New connection fd=%d from %s (pending classification)",
              fd, addrToString(addr).c_str());
 }
@@ -515,9 +602,7 @@ void SignalServer::handlePendingData(int fd) {
     char buf[4096];
     int n = recv(fd, buf, sizeof(buf), 0);
     if (n <= 0) {
-        epollDel(fd);
-        close(fd);
-        m_pending.erase(it);
+        removePending(it, true);
         return;
     }
 
@@ -528,9 +613,7 @@ void SignalServer::handlePendingData(int fd) {
     const TcpMsgHeader* hdr = reinterpret_cast<const TcpMsgHeader*>(pc.recvBuf.data());
     uint16_t payloadLen = ntohs(hdr->length);
     if (payloadLen > MAX_TCP_MSG_PAYLOAD) {
-        epollDel(fd);
-        close(fd);
-        m_pending.erase(it);
+        removePending(it, true);
         return;
     }
     size_t frameLen = sizeof(TcpMsgHeader) + payloadLen;
@@ -539,12 +622,14 @@ void SignalServer::handlePendingData(int fd) {
     uint8_t msgType = hdr->msgType;
 
     if (msgType == MSG_DATA_CHANNEL_INIT) {
+        const uint32_t remoteIp = pc.remoteIpv4;
         std::vector<uint8_t> trailing(
             pc.recvBuf.begin() + frameLen, pc.recvBuf.end());
-        if (m_authEnabled)
-            onSecureDataChannelInit(fd, pc.recvBuf.data() + sizeof(TcpMsgHeader), payloadLen);
-        else
-            onDataChannelInit(fd, pc.recvBuf.data() + sizeof(TcpMsgHeader), payloadLen);
+        onSecureDataChannelInit(fd,
+            pc.recvBuf.data() + sizeof(TcpMsgHeader), payloadLen);
+        std::map<uint32_t, IpState>::iterator ipIt = m_ipStates.find(remoteIp);
+        if (ipIt != m_ipStates.end() && ipIt->second.pending > 0)
+            --ipIt->second.pending;
         m_pending.erase(it);
         ClientSession* dataClient = findClientByDataFd(fd);
         if (dataClient && !trailing.empty()) {
@@ -556,13 +641,24 @@ void SignalServer::handlePendingData(int fd) {
     }
 
     // Signaling connection: promote to m_clients
+    const uint32_t remoteIp = pc.remoteIpv4;
+    IpState& ipState = m_ipStates[remoteIp];
+    if (m_clients.size() >= m_limits.maxClients ||
+        ipState.clients >= m_limits.maxClientsPerIp) {
+        removePending(it, true);
+        return;
+    }
     ClientSession& c = m_clients[fd];
     c.tcpFd    = fd;
     c.lastPing = time(nullptr);
     c.alive    = true;
+    c.remoteIpv4 = remoteIp;
     c.helloDeadline = c.lastPing + CLIENT_HELLO_TIMEOUT_SEC;
     c.recvBuf  = std::move(pc.recvBuf);
-    c.serverAuthOk = !m_authEnabled;
+    c.serverAuthOk = false;
+    if (ipState.pending > 0) --ipState.pending;
+    ++ipState.clients;
+    ipState.lastActivity = time(nullptr);
     m_pending.erase(it);
 
     LOG_DETAIL("[server] Connection fd=%d classified as signaling", fd);
@@ -730,9 +826,9 @@ void SignalServer::destroyClient(int fd, DisconnectReason reason) {
     if (!preservePeerId)
         releasePeerId(peerId);
 
-    c.sendBuf.clear();
+    clearSendBuffer(c, false);
     c.recvBuf.clear();
-    c.dataSendBuf.clear();
+    clearSendBuffer(c, true);
     c.dataRecvBuf.clear();
     crypto_wipe(c.secureMaster, sizeof(c.secureMaster));
     crypto_wipe(c.clientNonce, sizeof(c.clientNonce));
@@ -745,6 +841,7 @@ void SignalServer::destroyClient(int fd, DisconnectReason reason) {
     c.secureCipher.reset();
     c.dataCipher.reset();
     c.udpCipher.reset();
+    releaseClientIp(c);
     epollDel(fd);
     close(fd);
     m_clients.erase(it);
@@ -770,35 +867,17 @@ void SignalServer::handleUdpPacket(int fd) {
     if (n <= 0) return;
 
     uint8_t pktType = buf[0];
-    LOG_DETAIL("[server] UDP pkt type=0x%02X size=%zd from %s", pktType, n, addrToString(from).c_str());
 
     switch (pktType) {
     case UDP_RELAY_DATA:
     case UDP_RAW_RELAY_DATA:
-        if (!m_authEnabled) {
-            if (static_cast<size_t>(n) < sizeof(UdpRelayHeader))
-                break;
-            const UdpRelayHeader* relayHeader =
-                reinterpret_cast<const UdpRelayHeader*>(buf);
-            uint32_t srcId = ntohl(relayHeader->srcPeerId);
-            uint32_t dstId = ntohl(relayHeader->dstPeerId);
-            ClientSession* src = findClientByPeerId(srcId);
-            ClientSession* dst = findClientByPeerId(dstId);
-            if (!src || !dst) {
-                LOG_DETAIL("[server] Plain UDP relay unresolved peer %u -> %u",
-                           srcId, dstId);
-                break;
-            }
-            RelayHandler::processUdpRelay(fd, buf, n, from, *src, *dst);
-        } else {
-            LOG_DETAIL("[server] Dropping plaintext UDP relay while auth is enabled");
-        }
+        logDataDropSampled("plaintext UDP relay");
         break;
     case UDP_ENCRYPTED: {
         ClientSession* src = nullptr;
         std::vector<uint8_t> plain;
         if (!decryptUdpPacket(buf, static_cast<size_t>(n), &src, &plain) || !src) {
-            LOG_DETAIL("[server] Dropping undecryptable UDP packet");
+            logDataDropSampled("undecryptable UDP packet");
             break;
         }
         if (!plain.empty() && plain[0] == UDP_KEEPALIVE) {
@@ -806,33 +885,43 @@ void SignalServer::handleUdpPacket(int fd) {
             src->udpAddrKnown = true;
             break;
         }
-        if (plain.size() < sizeof(UdpRelayHeader)) break;
+        if (plain.size() < sizeof(UdpRelayHeader)) {
+            logDataDropSampled("short encrypted UDP payload");
+            break;
+        }
         const UdpRelayHeader* hdr = reinterpret_cast<const UdpRelayHeader*>(plain.data());
-        if (hdr->type != UDP_RELAY_DATA && hdr->type != UDP_RAW_RELAY_DATA) break;
+        if (hdr->type != UDP_RELAY_DATA && hdr->type != UDP_RAW_RELAY_DATA) {
+            logDataDropSampled("invalid encrypted UDP type");
+            break;
+        }
         uint32_t srcId = ntohl(hdr->srcPeerId);
         uint32_t dstId = ntohl(hdr->dstPeerId);
-        if (srcId != src->peerId || src->roomId == 0) {
-            LOG_ERROR("[server] Encrypted UDP src mismatch sessionPeer=%u hdrPeer=%u",
-                      src->peerId, srcId);
+        if (srcId != src->peerId || dstId == 0 || src->roomId == 0 ||
+            (hdr->trafficClass != TRAFFIC_TCP &&
+             hdr->trafficClass != TRAFFIC_UDP)) {
+            logDataDropSampled("encrypted UDP identity/class mismatch");
             break;
         }
         src->udpAddr = from;
         src->udpAddrKnown = true;
         ClientSession* dstClient = findClientByPeerId(dstId);
-        if (!dstClient || !dstClient->udpAddrKnown) break;
+        if (!dstClient || !dstClient->udpAddrKnown) {
+            logDataDropSampled("encrypted UDP destination unavailable");
+            break;
+        }
         ClientSession& dst = *dstClient;
         if (dst.roomId == 0 || dst.roomId != src->roomId) {
-            LOG_ERROR("[server] Encrypted UDP relay rejected: peer %u room=%u -> peer %u room=%u",
-                      src->peerId, src->roomId, dstId, dst.roomId);
+            logDataDropSampled("encrypted UDP cross-room destination");
             break;
         }
         sendEncryptedUdp(fd, dst, plain, dst.udpAddr);
         break;
     }
     case UDP_KEEPALIVE:
+        logDataDropSampled("plaintext UDP keepalive");
         break;
     default:
-        LOG_DETAIL("[server] Unknown UDP pkt type=0x%02X", pktType);
+        logDataDropSampled("unknown UDP packet type");
         break;
     }
 }
@@ -850,8 +939,7 @@ void SignalServer::checkTimeouts() {
             LOG_ERROR("[server] CLIENT_HELLO timeout fd=%d", kv.first);
             kv.second.alive = false;
         }
-        if (m_authEnabled &&
-            kv.second.state == SessionState::AwaitServerAuth &&
+        if (kv.second.state == SessionState::AwaitServerAuth &&
             kv.second.authDeadline > 0 && now > kv.second.authDeadline) {
             LOG_ERROR("[server] Auth timeout fd=%d", kv.first);
             kv.second.alive = false;
@@ -870,12 +958,12 @@ void SignalServer::checkTimeouts() {
             deadPending.push_back(kv.first);
     }
     for (int fd : deadPending) {
-        epollDel(fd);
-        close(fd);
-        m_pending.erase(fd);
+        std::map<int, PendingConn>::iterator it = m_pending.find(fd);
+        if (it != m_pending.end()) removePending(it, true);
     }
 
     cleanupExpiredLeases(now);
+    cleanupIpStates(now);
 }
 
 // ───────── Message dispatch ─────────
@@ -950,7 +1038,7 @@ void SignalServer::processMessage(ClientSession& c, uint8_t msgType,
             return;
         }
 
-        if (m_authEnabled) {
+        {
             if (!c.serverAuthOk || !c.secureEnabled) {
                 LOG_ERROR("[server] Authenticated state without secure context fd=%d state=%s",
                           c.tcpFd, sessionStateName(c.state));
@@ -958,7 +1046,7 @@ void SignalServer::processMessage(ClientSession& c, uint8_t msgType,
                 return;
             }
             if (msgType != MSG_ENCRYPTED) {
-                LOG_ERROR("[server] Plaintext business msg 0x%02X after auth from peer %u",
+                LOG_ERROR("[server] Unencrypted business msg 0x%02X after auth from peer %u",
                           msgType, c.peerId);
                 c.alive = false;
                 return;
@@ -994,7 +1082,7 @@ void SignalServer::processMessage(ClientSession& c, uint8_t msgType,
 
         if (isKnownClientSignalMessage(msgType) &&
             !validateClientSignalPayload(msgType, payload, len)) {
-            LOG_ERROR("[server] Malformed v7 msg 0x%02X from peer %u len=%zu",
+            LOG_ERROR("[server] Malformed v8 msg 0x%02X from peer %u len=%zu",
                       msgType, c.peerId, len);
             c.alive = false;
             return;
@@ -1039,8 +1127,9 @@ void SignalServer::processDataMessage(ClientSession& c, uint8_t msgType,
 
     try {
         std::vector<uint8_t> decryptedDataPayload;
-        if (m_authEnabled) {
-            if (!c.serverAuthOk || msgType != MSG_ENCRYPTED) {
+        {
+            if (!c.serverAuthOk || !c.secureEnabled ||
+                msgType != MSG_ENCRYPTED) {
                 LOG_ERROR("[server] Plain/unauth data msg 0x%02X from peer %u",
                           msgType, c.peerId);
                 if (c.dataFd >= 0)
@@ -1093,53 +1182,6 @@ void SignalServer::processDataMessage(ClientSession& c, uint8_t msgType,
     }
 }
 
-void SignalServer::onDataChannelInit(int fd, const uint8_t* p, size_t len) {
-    if (len != 4) {
-        LOG_ERROR("[server] DATA_CHANNEL_INIT invalid length=%zu, closing fd=%d", len, fd);
-        epollDel(fd);
-        close(fd);
-        return;
-    }
-
-    ByteBuffer bb(p, len);
-    uint32_t peerId = bb.readU32();
-
-    ClientSession* client = findClientByPeerId(peerId);
-    if (!client || !sessionCanBindDataChannel(client->state)) {
-        LOG_ERROR("[server] DATA_CHANNEL_INIT unknown peer %u, closing fd=%d", peerId, fd);
-        epollDel(fd);
-        close(fd);
-        return;
-    }
-
-    ClientSession& c = *client;
-
-    if (c.dataFd >= 0)
-        LOG_INFO("[server] Replacing old data channel fd=%d for peer %u", c.dataFd, peerId);
-    closeDataChannel(c);
-
-    c.dataFd = fd;
-    c.dataLastPing = time(nullptr);
-    c.dataSendBuf.clear();
-    c.dataRecvBuf.clear();
-    if (!bindDataFdIndex(c, fd)) {
-        c.dataFd = -1;
-        epollDel(fd);
-        close(fd);
-        LOG_ERROR("[server] DATA_CHANNEL_INIT fd index collision fd=%d", fd);
-        return;
-    }
-
-    ByteBuffer ack;
-    if (!sendDataMsg(c, MSG_DATA_CHANNEL_ACK, ack)) {
-        LOG_ERROR("[server] Failed to acknowledge data channel for peer %u",
-                  peerId);
-        return;
-    }
-
-    LOG_INFO("[server] Data channel established for peer %u fd=%d", peerId, fd);
-}
-
 void SignalServer::onSecureDataChannelInit(int fd, const uint8_t* p, size_t len) {
     const size_t expectedLength =
         SECURE_SESSION_ID_SIZE + SECURE_FRAME_OVERHEAD + 4;
@@ -1190,7 +1232,7 @@ void SignalServer::onSecureDataChannelInit(int fd, const uint8_t* p, size_t len)
 
     c.dataFd = fd;
     c.dataLastPing = time(nullptr);
-    c.dataSendBuf.clear();
+    clearSendBuffer(c, true);
     c.dataRecvBuf.clear();
     if (!bindDataFdIndex(c, fd)) {
         c.dataFd = -1;
@@ -1221,45 +1263,47 @@ void SignalServer::onClientHello(ClientSession& c, const uint8_t* p, size_t len)
     ByteBuffer bb(p, len);
     uint16_t clientVersion = bb.readU16();
     LOG_INFO("[server] Client hello fd=%d version=%u authRequired=%u len=%zu",
-             c.tcpFd, clientVersion, m_authEnabled ? 1 : 0, len);
+             c.tcpFd, clientVersion, 1, len);
 
     if (clientVersion != PROTOCOL_VERSION) {
         LOG_INFO("[server] Client hello version %u != server version %u",
                  clientVersion, PROTOCOL_VERSION);
         sendError(c.tcpFd, "Protocol version mismatch");
-        c.alive = false;
+        c.state = SessionState::Closing;
+        c.helloDeadline = 0;
         return;
     }
 
     bb.readBytes(c.clientNonce, 16);
     bb.readBytes(c.clientPubKey, 32);
     c.helloDeadline = 0;
-    c.serverAuthOk = !m_authEnabled;
+    c.serverAuthOk = false;
 
     ByteBuffer resp;
     resp.writeU16(PROTOCOL_VERSION);
-    resp.writeU8(m_authEnabled ? 1 : 0);
+    resp.writeU8(1);
 
-    if (m_authEnabled) {
-        secureRandomBytes(c.serverNonce, 16);
-        secureRandomBytes(c.serverPrivKey, 32);
-        crypto_x25519_public_key(c.serverPubKey, c.serverPrivKey);
-        c.authDeadline = time(nullptr) + SERVER_AUTH_TIMEOUT_SEC;
-        LOG_DETAIL("[server] Auth challenge prepared fd=%d deadline=%ld",
-                   c.tcpFd, static_cast<long>(c.authDeadline));
-        resp.writeBytes(c.serverNonce, 16);
-        resp.writeBytes(c.serverPubKey, 32);
-        c.state = SessionState::AwaitServerAuth;
-    } else {
-        c.state = SessionState::AwaitLogin;
+    if (!secureRandomBytes(c.serverNonce, 16) ||
+        !secureRandomBytes(c.serverPrivKey, 32)) {
+        LOG_ERROR("[server] Secure random generation failed fd=%d", c.tcpFd);
+        crypto_wipe(c.serverNonce, sizeof(c.serverNonce));
+        crypto_wipe(c.serverPrivKey, sizeof(c.serverPrivKey));
+        c.alive = false;
+        return;
     }
+    crypto_x25519_public_key(c.serverPubKey, c.serverPrivKey);
+    c.authDeadline = time(nullptr) + SERVER_AUTH_TIMEOUT_SEC;
+    LOG_DETAIL("[server] Auth challenge prepared fd=%d deadline=%ld",
+               c.tcpFd, static_cast<long>(c.authDeadline));
+    resp.writeBytes(c.serverNonce, 16);
+    resp.writeBytes(c.serverPubKey, 32);
+    c.state = SessionState::AwaitServerAuth;
 
     sendMsg(c.tcpFd, MSG_SERVER_HELLO, resp);
 }
 
 void SignalServer::onServerAuth(ClientSession& c, const uint8_t* p, size_t len) {
-    if (!m_authEnabled ||
-        c.state != SessionState::AwaitServerAuth ||
+    if (c.state != SessionState::AwaitServerAuth ||
         c.serverAuthOk) {
         LOG_ERROR("[server] Unexpected SERVER_AUTH fd=%d state=%s authOk=%u len=%zu",
                   c.tcpFd, sessionStateName(c.state),
@@ -1289,7 +1333,10 @@ void SignalServer::onServerAuth(ClientSession& c, const uint8_t* p, size_t len) 
         crypto_wipe(shared, sizeof(shared));
         crypto_wipe(master, sizeof(master));
         crypto_wipe(expected, sizeof(expected));
-        sendError(c.tcpFd, "Invalid server password");
+        const bool allowed = takeIpToken(
+            c.remoteIpv4, &IpState::authFailures, 5.0, 12.0);
+        if (allowed)
+            sendError(c.tcpFd, "Invalid server password");
         c.alive = false;
         return;
     }
@@ -1379,7 +1426,7 @@ void SignalServer::onLogin(ClientSession& c, const uint8_t* p, size_t len) {
         }
         if (!bb.atEnd())
             throw ByteBufferReadError("Trailing login payload");
-        LOG_INFO("[server] Parsed v7 login peer=%u fd=%d name='%s' version=%u resume=%u bodyLen=%zu",
+        LOG_INFO("[server] Parsed v8 login peer=%u fd=%d name='%s' version=%u resume=%u bodyLen=%zu",
                  c.peerId, c.tcpFd, name.c_str(), clientVersion, hasResume ? 1 : 0, len);
     } catch (const std::exception& e) {
         LOG_ERROR("[server] Login parse failed fd=%d peer=%u len=%zu reason=%s",
@@ -1392,7 +1439,7 @@ void SignalServer::onLogin(ClientSession& c, const uint8_t* p, size_t len) {
         LOG_INFO("[server] Client version %u != server version %u (peer name='%s')",
                  clientVersion, PROTOCOL_VERSION, name.c_str());
         sendError(c.tcpFd, "Protocol version mismatch");
-        c.alive = false;
+        c.state = SessionState::Closing;
         return;
     }
 
@@ -1473,6 +1520,14 @@ void SignalServer::onLogin(ClientSession& c, const uint8_t* p, size_t len) {
 void SignalServer::onCreateRoom(ClientSession& c, const uint8_t* p, size_t len) {
     if (c.peerId == 0) { sendError(c.tcpFd, "Not logged in"); return; }
     if (c.roomId != 0) { sendError(c.tcpFd, "Already in a room"); return; }
+    if (!takeIpToken(c.remoteIpv4, &IpState::creates, 4.0, 15.0)) {
+        sendError(c.tcpFd, "Room creation rate limit exceeded");
+        return;
+    }
+    if (m_rooms.size() >= m_limits.maxRooms) {
+        sendError(c.tcpFd, "Room capacity reached");
+        return;
+    }
 
     ByteBuffer bb(p, len);
     std::string roomName = bb.readString();
@@ -1521,11 +1576,14 @@ void SignalServer::onCreateRoom(ClientSession& c, const uint8_t* p, size_t len) 
         return;
     }
 
+    uint8_t leaseToken[RECONNECT_TOKEN_SIZE];
+    if (!generateLeaseToken(leaseToken)) {
+        sendError(c.tcpFd, "Secure random generation failed");
+        return;
+    }
     Room* room = m_rooms.createRoom(roomName, c.peerId, maxPlayers,
                                     tcpPolicy, udpPolicy,
                                     roomMtu, passwordProtected, pwdHash);
-    uint8_t leaseToken[RECONNECT_TOKEN_SIZE];
-    generateLeaseToken(leaseToken);
     RoomLease* lease = room->addLease(c.peerId, c.name, leaseToken);
     if (!lease) {
         m_rooms.eraseRoom(room->id);
@@ -1575,8 +1633,12 @@ void SignalServer::onJoinRoom(ClientSession& c, const uint8_t* p, size_t len) {
     if (room->passwordProtected) {
         c.pendingJoinRoomId = roomId;
         c.state = SessionState::AwaitRoomPassword;
-        int fd = open("/dev/urandom", O_RDONLY);
-        if (fd >= 0) { read(fd, c.authChallenge, 32); close(fd); }
+        if (!secureRandomBytes(c.authChallenge, sizeof(c.authChallenge))) {
+            c.pendingJoinRoomId = 0;
+            c.state = SessionState::LoggedIn;
+            sendError(c.tcpFd, "Secure random generation failed");
+            return;
+        }
 
         ByteBuffer challenge;
         challenge.writeBytes(c.authChallenge, 32);
@@ -1597,6 +1659,7 @@ void SignalServer::onAuthResponse(ClientSession& c, const uint8_t* p, size_t len
 
     Room* room = m_rooms.getRoom(c.pendingJoinRoomId);
     if (!room) {
+        crypto_wipe(c.authChallenge, sizeof(c.authChallenge));
         c.state = SessionState::LoggedIn;
         c.pendingJoinRoomId = 0;
         sendError(c.tcpFd, "Room not found");
@@ -1604,8 +1667,12 @@ void SignalServer::onAuthResponse(ClientSession& c, const uint8_t* p, size_t len
     }
 
     if (len != 32) {
+        crypto_wipe(c.authChallenge, sizeof(c.authChallenge));
         c.state = SessionState::LoggedIn;
         c.pendingJoinRoomId = 0;
+        if (!takeIpToken(c.remoteIpv4, &IpState::roomPasswordFailures,
+                         10.0, 6.0))
+            c.alive = false;
         sendError(c.tcpFd, "\xe5\xaf\x86\xe7\xa0\x81\xe9\x94\x99\xe8\xaf\xaf");
         return;
     }
@@ -1615,12 +1682,17 @@ void SignalServer::onAuthResponse(ClientSession& c, const uint8_t* p, size_t len
 
     if (crypto_verify32(expected, p) != 0) {
         crypto_wipe(expected, 32);
+        crypto_wipe(c.authChallenge, sizeof(c.authChallenge));
         c.state = SessionState::LoggedIn;
         c.pendingJoinRoomId = 0;
+        if (!takeIpToken(c.remoteIpv4, &IpState::roomPasswordFailures,
+                         10.0, 6.0))
+            c.alive = false;
         sendError(c.tcpFd, "\xe5\xaf\x86\xe7\xa0\x81\xe9\x94\x99\xe8\xaf\xaf");
         return;
     }
     crypto_wipe(expected, 32);
+    crypto_wipe(c.authChallenge, sizeof(c.authChallenge));
 
     c.state = SessionState::LoggedIn;
     uint32_t roomId = c.pendingJoinRoomId;
@@ -1633,7 +1705,10 @@ void SignalServer::onAuthResponse(ClientSession& c, const uint8_t* p, size_t len
 void SignalServer::completeJoin(ClientSession& c, Room* room) {
     uint32_t roomId = room->id;
     uint8_t leaseToken[RECONNECT_TOKEN_SIZE];
-    generateLeaseToken(leaseToken);
+    if (!generateLeaseToken(leaseToken)) {
+        sendError(c.tcpFd, "Secure random generation failed");
+        return;
+    }
     RoomLease* lease = room->addLease(c.peerId, c.name, leaseToken);
     if (!lease) {
         sendError(c.tcpFd, "Cannot join room");
@@ -1826,47 +1901,152 @@ void SignalServer::onLogout(ClientSession& c) {
         broadcastRoomListPush();
 }
 
-ByteBuffer SignalServer::buildRoomListPayload() {
-    auto rooms = m_rooms.listRooms();
-    ByteBuffer resp;
-    resp.writeU16(static_cast<uint16_t>(rooms.size()));
-    for (Room* r : rooms) {
-        resp.writeU32(r->id);
-        resp.writeString(r->name);
-        resp.writeU8(static_cast<uint8_t>(r->leases.size()));
-        resp.writeU8(r->maxPlayers);
-        resp.writeU8(static_cast<uint8_t>(r->tcpPolicy.transportMode));
-        resp.writeU8(static_cast<uint8_t>(r->tcpPolicy.fecMode));
-        resp.writeU8(static_cast<uint8_t>(r->tcpPolicy.kcpProfile));
-        resp.writeU8(static_cast<uint8_t>(r->udpPolicy.transportMode));
-        resp.writeU8(static_cast<uint8_t>(r->udpPolicy.fecMode));
-        resp.writeU8(static_cast<uint8_t>(r->udpPolicy.kcpProfile));
-        resp.writeU8(r->passwordProtected);
-        resp.writeU16(r->mtu);
+bool SignalServer::RoomListState::operator==(
+    const RoomListState& other) const {
+    return roomId == other.roomId && roomName == other.roomName &&
+           playerCount == other.playerCount &&
+           maxPlayers == other.maxPlayers &&
+           tcpPolicy.transportMode == other.tcpPolicy.transportMode &&
+           tcpPolicy.fecMode == other.tcpPolicy.fecMode &&
+           tcpPolicy.kcpProfile == other.tcpPolicy.kcpProfile &&
+           udpPolicy.transportMode == other.udpPolicy.transportMode &&
+           udpPolicy.fecMode == other.udpPolicy.fecMode &&
+           udpPolicy.kcpProfile == other.udpPolicy.kcpProfile &&
+           passwordProtected == other.passwordProtected && mtu == other.mtu;
+}
+
+std::map<uint32_t, SignalServer::RoomListState>
+SignalServer::collectRoomListState() {
+    std::map<uint32_t, RoomListState> result;
+    std::vector<Room*> rooms = m_rooms.listRooms();
+    for (size_t i = 0; i < rooms.size(); ++i) {
+        Room* room = rooms[i];
+        RoomListState state;
+        state.roomId = room->id;
+        state.roomName = room->name;
+        state.playerCount = static_cast<uint8_t>(room->leases.size());
+        state.maxPlayers = room->maxPlayers;
+        state.tcpPolicy = room->tcpPolicy;
+        state.udpPolicy = room->udpPolicy;
+        state.passwordProtected = room->passwordProtected;
+        state.mtu = room->mtu;
+        result[state.roomId] = state;
     }
-    return resp;
+    return result;
+}
+
+void SignalServer::writeRoomListItem(
+    ByteBuffer& body, const RoomListState& room) const {
+    body.writeU32(room.roomId);
+    body.writeString(room.roomName);
+    body.writeU8(room.playerCount);
+    body.writeU8(room.maxPlayers);
+    body.writeU8(static_cast<uint8_t>(room.tcpPolicy.transportMode));
+    body.writeU8(static_cast<uint8_t>(room.tcpPolicy.fecMode));
+    body.writeU8(static_cast<uint8_t>(room.tcpPolicy.kcpProfile));
+    body.writeU8(static_cast<uint8_t>(room.udpPolicy.transportMode));
+    body.writeU8(static_cast<uint8_t>(room.udpPolicy.fecMode));
+    body.writeU8(static_cast<uint8_t>(room.udpPolicy.kcpProfile));
+    body.writeU8(room.passwordProtected);
+    body.writeU16(room.mtu);
+}
+
+std::vector<ByteBuffer> SignalServer::buildRoomListPages(
+    const std::map<uint32_t, RoomListState>& rooms) const {
+    std::vector<std::vector<ByteBuffer> > packedPages(1);
+    size_t currentSize = 8 + 2 + 2 + 2;
+    for (std::map<uint32_t, RoomListState>::const_iterator it = rooms.begin();
+         it != rooms.end(); ++it) {
+        ByteBuffer record;
+        writeRoomListItem(record, it->second);
+        if (!packedPages.back().empty() &&
+            currentSize + record.size() > ROOM_LIST_PAGE_PAYLOAD) {
+            packedPages.push_back(std::vector<ByteBuffer>());
+            currentSize = 8 + 2 + 2 + 2;
+        }
+        packedPages.back().push_back(record);
+        currentSize += record.size();
+    }
+
+    const uint16_t pageCount = static_cast<uint16_t>(packedPages.size());
+    std::vector<ByteBuffer> pages;
+    pages.reserve(pageCount);
+    for (uint16_t pageIndex = 0; pageIndex < pageCount; ++pageIndex) {
+        ByteBuffer page;
+        page.writeU64(m_roomListRevision);
+        page.writeU16(pageIndex);
+        page.writeU16(pageCount);
+        page.writeU16(static_cast<uint16_t>(packedPages[pageIndex].size()));
+        for (size_t i = 0; i < packedPages[pageIndex].size(); ++i) {
+            const ByteBuffer& record = packedPages[pageIndex][i];
+            page.writeBytes(record.data(), record.size());
+        }
+        pages.push_back(page);
+    }
+    return pages;
 }
 
 void SignalServer::broadcastRoomListPush() {
-    ByteBuffer resp = buildRoomListPayload();
+    const std::map<uint32_t, RoomListState> current = collectRoomListState();
+    std::vector<std::pair<uint8_t, RoomListState> > operations;
+    for (std::map<uint32_t, RoomListState>::const_iterator it = current.begin();
+         it != current.end(); ++it) {
+        std::map<uint32_t, RoomListState>::const_iterator old =
+            m_publishedRooms.find(it->first);
+        if (old == m_publishedRooms.end() || old->second != it->second)
+            operations.push_back(std::make_pair(ROOM_LIST_UPSERT, it->second));
+    }
+    for (std::map<uint32_t, RoomListState>::const_iterator it =
+             m_publishedRooms.begin(); it != m_publishedRooms.end(); ++it) {
+        if (current.find(it->first) == current.end())
+            operations.push_back(std::make_pair(ROOM_LIST_REMOVE, it->second));
+    }
+    if (operations.empty()) return;
+
+    const uint64_t baseRevision = m_roomListRevision;
+    ++m_roomListRevision;
+    ByteBuffer resp;
+    resp.writeU64(baseRevision);
+    resp.writeU64(m_roomListRevision);
+    resp.writeU16(static_cast<uint16_t>(operations.size()));
+    for (size_t i = 0; i < operations.size(); ++i) {
+        resp.writeU8(operations[i].first);
+        if (operations[i].first == ROOM_LIST_UPSERT)
+            writeRoomListItem(resp, operations[i].second);
+        else
+            resp.writeU32(operations[i].second.roomId);
+    }
+    if (resp.size() > ROOM_LIST_PAGE_PAYLOAD) {
+        LOG_ERROR("[server] Room list delta exceeds payload budget (%zu)",
+                  resp.size());
+        return;
+    }
+    m_publishedRooms = current;
+
     size_t sent = 0;
-    for (auto& kv : m_clients) {
-        ClientSession& client = kv.second;
+    for (std::map<int, ClientSession>::iterator it = m_clients.begin();
+         it != m_clients.end(); ++it) {
+        ClientSession& client = it->second;
         if (client.peerId == 0 || !client.alive ||
             !sessionHasPeerIdentity(client.state) || !client.serverAuthOk)
             continue;
         sendClientMsg(client, MSG_ROOM_LIST_PUSH, resp);
         ++sent;
     }
-    LOG_DETAIL("[server] Room list pushed to %zu clients", sent);
+    LOG_DETAIL("[server] Room list revision %llu pushed to %zu clients",
+               static_cast<unsigned long long>(m_roomListRevision), sent);
 }
 
 void SignalServer::onListRooms(ClientSession& c) {
     cleanupExpiredLeases(time(nullptr));
-    auto rooms = m_rooms.listRooms();
-    LOG_DETAIL("[server] ListRooms request from peer %u, rooms=%zu", c.peerId, rooms.size());
-    ByteBuffer resp = buildRoomListPayload();
-    sendClientMsg(c, MSG_ROOM_LIST, resp);
+    const std::map<uint32_t, RoomListState> rooms = collectRoomListState();
+    const std::vector<ByteBuffer> pages = buildRoomListPages(rooms);
+    LOG_DETAIL("[server] ListRooms peer=%u revision=%llu rooms=%zu pages=%zu",
+               c.peerId,
+               static_cast<unsigned long long>(m_roomListRevision),
+               rooms.size(), pages.size());
+    for (size_t i = 0; i < pages.size(); ++i)
+        sendClientMsg(c, MSG_ROOM_LIST, pages[i]);
 }
 
 void SignalServer::onRequestRelay(ClientSession& c, const uint8_t* p, size_t len) {
@@ -1902,10 +2082,11 @@ void SignalServer::onPing(ClientSession& c) {
 void SignalServer::onTcpRelayData(ClientSession& c, const uint8_t* p, size_t len) {
     if (len < 9) return;
     ByteBuffer bb(p, len);
-    bb.readU32();
+    const uint32_t declaredSource = bb.readU32();
     uint32_t dstId = bb.readU32();
     uint8_t trafficClass = bb.readU8();
-    if (trafficClass != TRAFFIC_TCP && trafficClass != TRAFFIC_UDP)
+    if (declaredSource != c.peerId ||
+        (trafficClass != TRAFFIC_TCP && trafficClass != TRAFFIC_UDP))
         return;
 
     LOG_DETAIL("[server] TCP relay: peer %u -> peer %u class=%u dataSize=%zu",
@@ -2035,7 +2216,7 @@ void SignalServer::flushSendBuf(ClientSession& c) {
     while (!c.sendBuf.empty()) {
         ssize_t n = send(c.tcpFd, c.sendBuf.data(), c.sendBuf.size(), MSG_NOSIGNAL);
         if (n > 0) {
-            c.sendBuf.erase(c.sendBuf.begin(), c.sendBuf.begin() + n);
+            consumeSendBuffer(c, false, static_cast<size_t>(n));
         } else if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
             uint32_t events = EPOLLOUT | EPOLLERR | EPOLLHUP;
             if (c.state != SessionState::Closing)
@@ -2091,20 +2272,97 @@ void SignalServer::handleWritable(int fd) {
     }
 }
 
-void SignalServer::sendMsg(int fd, uint8_t msgType, const ByteBuffer& body) {
+bool SignalServer::appendSendBuffer(ClientSession& c, bool dataChannel,
+                                    const uint8_t* first, size_t firstLen,
+                                    const uint8_t* second, size_t secondLen) {
+    std::vector<uint8_t>& target =
+        dataChannel ? c.dataSendBuf : c.sendBuf;
+    if (firstLen > SIZE_MAX - secondLen) return false;
+    const size_t added = firstLen + secondLen;
+    if (target.size() > MAX_TCP_SEND_BUF - std::min(added, MAX_TCP_SEND_BUF) ||
+        added > MAX_TCP_SEND_BUF ||
+        m_globalSendBytes > m_limits.maxSendBufferBytes -
+            std::min(added, m_limits.maxSendBufferBytes) ||
+        added > m_limits.maxSendBufferBytes) {
+        if (!dataChannel && c.sendBudgetFailures < 255)
+            ++c.sendBudgetFailures;
+        return false;
+    }
+    if (firstLen) target.insert(target.end(), first, first + firstLen);
+    if (secondLen) target.insert(target.end(), second, second + secondLen);
+    m_globalSendBytes += added;
+    if (!dataChannel) c.sendBudgetFailures = 0;
+    return true;
+}
+
+void SignalServer::consumeSendBuffer(ClientSession& c, bool dataChannel,
+                                     size_t count) {
+    std::vector<uint8_t>& target =
+        dataChannel ? c.dataSendBuf : c.sendBuf;
+    count = std::min(count, target.size());
+    target.erase(target.begin(), target.begin() + count);
+    m_globalSendBytes = count > m_globalSendBytes
+        ? 0 : m_globalSendBytes - count;
+}
+
+void SignalServer::clearSendBuffer(ClientSession& c, bool dataChannel) {
+    std::vector<uint8_t>& target =
+        dataChannel ? c.dataSendBuf : c.sendBuf;
+    const size_t count = target.size();
+    target.clear();
+    m_globalSendBytes = count > m_globalSendBytes
+        ? 0 : m_globalSendBytes - count;
+}
+
+void SignalServer::logDataDropSampled(const char* reason) {
+    const time_t now = time(nullptr);
+    if (m_lastDataDropLog == 0 || now - m_lastDataDropLog >= 5) {
+        LOG_DETAIL("[server] Dropped data packet: %s (suppressed=%zu)",
+                   reason, m_suppressedDataDrops);
+        m_lastDataDropLog = now;
+        m_suppressedDataDrops = 0;
+    } else {
+        ++m_suppressedDataDrops;
+    }
+}
+
+void SignalServer::logSendRejectSampled(const char* reason, uint32_t peerId,
+                                        size_t queuedBytes) {
+    const time_t now = time(nullptr);
+    if (m_lastSendRejectLog == 0 || now - m_lastSendRejectLog >= 5) {
+        LOG_ERROR("[server] Send rejected: %s peer=%u queued=%zu global=%zu suppressed=%zu",
+                  reason, peerId, queuedBytes, m_globalSendBytes,
+                  m_suppressedSendRejects);
+        m_lastSendRejectLog = now;
+        m_suppressedSendRejects = 0;
+    } else {
+        ++m_suppressedSendRejects;
+    }
+}
+
+bool SignalServer::sendMsg(int fd, uint8_t msgType, const ByteBuffer& body) {
     auto it = m_clients.find(fd);
-    if (it == m_clients.end()) return;
+    if (it == m_clients.end()) return false;
     ClientSession& c = it->second;
-    if (!c.alive) return;
+    if (!c.alive) return false;
+    if (body.size() > MAX_TCP_MSG_PAYLOAD) {
+        logSendRejectSampled("oversized signal payload", c.peerId,
+                             c.sendBuf.size());
+        return false;
+    }
 
     TcpMsgHeader hdr;
     hdr.msgType = msgType;
     hdr.length  = htons(static_cast<uint16_t>(body.size()));
 
     const uint8_t* hp = reinterpret_cast<const uint8_t*>(&hdr);
-    c.sendBuf.insert(c.sendBuf.end(), hp, hp + sizeof(hdr));
-    if (body.size() > 0)
-        c.sendBuf.insert(c.sendBuf.end(), body.data(), body.data() + body.size());
+    if (!appendSendBuffer(c, false, hp, sizeof(hdr),
+                          body.size() ? body.data() : nullptr, body.size())) {
+        logSendRejectSampled("signal buffer budget", c.peerId,
+                             c.sendBuf.size());
+        if (c.sendBudgetFailures >= 3) c.alive = false;
+        return false;
+    }
 
     flushSendBuf(c);
 
@@ -2113,6 +2371,7 @@ void SignalServer::sendMsg(int fd, uint8_t msgType, const ByteBuffer& body) {
                   c.peerId, c.sendBuf.size());
         c.alive = false;
     }
+    return c.alive;
 }
 
 void SignalServer::sendMsg(int fd, uint8_t msgType) {
@@ -2121,12 +2380,19 @@ void SignalServer::sendMsg(int fd, uint8_t msgType) {
 }
 
 void SignalServer::sendClientMsg(ClientSession& c, uint8_t msgType, const ByteBuffer& body) {
-    if (m_authEnabled && c.secureEnabled && c.serverAuthOk) {
+    if (c.secureEnabled && c.serverAuthOk) {
         ByteBuffer wrapped = encryptForClient(c, msgType, body);
         sendMsg(c.tcpFd, MSG_ENCRYPTED, wrapped);
         return;
     }
-    sendMsg(c.tcpFd, msgType, body);
+    if (msgType == MSG_SERVER_HELLO || msgType == MSG_SERVER_AUTH_OK ||
+        msgType == MSG_ERROR) {
+        sendMsg(c.tcpFd, msgType, body);
+        return;
+    }
+    LOG_ERROR("[server] Refusing plaintext business response type=0x%02X fd=%d",
+              msgType, c.tcpFd);
+    c.alive = false;
 }
 
 void SignalServer::sendClientMsg(ClientSession& c, uint8_t msgType) {
@@ -2147,20 +2413,29 @@ void SignalServer::sendError(int fd, const std::string& text) {
 bool SignalServer::sendDataMsg(ClientSession& c, uint8_t msgType,
                                const ByteBuffer& body) {
     if (c.dataFd < 0 || !c.alive) return false;
+    if (body.size() > MAX_TCP_MSG_PAYLOAD) {
+        logSendRejectSampled("oversized data payload", c.peerId,
+                             c.dataSendBuf.size());
+        return false;
+    }
 
     ByteBuffer outBody = body;
     uint8_t outType = msgType;
-    if (m_authEnabled && c.secureEnabled && c.serverAuthOk) {
-        std::vector<uint8_t> plain;
-        plain.reserve(1 + body.size());
-        plain.push_back(msgType);
-        if (body.size() > 0)
-            plain.insert(plain.end(), body.data(), body.data() + body.size());
-        std::vector<uint8_t> enc = c.dataCipher.encrypt(plain.data(), plain.size());
-        outBody.clear();
-        if (!enc.empty())
-            outBody.writeBytes(enc.data(), enc.size());
-        outType = MSG_ENCRYPTED;
+    if (!c.secureEnabled || !c.serverAuthOk) return false;
+    std::vector<uint8_t> plain;
+    plain.reserve(1 + body.size());
+    plain.push_back(msgType);
+    if (body.size() > 0)
+        plain.insert(plain.end(), body.data(), body.data() + body.size());
+    std::vector<uint8_t> enc = c.dataCipher.encrypt(plain.data(), plain.size());
+    outBody.clear();
+    if (!enc.empty())
+        outBody.writeBytes(enc.data(), enc.size());
+    outType = MSG_ENCRYPTED;
+    if (outBody.size() > MAX_TCP_MSG_PAYLOAD) {
+        logSendRejectSampled("encrypted data payload limit", c.peerId,
+                             c.dataSendBuf.size());
+        return false;
     }
 
     TcpMsgHeader hdr;
@@ -2168,9 +2443,14 @@ bool SignalServer::sendDataMsg(ClientSession& c, uint8_t msgType,
     hdr.length  = htons(static_cast<uint16_t>(outBody.size()));
 
     const uint8_t* hp = reinterpret_cast<const uint8_t*>(&hdr);
-    c.dataSendBuf.insert(c.dataSendBuf.end(), hp, hp + sizeof(hdr));
-    if (outBody.size() > 0)
-        c.dataSendBuf.insert(c.dataSendBuf.end(), outBody.data(), outBody.data() + outBody.size());
+    if (!appendSendBuffer(c, true, hp, sizeof(hdr),
+                          outBody.size() ? outBody.data() : nullptr,
+                          outBody.size())) {
+        logSendRejectSampled("data buffer budget", c.peerId,
+                             c.dataSendBuf.size());
+        closeDataChannel(c);
+        return false;
+    }
 
     if (c.dataSendBuf.size() > MAX_TCP_SEND_BUF) {
         LOG_ERROR("[server] Data send buffer overflow for peer %u (%zu bytes), dropping data channel",
@@ -2188,7 +2468,7 @@ bool SignalServer::flushDataSendBuf(ClientSession& c) {
         ssize_t n = send(dataFd, c.dataSendBuf.data(),
                          c.dataSendBuf.size(), MSG_NOSIGNAL);
         if (n > 0) {
-            c.dataSendBuf.erase(c.dataSendBuf.begin(), c.dataSendBuf.begin() + n);
+            consumeSendBuffer(c, true, static_cast<size_t>(n));
         } else if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
             epollMod(dataFd, EPOLLIN | EPOLLOUT | EPOLLERR | EPOLLHUP);
             return true;

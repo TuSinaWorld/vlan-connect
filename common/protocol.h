@@ -28,6 +28,10 @@ static const int RAW_UDP_KEEPALIVE_MS       = 5000;
 static const int RAW_UDP_DEAD_TIMEOUT_MS    = 30000;
 static const int RAW_UDP_FRAG_TIMEOUT_MS    = 2000;
 static const int RAW_UDP_MAX_FRAG_PAYLOAD   = 1457;
+static const size_t RAW_UDP_MAX_REASSEMBLY_BYTES = 128 * 1024;
+static const size_t RAW_UDP_MAX_ACTIVE_MESSAGES  = 64;
+static const size_t FEC_MAX_BUFFERED_BYTES       = 256 * 1024;
+static const size_t FEC_MAX_ACTIVE_GROUPS        = 32;
 static const int ROOM_MTU_SAFE              = 1280;
 static const int ROOM_MTU_BALANCED          = 1400;
 static const int ROOM_MTU_AGGRESSIVE        = 1420;
@@ -46,12 +50,13 @@ static const uint8_t VNET_LAST_HOST_SUFFIX  = 254;
 
 static const size_t MAX_TCP_SEND_BUF    = 2 * 1024 * 1024;   // 2 MB per client
 static const size_t MAX_TCP_MSG_PAYLOAD = 65000;              // sanity cap
+static const size_t ROOM_LIST_PAGE_PAYLOAD = 60000;
 static const int TCP_RELAY_KEEPALIVE_MS = 10000;              // peer-level probe
 static const int TCP_RELAY_DEAD_MS      = 30000;              // peer-level timeout
 static const int TCP_RECV_TIMEOUT_MS    = 45000;              // client-side no-recv
 
 static const uint32_t PROTOCOL_MAGIC    = 0x564C414E; // "VLAN"
-static const uint16_t PROTOCOL_VERSION  = 7;
+static const uint16_t PROTOCOL_VERSION  = 8;
 
 enum UdpPacketType : uint8_t {
     UDP_KCP_DATA      = 0x01,
@@ -108,6 +113,11 @@ enum TrafficClass : uint8_t {
     TRAFFIC_UDP = 2
 };
 
+enum RoomListOperation : uint8_t {
+    ROOM_LIST_UPSERT = 1,
+    ROOM_LIST_REMOVE = 2
+};
+
 enum class DataPlaneState : uint8_t {
     Stopped = 0,
     Running = 1
@@ -115,14 +125,13 @@ enum class DataPlaneState : uint8_t {
 
 enum class DataPlaneSecurityMode : uint8_t {
     Unconfigured = 0,
-    Plaintext    = 1,
-    Secure       = 2
+    Secure       = 1
 };
 
 inline bool dataPlaneAllowsTraffic(DataPlaneState state,
                                    DataPlaneSecurityMode mode) {
     return state == DataPlaneState::Running &&
-           mode != DataPlaneSecurityMode::Unconfigured;
+           mode == DataPlaneSecurityMode::Secure;
 }
 
 inline bool dataPlaneCanReconfigure(DataPlaneState state) {

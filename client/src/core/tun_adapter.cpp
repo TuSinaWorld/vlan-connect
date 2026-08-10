@@ -243,15 +243,24 @@ void TunAdapter::run() {
                                .arg(GetLastError()));
             break;
         }
-        if (waitResult != WAIT_OBJECT_0)
+        if (waitResult != WAIT_OBJECT_0) {
+            emit errorOccurred(QStringLiteral("Wintun read session became invalid"));
             break;
+        }
 
         while (m_running.load() && m_acceptIo.load()) {
             DWORD packetSize = 0;
             BYTE* packet = m_api
                 ? m_api->receivePacket(m_session, &packetSize) : nullptr;
-            if (!packet)
+            if (!packet) {
+                const DWORD error = GetLastError();
+                if (error != ERROR_NO_MORE_ITEMS) {
+                    emit errorOccurred(QString("WintunReceivePacket failed (error %1)")
+                                       .arg(error));
+                    m_running = false;
+                }
                 break;
+            }
             QByteArray received(reinterpret_cast<char*>(packet),
                                 static_cast<int>(packetSize));
             m_api->releaseReceivePacket(m_session, packet);

@@ -25,8 +25,9 @@
 
 ## 运行模式
 
-- 不启用服务端鉴权: 客户端直接连接服务端。
-- 启用服务端鉴权: 客户端先完成服务端密码鉴权，之后信令、TCP Relay data channel、UDP relay frame 和 TUN payload 使用会话密钥传输。
+- 服务端强制启用鉴权；未指定合法 `--auth-file` 时会在创建监听 socket 前退出。
+- 客户端先完成服务端密码鉴权，之后信令、TCP Relay data channel、UDP relay frame 和 TUN payload 使用会话密钥传输。
+- GUI/CLI 会拒绝声明 `authRequired=0` 的不安全服务端。
 - 房间密码只用于加入房间校验，不参与服务端鉴权，也不作为传输加密密钥。
 
 本仓库提供的 `server/vlan-server.service` 默认启用服务端鉴权，并通过 `--auth-file /usr/local/bin/auth.password` 读取密码文件。
@@ -219,7 +220,22 @@ VLAN_SERVER_EXTRA_ARGS=
 - `VLAN_SERVER_AUTH_FILE`: 服务端鉴权密码文件。
 - `VLAN_SERVER_EXTRA_ARGS`: 额外命令行参数。
 
-服务端也支持 `VLAN_SERVER_AUTH_PASSWORD=...`，但不建议长期用环境变量保存密码。默认 systemd unit 使用 `--auth-file`。
+服务端只从 `--auth-file PATH` 读取密码，不支持 `--auth` 或 `VLAN_SERVER_AUTH_PASSWORD`。密码文件只允许第一行密码和后续空行；密码为 8–256 字节，不得包含 NUL、额外非空行或全空白内容。
+
+### 3. 容量上限
+
+内置硬上限为 256 个信令客户端、64 个待分类连接、128 个房间、单 IPv4 32 个客户端/8 个待连接，以及 64 MiB 全局发送缓冲。以下启动参数只能下调，不能突破硬上限：
+
+```text
+--max-clients N
+--max-pending N
+--max-rooms N
+--max-clients-per-ip N
+--max-pending-per-ip N
+--max-send-buffer-mb N
+```
+
+协议版本为 v8，服务端、GUI 和 CLI 必须同步发布；v7 客户端会收到版本不匹配并被拒绝。
 
 ## 防火墙和安全组
 
@@ -273,7 +289,7 @@ ss -lnu | grep 11510
 sudo systemctl restart vlan-server
 ```
 
-如果鉴权密码文件不存在、为空或权限错误，默认服务会启动失败。
+如果鉴权密码文件不存在、无法读取、为空、格式非法或长度不在 8–256 字节，服务会在监听端口前启动失败。
 
 ## 前台验证
 

@@ -132,20 +132,23 @@ struct TcpConnection {
         sendBuf.insert(sendBuf.end(), p, p + len);
     }
 
-    void sendTcpMsg(uint8_t msgType, const ByteBuffer& body) {
+    bool sendTcpMsg(uint8_t msgType, const ByteBuffer& body) {
+        if (body.size() > MAX_TCP_MSG_PAYLOAD) return false;
         TcpMsgHeader hdr;
         hdr.msgType = msgType;
         hdr.length  = htons(static_cast<uint16_t>(body.size()));
         queueSend(&hdr, sizeof(hdr));
         if (body.size() > 0)
             queueSend(body.data(), body.size());
+        return true;
     }
 
-    void sendTcpMsg(uint8_t msgType) {
+    bool sendTcpMsg(uint8_t msgType) {
         TcpMsgHeader hdr;
         hdr.msgType = msgType;
         hdr.length  = 0;
         queueSend(&hdr, sizeof(hdr));
+        return true;
     }
 
     int readData() {

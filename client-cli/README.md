@@ -1,96 +1,65 @@
 # VLan CLI 客户端
 
-`vlan-cli` 是 VLan 的命令行客户端，适合在终端环境中连接服务端、创建房间、加入房间和查看连接状态。
+`vlan-cli` 是 VLan 的命令行客户端，可连接服务端、创建/加入房间并查看连接状态。当前版本仅支持协议 v8，并且只连接强制鉴权的服务端；收到 `authRequired=0` 时会拒绝连接。
 
-## 相关文档
+相关文档：
 
-- 服务端部署: [../server/DEPLOY.md](../server/DEPLOY.md)
-- 项目入口和 GUI 客户端说明: [../README.md](../README.md)
-
-## 默认值
-
-- 服务端端口: `11510`
-- 房间 MTU: `1400`
-- TCP 流量策略: Raw UDP，关闭 FEC
-- UDP 及非 TCP 流量策略: KCP，关闭 FEC，realtime profile
-- 房间密码: 可选，只用于加入房间校验
-- 服务端鉴权密码: 只缓存在当前进程内，程序退出后失效
+- [服务端部署](../server/DEPLOY.md)
+- [项目与 GUI 说明](../README.md)
 
 ## 启动
 
 ```bash
-vlan-cli -s 127.0.0.1 -p 11510 -n Player1
+vlan-cli -s 127.0.0.1 -p 11510 -n Player1 --auth-file ./auth.password
 ```
-
-启动参数:
 
 | 参数 | 说明 | 示例 |
 |---|---|---|
-| `-s HOST` | 服务端地址，默认 `127.0.0.1`。 | `-s example.com` |
-| `-p PORT` | 服务端端口，默认 `11510`。 | `-p 11510` |
-| `-n NAME` | 玩家昵称。 | `-n Player1` |
-| `--auth PASSWORD` | 为当前进程设置服务端鉴权密码。 | `--auth my-server-password` |
-| `--auth-file PATH` | 从文件第一行读取服务端鉴权密码。 | `--auth-file ./auth.password` |
-| `-v` | 输出详细日志。 | `-v` |
+| `-s HOST` | 服务端地址，默认 `127.0.0.1` | `-s example.com` |
+| `-p PORT` | 服务端端口，默认 `11510` | `-p 11510` |
+| `-n NAME` | 玩家昵称；省略时交互输入 | `-n Player1` |
+| `--auth PASSWORD` | 当前进程使用的服务端鉴权密码 | `--auth my-server-password` |
+| `--auth-file PATH` | 从文件第一行读取客户端提交的服务端鉴权密码 | `--auth-file ./auth.password` |
+| `-v` | 输出详细日志 | `-v` |
 
-如果服务端启用了鉴权，但启动时没有传入密码，CLI 会提示使用 `server-password <password>` 输入密码。
+客户端仍允许通过参数或交互命令输入密码，但服务端本身只能用 `--auth-file` 配置。客户端密码只保存在当前进程内，不写入磁盘。未在启动时提供密码时，CLI 会提示使用 `server-password <password>` 后继续鉴权。
+
+## 默认房间参数
+
+- MTU：`1400`
+- TCP：Raw UDP，FEC 关闭
+- UDP/其它流量：KCP，FEC 关闭，`realtime` profile
+- 房间密码：可选，仅用于加入房间校验
 
 ## 交互命令
 
-进入 CLI 后可以输入以下命令。
+| 命令 | 说明 |
+|---|---|
+| `connect` | 连接当前服务端 |
+| `server <host[:port]> [serverPassword]` | 设置服务端，可同时设置当前进程密码 |
+| `server <host> <port> [serverPassword]` | 分开指定地址和端口 |
+| `server-password <password>` | 设置当前进程鉴权密码并继续握手 |
+| `list` | 获取完整 v8 分页房间快照 |
+| `create <name> [maxPlayers] [roomPassword] [mtu] [opts]` | 创建房间 |
+| `join <roomId> [roomPassword]` | 加入房间 |
+| `leave` | 离开房间并回到大厅 |
+| `status` | 查看服务端、房间和传输状态 |
+| `peers` | 查看房间成员与连接信息 |
+| `quit` | 优雅退出 CLI |
 
-| 命令 | 说明 | 示例 |
-|---|---|---|
-| `connect` | 连接当前服务端地址。地址来自启动参数或 `server` 命令。 | `connect` |
-| `server <host[:port]> [serverPassword]` | 设置服务端地址，可同时设置端口和当前进程内的服务端鉴权密码。未提供密码时会清除旧的进程内密码。 | `server example.com:11510 my-server-password` |
-| `server <host> <port> [serverPassword]` | 用分开的 host 和 port 设置服务端地址。 | `server example.com 11510` |
-| `server-password <password>` | 设置当前进程内的服务端鉴权密码，用于连接或重连。不会写入磁盘。 | `server-password my-server-password` |
-| `list` | 获取服务端房间列表。 | `list` |
-| `create <name> [maxPlayers] [roomPassword] [mtu] [opts]` | 创建房间。未填写的参数使用默认值，`opts` 用于覆盖 TCP/UDP 传输策略。 | `create TestRoom 8 roompass 1400 tcp=raw udp=kcp udp-profile=realtime udp-fec=30` |
-| `join <roomId> [roomPassword]` | 加入指定房间。如果房间有密码，需要提供房间密码。 | `join 1001 roompass` |
-| `leave` | 离开当前房间。 | `leave` |
-| `status` | 查看当前服务端、连接状态、房间状态和传输策略。 | `status` |
-| `peers` | 查看当前房间中的成员和连接信息。 | `peers` |
-| `quit` | 退出 CLI。 | `quit` |
+`create` 的 `opts` 使用 `key=value`，支持：
 
-## create 命令参数
+- `tcp=raw|kcp|tcp`、`udp=raw|kcp|tcp`
+- `tcp-fec=none|10|30|50|70|100|200`
+- `udp-fec=none|10|30|50|70|100|200`
+- `tcp-profile=realtime|bulk`、`udp-profile=realtime|bulk`
 
-`create` 的位置参数依次为:
-
-```text
-create <name> [maxPlayers] [roomPassword] [mtu] [opts]
-```
-
-- `<name>`: 房间名，必填。
-- `[maxPlayers]`: 最大人数，未填写时使用默认值。
-- `[roomPassword]`: 房间密码，未填写时房间不设密码。
-- `[mtu]`: 房间 MTU，只支持 `1280`、`1400`、`1420`。
-- `[opts]`: 传输策略选项，使用 `key=value` 格式，可以写多个。
-
-`opts` 支持:
-
-| 选项 | 可选值 | 说明 |
-|---|---|---|
-| `tcp` | `raw`、`kcp`、`tcp` | TCP 流量使用的传输模式。 |
-| `udp` | `raw`、`kcp`、`tcp` | UDP 及非 TCP 流量使用的传输模式。 |
-| `tcp-fec` | `none`、`10`、`30`、`50`、`70`、`100`、`200` | TCP 流量传输的 FEC 冗余比例。 |
-| `udp-fec` | `none`、`10`、`30`、`50`、`70`、`100`、`200` | UDP 及非 TCP 流量传输的 FEC 冗余比例。 |
-| `tcp-profile` | `realtime`、`bulk` | TCP 流量在 KCP 模式下的 profile。 |
-| `udp-profile` | `realtime`、`bulk` | UDP 及非 TCP 流量在 KCP 模式下的 profile。 |
-
-示例:
+MTU 只支持 `1280`、`1400`、`1420`。示例：
 
 ```text
 create MyRoom
-create MyRoom 8
-create MyRoom 8 roompass
-create MyRoom 8 roompass 1400
 create MyRoom 8 roompass 1400 tcp=raw udp=kcp udp-profile=realtime udp-fec=30
-create BulkRoom 4 1420 tcp=tcp udp=kcp udp-profile=bulk
+join 1001 roompass
 ```
 
-如果不确定传输策略，直接使用默认创建命令即可:
-
-```text
-create MyRoom
-```
+TUN 初始化或运行期发生终止性错误时，CLI 会自动发送离房请求、清理租约和传输状态并回到大厅，同时保持服务端登录。临时 TUN 发送环满只计为丢包，不触发退房。

@@ -6,7 +6,6 @@
 #include <map>
 #include <vector>
 #include <string>
-#include <random>
 
 namespace VLan {
 
@@ -104,6 +103,9 @@ private:
     void failSignalFrame(uint8_t msgType, size_t len,
                          const char* error, size_t offset);
     void notifyDisconnectedOnce();
+    CliRoomListItem readRoomListItem(ByteBuffer& bb);
+    void resetRoomListState();
+    void emitRoomList(bool pushed);
 
     TcpConnection m_conn;
     uint32_t      m_myPeerId;
@@ -123,6 +125,12 @@ private:
     uint8_t       m_serverPubKey[32];
     Buffer        m_secureMaster;
     SecureFrameCipher m_secureCipher;
+    uint64_t      m_roomListRevision;
+    uint64_t      m_snapshotRevision;
+    uint16_t      m_snapshotPageCount;
+    uint16_t      m_snapshotNextPage;
+    std::map<uint32_t, CliRoomListItem> m_roomListCache;
+    std::map<uint32_t, CliRoomListItem> m_snapshotRooms;
 };
 
 // ======================== CliDataChannel ========================
@@ -136,7 +144,6 @@ public:
     void disconnect();
     bool isConnected() const { return m_established; }
     socket_t fd() const { return m_conn.fd; }
-    void configurePlaintextSession();
     bool installSecureSession(uint32_t sessionId, const Buffer& master);
     void clearSecurityContext();
     DataPlaneSecurityMode securityMode() const { return m_securityMode; }

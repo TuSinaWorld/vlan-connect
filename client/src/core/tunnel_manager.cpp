@@ -4,6 +4,7 @@
 #include "raw_udp_tunnel.h"
 #include "peer_connection.h"
 #include "net_common.h"
+#include "overlay_packet_validator.h"
 #include "../ui/log_manager.h"
 #include <cstring>
 
@@ -13,6 +14,7 @@ TunnelManager::TunnelManager(QObject* parent)
     : QObject(parent),
       m_tun(nullptr),
       m_serverUdpPort(0), m_myPeerId(0), m_myVirtualIP(0),
+      m_roomMtu(ROOM_MTU_DEFAULT),
       m_tunUploadBytes(0), m_tunDownloadBytes(0),
       m_tunGeneration(0),
       m_dataPlaneState(DataPlaneState::Stopped),
@@ -62,15 +64,6 @@ void TunnelManager::setServerEndpoint(const QHostAddress& addr, quint16 udpPort)
 
 quint16 TunnelManager::localUdpPort() const {
     return m_udpSocket->localPort();
-}
-
-void TunnelManager::configurePlaintextSession() {
-    if (!dataPlaneCanReconfigure(m_dataPlaneState)) {
-        LogManager::instance().logError("[tunnel] Refusing to change security while data plane is running");
-        return;
-    }
-    clearSecurityContext();
-    m_securityMode = DataPlaneSecurityMode::Plaintext;
 }
 
 bool TunnelManager::installSecureSession(uint32_t sessionId, const QByteArray& master) {
@@ -144,7 +137,10 @@ PeerConnection* TunnelManager::addPeer(uint32_t peerId, uint32_t virtualIP, cons
     m_peerById[peerId]    = peer;
     m_peerByVIP[virtualIP] = peer;
 
-    connect(peer, &PeerConnection::dataReceived, this, &TunnelManager::onPeerDataReceived);
+    connect(peer, &PeerConnection::dataReceived, this,
+            [this, peerId](QByteArray packet) {
+        onPeerDataReceived(peerId, packet);
+    });
     LogManager::instance().logDetail(QString("[tunnel] Added peer %1 vip %2 %3").arg(peerId).arg(virtualIPToString(virtualIP)).arg(name));
     return peer;
 }
@@ -323,7 +319,11 @@ void TunnelManager::routeFromTun(const QByteArray& ipPacket) {
     if (!dataPlaneAllowsTraffic(m_dataPlaneState, m_securityMode)) {
         return;
     }
-    if (ipPacket.size() < 20) return;
+    if (!validateOutboundOverlayIpv4(
+            reinterpret_cast<const uint8_t*>(ipPacket.constData()),
+            static_cast<size_t>(ipPacket.size()), m_roomMtu,
+            m_myVirtualIP).isValid())
+        return;
     m_tunUploadBytes += static_cast<quint64>(ipPacket.size());
 
     uint32_t dstIP = extractDstIP(
@@ -345,18 +345,24 @@ void TunnelManager::routeFromTun(const QByteArray& ipPacket) {
 
 // ───────── Network -> TUN ─────────
 
-void TunnelManager::onPeerDataReceived(QByteArray ipPacket) {
+void TunnelManager::onPeerDataReceived(uint32_t peerId, QByteArray ipPacket) {
     if (m_dataPlaneState != DataPlaneState::Running ||
         m_securityMode == DataPlaneSecurityMode::Unconfigured) {
         return;
     }
-    routeToTun(ipPacket);
+    routeToTun(peerId, ipPacket);
 }
 
-void TunnelManager::routeToTun(const QByteArray& ipPacket) {
+void TunnelManager::routeToTun(uint32_t peerId, const QByteArray& ipPacket) {
     if (!dataPlaneAllowsTraffic(m_dataPlaneState, m_securityMode)) {
         return;
     }
+    PeerConnection* peer = peerById(peerId);
+    if (!peer || !validateInboundOverlayIpv4(
+            reinterpret_cast<const uint8_t*>(ipPacket.constData()),
+            static_cast<size_t>(ipPacket.size()), m_roomMtu,
+            peer->virtualIP(), m_myVirtualIP).isValid())
+        return;
     if (g_verboseLog)
         LogManager::instance().logDetail(QString("[tunnel] routeToTun size=%1").arg(ipPacket.size()));
     if (m_tun && m_tun->writePacket(ipPacket))
@@ -382,10 +388,6 @@ void TunnelManager::addTunDownloadBytes(quint64 bytes) {
 void TunnelManager::sendUdpDatagram(const QByteArray& datagram,
                                     const QHostAddress& addr, quint16 port) {
     if (!dataPlaneAllowsTraffic(m_dataPlaneState, m_securityMode)) {
-        return;
-    }
-    if (m_securityMode == DataPlaneSecurityMode::Plaintext) {
-        m_udpSocket->writeDatagram(datagram, addr, port);
         return;
     }
     if (m_securityMode != DataPlaneSecurityMode::Secure ||
@@ -419,47 +421,43 @@ void TunnelManager::onUdpReadyRead() {
         if (!dataPlaneAllowsTraffic(m_dataPlaneState, m_securityMode)) {
             continue;
         }
+        if (sender != m_serverAddr || senderPort != m_serverUdpPort)
+            continue;
         if (datagram.isEmpty()) continue;
         uint8_t pktType = static_cast<uint8_t>(datagram[0]);
 
-        if (m_securityMode == DataPlaneSecurityMode::Secure) {
-            if (pktType != UDP_ENCRYPTED)
-                continue;
-            if (datagram.size() < 1 + SECURE_SESSION_ID_SIZE + SECURE_FRAME_OVERHEAD)
-                continue;
-            uint32_t sid = readU32BE(reinterpret_cast<const uint8_t*>(datagram.constData()) + 1);
-            if (sid != m_secureSessionId)
-                continue;
-            std::vector<uint8_t> plain;
-            const uint8_t* frame = reinterpret_cast<const uint8_t*>(datagram.constData()) + 1 + SECURE_SESSION_ID_SIZE;
-            size_t frameLen = static_cast<size_t>(datagram.size() - 1 - SECURE_SESSION_ID_SIZE);
-            if (!m_udpCipher.decrypt(frame, frameLen, &plain) || plain.empty())
-                continue;
-            datagram = QByteArray(reinterpret_cast<const char*>(plain.data()),
-                                  static_cast<int>(plain.size()));
-            pktType = static_cast<uint8_t>(datagram[0]);
-        }
+        if (m_securityMode != DataPlaneSecurityMode::Secure ||
+            pktType != UDP_ENCRYPTED)
+            continue;
+        if (datagram.size() < 1 + SECURE_SESSION_ID_SIZE + SECURE_FRAME_OVERHEAD)
+            continue;
+        uint32_t sid = readU32BE(reinterpret_cast<const uint8_t*>(datagram.constData()) + 1);
+        if (sid != m_secureSessionId)
+            continue;
+        std::vector<uint8_t> plain;
+        const uint8_t* frame = reinterpret_cast<const uint8_t*>(datagram.constData()) + 1 + SECURE_SESSION_ID_SIZE;
+        size_t frameLen = static_cast<size_t>(datagram.size() - 1 - SECURE_SESSION_ID_SIZE);
+        if (!m_udpCipher.decrypt(frame, frameLen, &plain) || plain.empty())
+            continue;
+        datagram = QByteArray(reinterpret_cast<const char*>(plain.data()),
+                              static_cast<int>(plain.size()));
+        pktType = static_cast<uint8_t>(datagram[0]);
 
         if (g_verboseLog)
             LogManager::instance().logDetail(QString("[tunnel] onUdpReadyRead type=0x%1 size=%2 from=%3:%4").arg(pktType, 0, 16).arg(datagram.size()).arg(sender.toString()).arg(senderPort));
 
         switch (pktType) {
-        case UDP_KCP_DATA: {
-            EndpointKey key;
-            key.ip   = sender.toIPv4Address();
-            key.port = senderPort;
-            auto it = m_endpointToKcp.find(key);
-            if (it != m_endpointToKcp.end()) {
-                it.value()->feedInput(datagram.constData() + 1, datagram.size() - 1);
-            }
-            break;
-        }
         case UDP_RELAY_DATA: {
             if (datagram.size() < static_cast<int>(sizeof(UdpRelayHeader))) break;
             const UdpRelayHeader* hdr =
                 reinterpret_cast<const UdpRelayHeader*>(datagram.constData());
             uint32_t srcPeerId = ntohl(hdr->srcPeerId);
-            TrafficClass cls = hdr->trafficClass == TRAFFIC_TCP ? TRAFFIC_TCP : TRAFFIC_UDP;
+            uint32_t dstPeerId = ntohl(hdr->dstPeerId);
+            if (dstPeerId != m_myPeerId ||
+                (hdr->trafficClass != TRAFFIC_TCP &&
+                 hdr->trafficClass != TRAFFIC_UDP))
+                break;
+            TrafficClass cls = static_cast<TrafficClass>(hdr->trafficClass);
             PeerConnection* peer = peerById(srcPeerId);
             if (peer && peer->kcpTunnel(cls)) {
                 const char* kcpData = datagram.constData() + sizeof(UdpRelayHeader);
@@ -474,7 +472,12 @@ void TunnelManager::onUdpReadyRead() {
             const UdpRelayHeader* hdr =
                 reinterpret_cast<const UdpRelayHeader*>(datagram.constData());
             uint32_t srcPeerId = ntohl(hdr->srcPeerId);
-            TrafficClass cls = hdr->trafficClass == TRAFFIC_TCP ? TRAFFIC_TCP : TRAFFIC_UDP;
+            uint32_t dstPeerId = ntohl(hdr->dstPeerId);
+            if (dstPeerId != m_myPeerId ||
+                (hdr->trafficClass != TRAFFIC_TCP &&
+                 hdr->trafficClass != TRAFFIC_UDP))
+                break;
+            TrafficClass cls = static_cast<TrafficClass>(hdr->trafficClass);
             PeerConnection* peer = peerById(srcPeerId);
             if (peer && peer->rawUdpTunnel(cls)) {
                 const char* fragData = datagram.constData() + sizeof(UdpRelayHeader);

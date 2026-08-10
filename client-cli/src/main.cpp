@@ -6,10 +6,10 @@
 #include <csignal>
 #include <fstream>
 
-static VLan::CliApp* g_app = nullptr;
+static volatile sig_atomic_t g_stopRequested = 0;
 
 static void signalHandler(int) {
-    if (g_app) g_app->requestStop();
+    g_stopRequested = 1;
 }
 
 static std::string trimLine(const std::string& s) {
@@ -95,10 +95,17 @@ int main(int argc, char* argv[]) {
     }
 
     VLan::CliApp app;
-    g_app = &app;
-
-    signal(SIGINT,  signalHandler);
+#ifdef _WIN32
+    signal(SIGINT, signalHandler);
     signal(SIGTERM, signalHandler);
+#else
+    struct sigaction action;
+    memset(&action, 0, sizeof(action));
+    action.sa_handler = signalHandler;
+    sigemptyset(&action.sa_mask);
+    sigaction(SIGINT, &action, nullptr);
+    sigaction(SIGTERM, &action, nullptr);
+#endif
 
     app.setServer(serverHost, serverPort);
     const char* envPassword = std::getenv("VLAN_SERVER_AUTH_PASSWORD");
@@ -109,5 +116,5 @@ int main(int argc, char* argv[]) {
     app.setPlayerName(playerName);
     app.setVerbose(verbose);
 
-    return app.run();
+    return app.run(&g_stopRequested);
 }

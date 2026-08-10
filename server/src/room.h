@@ -148,6 +148,7 @@ struct ClientSession {
     uint32_t         peerId;
     uint32_t         virtualIP;
     uint32_t         roomId;
+    uint32_t         remoteIpv4;
     struct sockaddr_in udpAddr;
     bool             udpAddrKnown;
     std::string      name;
@@ -173,6 +174,7 @@ struct ClientSession {
     SecureFrameCipher udpCipher;
     time_t           helloDeadline;
     time_t           authDeadline;
+    uint8_t          sendBudgetFailures;
 
     uint32_t         pendingJoinRoomId;
     uint8_t          authChallenge[32];
@@ -182,10 +184,12 @@ struct ClientSession {
 
     ClientSession()
         : tcpFd(-1), dataFd(-1), peerId(0), virtualIP(0), roomId(0),
+          remoteIpv4(0),
           udpAddrKnown(false),
           lastPing(0), dataLastPing(0), alive(true),
           state(SessionState::AwaitHello), serverAuthOk(false), secureEnabled(false),
           secureSessionId(0), helloDeadline(0), authDeadline(0),
+          sendBudgetFailures(0),
           pendingJoinRoomId(0), resumeRoomId(0), resumePeerId(0) {
         memset(&udpAddr, 0, sizeof(udpAddr));
         memset(clientNonce, 0, sizeof(clientNonce));
@@ -408,6 +412,8 @@ public:
         for (auto& kv : m_rooms) result.push_back(&kv.second);
         return result;
     }
+
+    size_t size() const { return m_rooms.size(); }
 
     void eraseRoom(uint32_t roomId) {
         auto it = m_rooms.find(roomId);

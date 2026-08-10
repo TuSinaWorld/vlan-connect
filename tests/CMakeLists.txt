@@ -13,7 +13,7 @@ if(NOT VLAN_BUILD_ROOT_OFFSET EQUAL 0)
         "Configure isolated tests below ${VLAN_TEST_BUILD_ROOT}")
 endif()
 
-project(vlan_protocol_v7_tests C CXX)
+project(vlan_protocol_v8_tests C CXX)
 enable_testing()
 
 set(CMAKE_CXX_STANDARD 11)
@@ -56,12 +56,18 @@ set(VLAN_COMMON_INCLUDES
 set(VLAN_MONOCYPHER
     "${VLAN_ROOT}/3rdparty/monocypher/monocypher.c")
 
-add_executable(protocol_v7_tests
-    common/protocol_v7_tests.cpp
+add_executable(protocol_v8_tests
+    common/protocol_v8_tests.cpp
     ${VLAN_MONOCYPHER})
-target_include_directories(protocol_v7_tests PRIVATE
+target_include_directories(protocol_v8_tests PRIVATE
     ${VLAN_COMMON_INCLUDES})
-vlan_test_output(protocol_v7_tests)
+vlan_test_output(protocol_v8_tests)
+
+add_executable(server_auth_file_tests
+    server/auth_file_tests.cpp)
+target_include_directories(server_auth_file_tests PRIVATE
+    "${VLAN_ROOT}/server/src")
+vlan_test_output(server_auth_file_tests)
 
 add_executable(server_session_tests
     server/server_session_state_tests.cpp
@@ -80,7 +86,11 @@ vlan_test_output(gui_signal_tests)
 add_executable(cli_signal_tests
     cli/cli_signal_tests.cpp)
 target_include_directories(cli_signal_tests PRIVATE
-    ${VLAN_COMMON_INCLUDES})
+    ${VLAN_COMMON_INCLUDES}
+    "${VLAN_ROOT}/client-cli/src")
+if(WIN32)
+    target_link_libraries(cli_signal_tests PRIVATE ws2_32)
+endif()
 vlan_test_output(cli_signal_tests)
 
 add_executable(data_channel_tests
@@ -116,13 +126,52 @@ if(WIN32)
 else()
     add_executable(wintun_lifecycle_tests
         wintun/wintun_lifecycle_tests.cpp)
+
+    find_package(Threads REQUIRED)
+    add_executable(linux_tun_netlink_tests
+        cli/linux_tun_netlink_tests.cpp
+        "${VLAN_ROOT}/client-cli/src/cli_tun_linux.cpp")
+    target_include_directories(linux_tun_netlink_tests PRIVATE
+        ${VLAN_COMMON_INCLUDES}
+        "${VLAN_ROOT}/client-cli/src")
+    target_link_libraries(linux_tun_netlink_tests PRIVATE Threads::Threads)
+    vlan_test_output(linux_tun_netlink_tests)
+
+    add_executable(cli_raw_fec_tests
+        cli/raw_fec_limits_tests.cpp
+        "${VLAN_ROOT}/client-cli/src/cli_peer.cpp"
+        "${VLAN_ROOT}/client-cli/src/cli_fec.cpp"
+        "${VLAN_ROOT}/3rdparty/kcp/ikcp.c"
+        "${VLAN_ROOT}/3rdparty/cm256cc/cm256.cpp"
+        "${VLAN_ROOT}/3rdparty/cm256cc/gf256.cpp")
+    target_include_directories(cli_raw_fec_tests PRIVATE
+        ${VLAN_COMMON_INCLUDES}
+        "${VLAN_ROOT}/client-cli/src"
+        "${VLAN_ROOT}/3rdparty/kcp"
+        "${VLAN_ROOT}/3rdparty/cm256cc")
+    target_compile_definitions(cli_raw_fec_tests PRIVATE cm256cc_STATIC)
+    if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|amd64|AMD64|i[3-6]86)$")
+        target_compile_definitions(cli_raw_fec_tests PRIVATE USE_SSSE3)
+        target_compile_options(cli_raw_fec_tests PRIVATE -mssse3)
+    elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "^(aarch64|arm64|ARM64|armv7.*)$")
+        target_compile_definitions(cli_raw_fec_tests PRIVATE USE_NEON)
+    else()
+        message(FATAL_ERROR "Unsupported processor for cli_raw_fec_tests")
+    endif()
+    target_link_libraries(cli_raw_fec_tests PRIVATE Threads::Threads)
+    vlan_test_output(cli_raw_fec_tests)
 endif()
 vlan_test_output(wintun_lifecycle_tests)
 
-add_test(NAME protocol_v7_tests COMMAND protocol_v7_tests)
+add_test(NAME protocol_v8_tests COMMAND protocol_v8_tests)
+add_test(NAME server_auth_file_tests COMMAND server_auth_file_tests)
 add_test(NAME server_session_tests COMMAND server_session_tests)
 add_test(NAME gui_signal_tests COMMAND gui_signal_tests)
 add_test(NAME cli_signal_tests COMMAND cli_signal_tests)
 add_test(NAME data_channel_tests COMMAND data_channel_tests)
 add_test(NAME data_plane_tests COMMAND data_plane_tests)
 add_test(NAME wintun_lifecycle_tests COMMAND wintun_lifecycle_tests)
+if(NOT WIN32)
+    add_test(NAME linux_tun_netlink_tests COMMAND linux_tun_netlink_tests)
+    add_test(NAME cli_raw_fec_tests COMMAND cli_raw_fec_tests)
+endif()

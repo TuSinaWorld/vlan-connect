@@ -110,7 +110,7 @@ void CliFecEncoder::update(uint32_t) {
 // ======================== FecDecoder ========================
 
 CliFecDecoder::CliFecDecoder(OutputFunc output)
-    : m_cm256(sharedCM256()), m_output(output)
+    : m_cm256(sharedCM256()), m_output(output), m_bufferedBytes(0)
 {}
 
 void CliFecDecoder::emitOriginalBlock(const Buffer& block) {
@@ -131,35 +131,52 @@ void CliFecDecoder::addPacket(const char* data, int len) {
     uint8_t N     = fh->dataCount;
     uint8_t total = fh->totalCount;
 
-    if (N == 0 || total < N) return;
+    if (N < 1 || N > 10 || total < N || total > 3 * N || idx >= total)
+        return;
 
     const char* blockData = data + sizeof(FecHeader);
     int blockLen = len - sizeof(FecHeader);
     if (blockLen <= 0) return;
 
-    FecGroup& g = m_groups[gid];
-    if (g.blocks.empty()) {
-        g.dataCount  = N;
-        g.totalCount = total;
-        g.blockBytes = blockLen;
-        g.createTime = currentTimeMs();
-        g.decoded    = false;
+    std::map<uint8_t, FecGroup>::iterator groupIt = m_groups.find(gid);
+    if (groupIt != m_groups.end() &&
+        (groupIt->second.dataCount != N ||
+         groupIt->second.totalCount != total ||
+         groupIt->second.blockBytes != blockLen)) {
+        removeGroup(gid);
+        return;
+    }
+    if (groupIt == m_groups.end()) {
+        if (!ensureCapacity(static_cast<size_t>(blockLen), true)) return;
+        FecGroup group;
+        group.dataCount = N;
+        group.totalCount = total;
+        group.blockBytes = blockLen;
+        group.createTime = currentTimeMs();
+        group.decoded = false;
+        m_groups[gid] = group;
+        groupIt = m_groups.find(gid);
     }
 
-    if (g.decoded) return;
+    if (groupIt->second.decoded) return;
 
-    if (g.blocks.find(idx) == g.blocks.end()) {
+    if (groupIt->second.blocks.find(idx) == groupIt->second.blocks.end()) {
+        if (!ensureCapacity(static_cast<size_t>(blockLen), false)) return;
+        groupIt = m_groups.find(gid);
+        if (groupIt == m_groups.end()) return;
         Buffer block(blockData, blockData + blockLen);
-        if (static_cast<int>(block.size()) < g.blockBytes)
-            block.resize(g.blockBytes, 0);
-        g.blocks[idx] = block;
+        groupIt->second.blocks[idx] = block;
+        m_bufferedBytes += block.size();
 
         if (idx < N) {
             emitOriginalBlock(block);
-            g.emittedOriginals.insert(idx);
+            groupIt->second.emittedOriginals.insert(idx);
         }
     }
 
+    groupIt = m_groups.find(gid);
+    if (groupIt == m_groups.end()) return;
+    FecGroup& g = groupIt->second;
     if (static_cast<int>(g.blocks.size()) >= g.dataCount)
         tryDecode(gid);
 }
@@ -233,7 +250,35 @@ void CliFecDecoder::cleanup(uint32_t nowMs) {
             stale.push_back(it->first);
     }
     for (uint8_t gid : stale)
-        m_groups.erase(gid);
+        removeGroup(gid);
+}
+
+void CliFecDecoder::removeGroup(uint8_t groupId) {
+    std::map<uint8_t, FecGroup>::iterator it = m_groups.find(groupId);
+    if (it == m_groups.end()) return;
+    size_t bytes = 0;
+    for (std::map<uint8_t, Buffer>::const_iterator block =
+             it->second.blocks.begin(); block != it->second.blocks.end(); ++block)
+        bytes += block->second.size();
+    m_bufferedBytes = bytes > m_bufferedBytes
+        ? 0 : m_bufferedBytes - bytes;
+    m_groups.erase(it);
+}
+
+bool CliFecDecoder::ensureCapacity(size_t incomingBytes, bool newGroup) {
+    if (incomingBytes > FEC_MAX_BUFFERED_BYTES) return false;
+    while (!m_groups.empty() &&
+           ((newGroup && m_groups.size() >= FEC_MAX_ACTIVE_GROUPS) ||
+            m_bufferedBytes + incomingBytes > FEC_MAX_BUFFERED_BYTES)) {
+        std::map<uint8_t, FecGroup>::const_iterator oldest = m_groups.begin();
+        for (std::map<uint8_t, FecGroup>::const_iterator it = m_groups.begin();
+             it != m_groups.end(); ++it) {
+            if (it->second.createTime < oldest->second.createTime) oldest = it;
+        }
+        removeGroup(oldest->first);
+    }
+    return (!newGroup || m_groups.size() < FEC_MAX_ACTIVE_GROUPS) &&
+           m_bufferedBytes + incomingBytes <= FEC_MAX_BUFFERED_BYTES;
 }
 
 } // namespace VLan

@@ -44,7 +44,7 @@ public:
 
     void setMyPeerId(uint32_t id)    { m_myPeerId = id; }
     void setMyVirtualIP(uint32_t ip) { m_myVirtualIP = ip; }
-    void configurePlaintextSession();
+    void setRoomMtu(uint16_t mtu) { m_roomMtu = normalizeRoomMtu(mtu); }
     bool installSecureSession(uint32_t sessionId, const Buffer& master);
     void clearSecurityContext();
     bool startDataPlane();
@@ -66,7 +66,7 @@ private:
     void flushPendingTransportDead();
     void udpSend(const uint8_t* data, size_t len, uint32_t dstIP, uint16_t dstPort);
     void routeFromTun(const Buffer& ipPacket);
-    void routeToTun(const Buffer& ipPacket);
+    void routeToTun(uint32_t peerId, const Buffer& ipPacket);
     void onPeerDataReceived(uint32_t peerId, const Buffer& ipPacket);
 
     CliTunAdapter*  m_tun;
@@ -83,6 +83,7 @@ private:
     uint16_t m_serverPort;
     uint32_t m_myPeerId;
     uint32_t m_myVirtualIP;
+    uint16_t m_roomMtu;
     DataPlaneState m_dataPlaneState;
     DataPlaneSecurityMode m_securityMode;
     uint32_t m_secureSessionId;

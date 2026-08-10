@@ -27,10 +27,21 @@ static const uint8_t ARGON2_AUTH_SALT[16] = {
     'V','L','a','n','-','a','u','t','h','-','s','a','l','t','v','1'
 };
 
-inline bool computeIntermediate(const uint8_t* password, size_t pwdLen,
-                                uint8_t out[CIPHER_KEY_SIZE])
+typedef void* (*PayloadCipherAllocator)(size_t);
+typedef void (*PayloadCipherDeallocator)(void*);
+
+inline bool computeIntermediateWithAllocator(
+    const uint8_t* password, size_t pwdLen,
+    uint8_t out[CIPHER_KEY_SIZE],
+    PayloadCipherAllocator allocator,
+    PayloadCipherDeallocator deallocator)
 {
-    void* work = malloc(static_cast<size_t>(ARGON2_NB_BLOCKS) * 1024);
+    if (!out || !allocator || !deallocator ||
+        (pwdLen > 0 && !password) || pwdLen > UINT32_MAX) {
+        if (out) memset(out, 0, CIPHER_KEY_SIZE);
+        return false;
+    }
+    void* work = allocator(static_cast<size_t>(ARGON2_NB_BLOCKS) * 1024);
     if (!work) {
         memset(out, 0, CIPHER_KEY_SIZE);
         return false;
@@ -42,8 +53,15 @@ inline bool computeIntermediate(const uint8_t* password, size_t pwdLen,
         password, ARGON2_AUTH_SALT, static_cast<uint32_t>(pwdLen), 16
     };
     crypto_argon2(out, CIPHER_KEY_SIZE, work, cfg, inp, crypto_argon2_no_extras);
-    free(work);
+    deallocator(work);
     return true;
+}
+
+inline bool computeIntermediate(const uint8_t* password, size_t pwdLen,
+                                uint8_t out[CIPHER_KEY_SIZE])
+{
+    return computeIntermediateWithAllocator(
+        password, pwdLen, out, &malloc, &free);
 }
 
 inline void authHashFromIntermediate(const uint8_t intermediate[CIPHER_KEY_SIZE],
@@ -55,13 +73,18 @@ inline void authHashFromIntermediate(const uint8_t intermediate[CIPHER_KEY_SIZE]
                          domain, sizeof(domain) - 1);
 }
 
-inline void hashPassword(const uint8_t* password, size_t pwdLen,
+inline bool hashPassword(const uint8_t* password, size_t pwdLen,
                          uint8_t hash[CIPHER_KEY_SIZE])
 {
+    if (!hash) return false;
     uint8_t intermediate[CIPHER_KEY_SIZE];
-    computeIntermediate(password, pwdLen, intermediate);
+    if (!computeIntermediate(password, pwdLen, intermediate)) {
+        memset(hash, 0, CIPHER_KEY_SIZE);
+        return false;
+    }
     authHashFromIntermediate(intermediate, hash);
     crypto_wipe(intermediate, CIPHER_KEY_SIZE);
+    return true;
 }
 
 inline void computeChallengeResponse(const uint8_t authHash[CIPHER_KEY_SIZE],
@@ -77,15 +100,24 @@ inline void computeChallengeResponse(const uint8_t authHash[CIPHER_KEY_SIZE],
 
 class PayloadCipher {
 public:
-    static QByteArray computeIntermediate(const QString& password)
+    static bool computeIntermediate(const QString& password, QByteArray* out)
     {
+        if (!out) return false;
         QByteArray pwd = password.toUtf8();
         QByteArray inter(CIPHER_KEY_SIZE, '\0');
-        VLan::computeIntermediate(
+        const bool success = VLan::computeIntermediate(
             reinterpret_cast<const uint8_t*>(pwd.constData()),
             static_cast<size_t>(pwd.size()),
             reinterpret_cast<uint8_t*>(inter.data()));
-        return inter;
+        if (!pwd.isEmpty())
+            crypto_wipe(reinterpret_cast<uint8_t*>(pwd.data()),
+                        static_cast<size_t>(pwd.size()));
+        if (!success) {
+            out->fill('\0', CIPHER_KEY_SIZE);
+            return false;
+        }
+        *out = inter;
+        return true;
     }
 
     static QByteArray hashFromIntermediate(const QByteArray& intermediate)
@@ -97,13 +129,19 @@ public:
         return hash;
     }
 
-    static QByteArray hashPassword(const QString& password)
+    static bool hashPassword(const QString& password, QByteArray* out)
     {
-        QByteArray inter = computeIntermediate(password);
+        if (!out) return false;
+        QByteArray inter;
+        if (!computeIntermediate(password, &inter)) {
+            out->fill('\0', CIPHER_KEY_SIZE);
+            return false;
+        }
         QByteArray hash = hashFromIntermediate(inter);
         crypto_wipe(reinterpret_cast<uint8_t*>(inter.data()),
                     static_cast<size_t>(inter.size()));
-        return hash;
+        *out = hash;
+        return true;
     }
 
     static QByteArray challengeResponse(const QByteArray& authHash,

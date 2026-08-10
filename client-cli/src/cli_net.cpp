@@ -16,7 +16,9 @@ namespace VLan {
 CliSignalClient::CliSignalClient()
     : m_myPeerId(0), m_pingSentTime(0), m_connectStartTime(0), m_hasPendingAuth(false),
       m_serverAuthRequired(false), m_secureReady(false),
-      m_disconnectNotified(false), m_secureSessionId(0)
+      m_disconnectNotified(false), m_secureSessionId(0),
+      m_roomListRevision(0), m_snapshotRevision(0),
+      m_snapshotPageCount(0), m_snapshotNextPage(0)
 {
     memset(m_pendingAuthHash, 0, CIPHER_KEY_SIZE);
     memset(m_clientNonce, 0, sizeof(m_clientNonce));
@@ -42,6 +44,18 @@ void CliSignalClient::resetSecureState() {
     crypto_wipe(m_clientPrivKey, sizeof(m_clientPrivKey));
     crypto_wipe(m_clientPubKey, sizeof(m_clientPubKey));
     crypto_wipe(m_serverPubKey, sizeof(m_serverPubKey));
+    crypto_wipe(m_pendingAuthHash, sizeof(m_pendingAuthHash));
+    m_hasPendingAuth = false;
+    resetRoomListState();
+}
+
+void CliSignalClient::resetRoomListState() {
+    m_roomListRevision = 0;
+    m_snapshotRevision = 0;
+    m_snapshotPageCount = 0;
+    m_snapshotNextPage = 0;
+    m_roomListCache.clear();
+    m_snapshotRooms.clear();
 }
 
 bool CliSignalClient::connectTo(const std::string& ip, uint16_t port) {
@@ -107,6 +121,7 @@ void CliSignalClient::createRoom(const std::string& roomName, uint8_t maxPlayers
 }
 
 void CliSignalClient::joinRoom(uint32_t roomId, const uint8_t* authHash) {
+    crypto_wipe(m_pendingAuthHash, sizeof(m_pendingAuthHash));
     if (authHash) {
         memcpy(m_pendingAuthHash, authHash, CIPHER_KEY_SIZE);
         m_hasPendingAuth = true;
@@ -160,8 +175,13 @@ void CliSignalClient::sendAuthResponse(const uint8_t* response) {
 }
 
 void CliSignalClient::sendClientHello() {
-    secureRandomBytes(m_clientNonce, 16);
-    secureRandomBytes(m_clientPrivKey, 32);
+    if (!secureRandomBytes(m_clientNonce, 16) ||
+        !secureRandomBytes(m_clientPrivKey, 32)) {
+        if (onServerError) onServerError("secure random generation failed");
+        m_conn.reset();
+        notifyDisconnectedOnce();
+        return;
+    }
     crypto_x25519_public_key(m_clientPubKey, m_clientPrivKey);
 
     ByteBuffer bb;
@@ -179,8 +199,14 @@ void CliSignalClient::sendServerAuth() {
 
     uint8_t intermediate[CIPHER_KEY_SIZE];
     uint8_t authHash[CIPHER_KEY_SIZE];
-    computeIntermediate(reinterpret_cast<const uint8_t*>(m_serverPassword.data()),
-                        m_serverPassword.size(), intermediate);
+    if (!computeIntermediate(
+            reinterpret_cast<const uint8_t*>(m_serverPassword.data()),
+            m_serverPassword.size(), intermediate)) {
+        if (onServerError) onServerError("authentication KDF failed");
+        m_conn.reset();
+        notifyDisconnectedOnce();
+        return;
+    }
     authHashFromIntermediate(intermediate, authHash);
 
     uint8_t shared[32];
@@ -205,29 +231,49 @@ void CliSignalClient::sendServerAuth() {
 }
 
 void CliSignalClient::sendMsg(uint8_t msgType, const ByteBuffer& body) {
-    if (m_secureReady &&
-        msgType != MSG_CLIENT_HELLO &&
-        msgType != MSG_SERVER_AUTH &&
-        msgType != MSG_SERVER_AUTH_OK &&
-        msgType != MSG_SERVER_HELLO) {
-        std::vector<uint8_t> plain;
-        plain.reserve(1 + body.size());
-        plain.push_back(msgType);
-        if (body.size() > 0)
-            plain.insert(plain.end(), body.data(), body.data() + body.size());
-        std::vector<uint8_t> enc = m_secureCipher.encrypt(plain.data(), plain.size());
-        ByteBuffer wrapped;
-        if (!enc.empty())
-            wrapped.writeBytes(enc.data(), enc.size());
-        m_conn.sendTcpMsg(MSG_ENCRYPTED, wrapped);
-        return;
-    }
-    m_conn.sendTcpMsg(msgType, body);
+    if (body.size() > MAX_TCP_MSG_PAYLOAD) return;
+    if (!m_secureReady) return;
+    std::vector<uint8_t> plain;
+    plain.reserve(1 + body.size());
+    plain.push_back(msgType);
+    if (body.size() > 0)
+        plain.insert(plain.end(), body.data(), body.data() + body.size());
+    std::vector<uint8_t> enc = m_secureCipher.encrypt(plain.data(), plain.size());
+    if (enc.size() > MAX_TCP_MSG_PAYLOAD) return;
+    ByteBuffer wrapped;
+    if (!enc.empty())
+        wrapped.writeBytes(enc.data(), enc.size());
+    m_conn.sendTcpMsg(MSG_ENCRYPTED, wrapped);
 }
 
 void CliSignalClient::sendMsg(uint8_t msgType) {
     ByteBuffer empty;
     sendMsg(msgType, empty);
+}
+
+CliRoomListItem CliSignalClient::readRoomListItem(ByteBuffer& bb) {
+    CliRoomListItem info;
+    info.roomId = bb.readU32();
+    info.roomName = bb.readString();
+    info.playerCount = bb.readU8();
+    info.maxPlayers = bb.readU8();
+    info.tcpPolicy = normalizeTrafficPolicy(
+        bb.readU8(), bb.readU8(), bb.readU8(), makeDefaultTcpPolicy());
+    info.udpPolicy = normalizeTrafficPolicy(
+        bb.readU8(), bb.readU8(), bb.readU8(), makeDefaultUdpPolicy());
+    info.passwordProtected = bb.readU8();
+    info.mtu = bb.readU16();
+    return info;
+}
+
+void CliSignalClient::emitRoomList(bool pushed) {
+    if (!onRoomList) return;
+    std::vector<CliRoomListItem> rooms;
+    rooms.reserve(m_roomListCache.size());
+    for (std::map<uint32_t, CliRoomListItem>::const_iterator it =
+             m_roomListCache.begin(); it != m_roomListCache.end(); ++it)
+        rooms.push_back(it->second);
+    onRoomList(rooms, pushed);
 }
 
 void CliSignalClient::onWritable() {
@@ -397,8 +443,11 @@ bool CliSignalClient::processMessage(uint8_t msgType,
             }
             m_serverAuthRequired = authRequired;
             if (!authRequired) {
-                if (onConnected) onConnected();
-                return true;
+                if (onServerError)
+                    onServerError("insecure server rejected: authentication is not required");
+                m_conn.reset();
+                notifyDisconnectedOnce();
+                return false;
             }
             bb.readBytes(m_serverNonce, 16);
             bb.readBytes(m_serverPubKey, 32);
@@ -422,9 +471,15 @@ bool CliSignalClient::processMessage(uint8_t msgType,
             uint8_t intermediate[CIPHER_KEY_SIZE];
             uint8_t authHash[CIPHER_KEY_SIZE];
             uint8_t expected[SECURE_KEY_SIZE];
-            computeIntermediate(
-                reinterpret_cast<const uint8_t*>(m_serverPassword.data()),
-                m_serverPassword.size(), intermediate);
+            if (!computeIntermediate(
+                    reinterpret_cast<const uint8_t*>(m_serverPassword.data()),
+                    m_serverPassword.size(), intermediate)) {
+                crypto_wipe(intermediate, sizeof(intermediate));
+                if (onServerError) onServerError("authentication KDF failed");
+                m_conn.reset();
+                notifyDisconnectedOnce();
+                return false;
+            }
             authHashFromIntermediate(intermediate, authHash);
             computeServerAuthProof(expected, m_secureMaster.data(), authHash);
             const bool proofValid =
@@ -505,6 +560,7 @@ bool CliSignalClient::processMessage(uint8_t msgType,
             }
             Buffer leaseToken(RECONNECT_TOKEN_SIZE);
             bb.readBytes(leaseToken.data(), leaseToken.size());
+            crypto_wipe(m_pendingAuthHash, sizeof(m_pendingAuthHash));
             m_hasPendingAuth = false;
             if (onJoinResponse)
                 onJoinResponse(roomId, virtualIP, tcpPolicy, udpPolicy, mtu,
@@ -535,29 +591,76 @@ bool CliSignalClient::processMessage(uint8_t msgType,
             if (onLogoutAck) onLogoutAck();
             return true;
 
-        case MSG_ROOM_LIST:
-        case MSG_ROOM_LIST_PUSH: {
+        case MSG_ROOM_LIST: {
+            const uint64_t revision = bb.readU64();
+            const uint16_t pageIndex = bb.readU16();
+            const uint16_t pageCount = bb.readU16();
             const uint16_t count = bb.readU16();
-            std::vector<CliRoomListItem> rooms;
-            rooms.reserve(count);
-            for (uint16_t i = 0; i < count; ++i) {
-                CliRoomListItem info;
-                info.roomId = bb.readU32();
-                info.roomName = bb.readString();
-                info.playerCount = bb.readU8();
-                info.maxPlayers = bb.readU8();
-                info.tcpPolicy = normalizeTrafficPolicy(
-                    bb.readU8(), bb.readU8(), bb.readU8(),
-                    makeDefaultTcpPolicy());
-                info.udpPolicy = normalizeTrafficPolicy(
-                    bb.readU8(), bb.readU8(), bb.readU8(),
-                    makeDefaultUdpPolicy());
-                info.passwordProtected = bb.readU8();
-                info.mtu = bb.readU16();
-                rooms.push_back(info);
+            if (pageIndex == 0) {
+                m_snapshotRooms.clear();
+                m_snapshotRevision = revision;
+                m_snapshotPageCount = pageCount;
+                m_snapshotNextPage = 0;
             }
-            if (onRoomList)
-                onRoomList(rooms, msgType == MSG_ROOM_LIST_PUSH);
+            if (revision != m_snapshotRevision ||
+                pageCount != m_snapshotPageCount ||
+                pageIndex != m_snapshotNextPage) {
+                m_snapshotRooms.clear();
+                m_snapshotRevision = 0;
+                m_snapshotPageCount = 0;
+                m_snapshotNextPage = 0;
+                listRooms();
+                return true;
+            }
+            for (uint16_t i = 0; i < count; ++i) {
+                const CliRoomListItem info = readRoomListItem(bb);
+                if (m_snapshotRooms.count(info.roomId)) {
+                    m_snapshotRooms.clear();
+                    m_snapshotRevision = 0;
+                    m_snapshotPageCount = 0;
+                    m_snapshotNextPage = 0;
+                    listRooms();
+                    return true;
+                }
+                m_snapshotRooms[info.roomId] = info;
+            }
+            ++m_snapshotNextPage;
+            if (m_snapshotNextPage == m_snapshotPageCount) {
+                m_roomListCache = m_snapshotRooms;
+                m_roomListRevision = m_snapshotRevision;
+                m_snapshotRooms.clear();
+                m_snapshotRevision = 0;
+                m_snapshotPageCount = 0;
+                m_snapshotNextPage = 0;
+                emitRoomList(false);
+            }
+            return true;
+        }
+        case MSG_ROOM_LIST_PUSH: {
+            const uint64_t baseRevision = bb.readU64();
+            const uint64_t revision = bb.readU64();
+            const uint16_t count = bb.readU16();
+            if (baseRevision != m_roomListRevision) {
+                m_snapshotRooms.clear();
+                m_snapshotRevision = 0;
+                m_snapshotPageCount = 0;
+                m_snapshotNextPage = 0;
+                listRooms();
+                return true;
+            }
+            std::map<uint32_t, CliRoomListItem> updated = m_roomListCache;
+            for (uint16_t i = 0; i < count; ++i) {
+                const uint8_t operation = bb.readU8();
+                if (operation == ROOM_LIST_UPSERT) {
+                    const CliRoomListItem info = readRoomListItem(bb);
+                    updated[info.roomId] = info;
+                } else {
+                    updated.erase(bb.readU32());
+                }
+            }
+            m_roomListCache.swap(updated);
+            m_roomListRevision = revision;
+            emitRoomList(true);
             return true;
         }
         case MSG_RELAY_READY: {
@@ -567,7 +670,7 @@ bool CliSignalClient::processMessage(uint8_t msgType,
         }
         case MSG_TCP_RELAY_DATA: {
             const uint32_t srcPeerId = bb.readU32();
-            bb.readU32();
+            const uint32_t dstPeerId = bb.readU32();
             const TrafficClass cls =
                 static_cast<TrafficClass>(bb.readU8());
             const size_t dataLen = bb.remaining();
@@ -577,7 +680,7 @@ bool CliSignalClient::processMessage(uint8_t msgType,
                     payload + len - dataLen;
                 data.assign(dataStart, dataStart + dataLen);
             }
-            if (onRelayData)
+            if (dstPeerId == m_myPeerId && onRelayData)
                 onRelayData(srcPeerId, cls, data);
             return true;
         }
@@ -600,6 +703,8 @@ bool CliSignalClient::processMessage(uint8_t msgType,
                 sendAuthResponse(response);
                 crypto_wipe(challenge, sizeof(challenge));
                 crypto_wipe(response, sizeof(response));
+                crypto_wipe(m_pendingAuthHash, sizeof(m_pendingAuthHash));
+                m_hasPendingAuth = false;
             } else {
                 m_hasPendingAuth = false;
                 LOG_ERR("[signal] Unexpected auth challenge type=0x%02x len=%zu",
@@ -609,6 +714,7 @@ bool CliSignalClient::processMessage(uint8_t msgType,
 
         case MSG_ERROR: {
             const std::string message = bb.readString();
+            crypto_wipe(m_pendingAuthHash, sizeof(m_pendingAuthHash));
             m_hasPendingAuth = false;
             if (onServerError) onServerError(message);
             return true;
@@ -658,19 +764,6 @@ void CliDataChannel::disconnect() {
     m_needReconnect = false;
     m_peerId = 0;
     m_port = 0;
-}
-
-void CliDataChannel::configurePlaintextSession() {
-    if (m_conn.fd != SOCK_INVALID) {
-        LOG_ERR("[datachannel] Cannot change security mode while connected");
-        return;
-    }
-    if (!m_secureMaster.empty())
-        crypto_wipe(m_secureMaster.data(), m_secureMaster.size());
-    m_secureMaster.clear();
-    m_secureSessionId = 0;
-    m_cipher.reset();
-    m_securityMode = DataPlaneSecurityMode::Plaintext;
 }
 
 bool CliDataChannel::installSecureSession(uint32_t sessionId,
@@ -736,21 +829,18 @@ void CliDataChannel::onWritable() {
             m_conn.lastRecvTime = currentTimeMs();
 
             ByteBuffer bb;
-            if (m_securityMode == DataPlaneSecurityMode::Secure) {
-                ByteBuffer inner;
-                inner.writeU32(m_peerId);
-                std::vector<uint8_t> enc = m_cipher.encrypt(inner.data(), inner.size());
-                uint8_t sid[SECURE_SESSION_ID_SIZE];
-                writeU32BE(sid, m_secureSessionId);
-                bb.writeBytes(sid, SECURE_SESSION_ID_SIZE);
-                if (!enc.empty())
-                    bb.writeBytes(enc.data(), enc.size());
-            } else if (m_securityMode == DataPlaneSecurityMode::Plaintext) {
-                bb.writeU32(m_peerId);
-            } else {
+            if (m_securityMode != DataPlaneSecurityMode::Secure) {
                 m_conn.reset();
                 return;
             }
+            ByteBuffer inner;
+            inner.writeU32(m_peerId);
+            std::vector<uint8_t> enc = m_cipher.encrypt(inner.data(), inner.size());
+            uint8_t sid[SECURE_SESSION_ID_SIZE];
+            writeU32BE(sid, m_secureSessionId);
+            bb.writeBytes(sid, SECURE_SESSION_ID_SIZE);
+            if (!enc.empty())
+                bb.writeBytes(enc.data(), enc.size());
             m_conn.sendTcpMsg(MSG_DATA_CHANNEL_INIT, bb);
             LOG_DBG("[datachannel] TCP connected, sent INIT for peer %u", m_peerId);
         } else {
@@ -864,12 +954,13 @@ bool CliDataChannel::processMessage(uint8_t msgType,
         case MSG_TCP_RELAY_DATA: {
             ByteBuffer bb(payload, len);
             const uint32_t srcId = bb.readU32();
-            bb.readU32();
+            const uint32_t dstId = bb.readU32();
             const TrafficClass trafficClass =
                 static_cast<TrafficClass>(bb.readU8());
             const size_t dataLen = bb.remaining();
             Buffer data(payload + len - dataLen, payload + len);
-            if (onRelayData) onRelayData(srcId, trafficClass, data);
+            if (dstId == m_peerId && onRelayData)
+                onRelayData(srcId, trafficClass, data);
             return true;
         }
         case MSG_PONG:
@@ -902,8 +993,9 @@ void CliDataChannel::failDataChannelFrame(uint8_t msgType, size_t len,
 
 void CliDataChannel::sendMsg(uint8_t msgType, const ByteBuffer& body) {
     if (!m_conn.connected ||
-        m_securityMode == DataPlaneSecurityMode::Unconfigured)
+        m_securityMode != DataPlaneSecurityMode::Secure)
         return;
+    if (body.size() > MAX_TCP_MSG_PAYLOAD) return;
     if (m_securityMode == DataPlaneSecurityMode::Secure &&
         msgType != MSG_DATA_CHANNEL_INIT) {
         std::vector<uint8_t> plain;
@@ -912,6 +1004,7 @@ void CliDataChannel::sendMsg(uint8_t msgType, const ByteBuffer& body) {
         if (body.size() > 0)
             plain.insert(plain.end(), body.data(), body.data() + body.size());
         std::vector<uint8_t> enc = m_cipher.encrypt(plain.data(), plain.size());
+        if (enc.size() > MAX_TCP_MSG_PAYLOAD) return;
         ByteBuffer wrapped;
         if (!enc.empty())
             wrapped.writeBytes(enc.data(), enc.size());

@@ -61,7 +61,7 @@ public:
 
     void setMyPeerId(uint32_t id)   { m_myPeerId = id; }
     void setMyVirtualIP(uint32_t ip) { m_myVirtualIP = ip; }
-    void configurePlaintextSession();
+    void setRoomMtu(uint16_t mtu) { m_roomMtu = normalizeRoomMtu(mtu); }
     bool installSecureSession(uint32_t sessionId, const QByteArray& master);
     void clearSecurityContext();
     bool startDataPlane();
@@ -80,12 +80,12 @@ private slots:
     void onTunPacketReceived(QByteArray packet);
     void onUdpReadyRead();
     void onKcpUpdate();
-    void onPeerDataReceived(QByteArray ipPacket);
+    void onPeerDataReceived(uint32_t peerId, QByteArray ipPacket);
     void onUdpKeepalive();
 
 private:
     void routeFromTun(const QByteArray& ipPacket);
-    void routeToTun(const QByteArray& ipPacket);
+    void routeToTun(uint32_t peerId, const QByteArray& ipPacket);
     void sendUdpDatagram(const QByteArray& datagram,
                          const QHostAddress& addr, quint16 port);
     void markTransportDead(uint32_t peerId, TrafficClass cls);
@@ -121,6 +121,7 @@ private:
     quint16      m_serverUdpPort;
     uint32_t     m_myPeerId;
     uint32_t     m_myVirtualIP;
+    uint16_t     m_roomMtu;
     quint64      m_tunUploadBytes;
     quint64      m_tunDownloadBytes;
     quint64      m_tunGeneration;

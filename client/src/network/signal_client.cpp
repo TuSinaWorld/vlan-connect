@@ -11,22 +11,19 @@
 namespace VLan {
 
 SignalClient::SignalClient(QObject* parent)
-    : QObject(parent), m_myPeerId(0), m_serverPort(0), m_connectTimeoutMs(8000),
+    : QObject(parent), m_socket(nullptr), m_myPeerId(0), m_serverPort(0), m_connectTimeoutMs(8000),
       m_lastRecvTime(0), m_pingSentTime(0),
       m_serverAuthRequired(false), m_secureReady(false),
-      m_fatalDisconnectPending(false), m_secureSessionId(0)
+      m_fatalDisconnectPending(false), m_secureSessionId(0),
+      m_roomListRevision(0), m_snapshotRevision(0),
+      m_snapshotPageCount(0), m_snapshotNextPage(0)
 {
     memset(m_clientNonce, 0, sizeof(m_clientNonce));
     memset(m_serverNonce, 0, sizeof(m_serverNonce));
     memset(m_clientPrivKey, 0, sizeof(m_clientPrivKey));
     memset(m_clientPubKey, 0, sizeof(m_clientPubKey));
     memset(m_serverPubKey, 0, sizeof(m_serverPubKey));
-    m_socket = new QTcpSocket(this);
-    connect(m_socket, &QTcpSocket::connected,    this, &SignalClient::onConnected);
-    connect(m_socket, &QTcpSocket::disconnected, this, &SignalClient::onDisconnected);
-    connect(m_socket, &QTcpSocket::readyRead,    this, &SignalClient::onReadyRead);
-    connect(m_socket, SIGNAL(error(QAbstractSocket::SocketError)),
-            this, SLOT(onSocketError(QAbstractSocket::SocketError)));
+    createSocket();
 
     m_pingTimer = new QTimer(this);
     connect(m_pingTimer, &QTimer::timeout, this, &SignalClient::onPingTimer);
@@ -37,6 +34,26 @@ SignalClient::SignalClient(QObject* parent)
 
     m_recvTimeoutTimer = new QTimer(this);
     connect(m_recvTimeoutTimer, &QTimer::timeout, this, &SignalClient::onRecvTimeoutCheck);
+}
+
+void SignalClient::createSocket() {
+    QTcpSocket* socket = new QTcpSocket(this);
+    m_socket = socket;
+    connect(socket, &QTcpSocket::connected, this, [this, socket]() {
+        if (m_socket == socket) onConnected();
+    });
+    connect(socket, &QTcpSocket::disconnected, this, [this, socket]() {
+        if (m_socket == socket) onDisconnected();
+    });
+    connect(socket, &QTcpSocket::readyRead, this, [this, socket]() {
+        if (m_socket == socket) onReadyRead();
+    });
+    connect(socket,
+            static_cast<void (QTcpSocket::*)(QAbstractSocket::SocketError)>(
+                &QTcpSocket::error),
+            this, [this, socket](QAbstractSocket::SocketError error) {
+        if (m_socket == socket) onSocketError(error);
+    });
 }
 
 SignalClient::~SignalClient() {
@@ -59,13 +76,33 @@ void SignalClient::resetSecureState() {
     crypto_wipe(m_clientPrivKey, sizeof(m_clientPrivKey));
     crypto_wipe(m_clientPubKey, sizeof(m_clientPubKey));
     crypto_wipe(m_serverPubKey, sizeof(m_serverPubKey));
+    if (!m_pendingAuthHash.isEmpty()) {
+        crypto_wipe(reinterpret_cast<uint8_t*>(m_pendingAuthHash.data()),
+                    static_cast<size_t>(m_pendingAuthHash.size()));
+        m_pendingAuthHash.clear();
+    }
+    resetRoomListState();
+}
+
+void SignalClient::resetRoomListState() {
+    m_roomListRevision = 0;
+    m_snapshotRevision = 0;
+    m_snapshotPageCount = 0;
+    m_snapshotNextPage = 0;
+    m_roomListCache.clear();
+    m_snapshotRooms.clear();
 }
 
 void SignalClient::connectToServer(const QString& host, quint16 port,
                                    int timeoutMs) {
-    if (m_socket->state() != QAbstractSocket::UnconnectedState) {
-        m_socket->abort();
+    if (m_socket) {
+        QTcpSocket* oldSocket = m_socket;
+        m_socket = nullptr;
+        QObject::disconnect(oldSocket, nullptr, this, nullptr);
+        oldSocket->abort();
+        oldSocket->deleteLater();
     }
+    createSocket();
     m_serverHost       = host;
     m_serverPort       = port;
     m_connectTimeoutMs = timeoutMs;
@@ -149,6 +186,10 @@ void SignalClient::createRoom(const QString& roomName, uint8_t maxPlayers,
 }
 
 void SignalClient::joinRoom(uint32_t roomId, const QByteArray& authHash) {
+    if (!m_pendingAuthHash.isEmpty()) {
+        crypto_wipe(reinterpret_cast<uint8_t*>(m_pendingAuthHash.data()),
+                    static_cast<size_t>(m_pendingAuthHash.size()));
+    }
     m_pendingAuthHash = authHash;
     ByteBuffer bb;
     bb.writeU32(roomId);
@@ -215,23 +256,25 @@ void SignalClient::onDisconnected() {
 
 void SignalClient::onSocketError(QAbstractSocket::SocketError err) {
     Q_UNUSED(err);
+    QTcpSocket* failedSocket = m_socket;
     m_connectTimer->stop();
     m_pingTimer->stop();
     m_recvTimeoutTimer->stop();
     QString reason = m_socket->errorString();
     if (m_socket->state() != QAbstractSocket::ConnectedState) {
         QPointer<SignalClient> guard(this);
-        m_socket->abort();
-        if (guard.isNull()) return;
+        failedSocket->abort();
+        if (guard.isNull() || guard->m_socket != failedSocket) return;
         emit connectFailed(reason);
     }
 }
 
 void SignalClient::onConnectTimeout() {
     if (m_socket->state() != QAbstractSocket::ConnectedState) {
+        QTcpSocket* timedOutSocket = m_socket;
         QPointer<SignalClient> guard(this);
-        m_socket->abort();
-        if (guard.isNull()) return;
+        timedOutSocket->abort();
+        if (guard.isNull() || guard->m_socket != timedOutSocket) return;
         emit connectFailed(UiStrings::text("error.connectTimeout")
                            .arg(m_connectTimeoutMs / 1000));
     }
@@ -316,8 +359,12 @@ void SignalClient::onPingTimer() {
 // Send helper
 
 void SignalClient::sendClientHello() {
-    secureRandomBytes(m_clientNonce, 16);
-    secureRandomBytes(m_clientPrivKey, 32);
+    if (!secureRandomBytes(m_clientNonce, 16) ||
+        !secureRandomBytes(m_clientPrivKey, 32)) {
+        emit serverError(QStringLiteral("Secure random generation failed."));
+        m_socket->abort();
+        return;
+    }
     crypto_x25519_public_key(m_clientPubKey, m_clientPrivKey);
 
     ByteBuffer bb;
@@ -338,7 +385,12 @@ void SignalClient::sendServerAuth() {
         return;
     }
 
-    QByteArray inter = PayloadCipher::computeIntermediate(m_serverPassword);
+    QByteArray inter;
+    if (!PayloadCipher::computeIntermediate(m_serverPassword, &inter)) {
+        emit serverError(QStringLiteral("Authentication KDF failed."));
+        m_socket->abort();
+        return;
+    }
     QByteArray authHash = PayloadCipher::hashFromIntermediate(inter);
     uint8_t shared[32];
     uint8_t master[32];
@@ -370,39 +422,64 @@ void SignalClient::sendServerAuth() {
 
 void SignalClient::sendMsg(uint8_t msgType, const ByteBuffer& body) {
     if (m_socket->state() != QAbstractSocket::ConnectedState) return;
-
-    if (m_secureReady &&
-        msgType != MSG_CLIENT_HELLO &&
-        msgType != MSG_SERVER_AUTH &&
-        msgType != MSG_SERVER_AUTH_OK &&
-        msgType != MSG_SERVER_HELLO) {
-        std::vector<uint8_t> plain;
-        plain.reserve(1 + body.size());
-        plain.push_back(msgType);
-        if (body.size() > 0)
-            plain.insert(plain.end(), body.data(), body.data() + body.size());
-        std::vector<uint8_t> enc = m_secureCipher.encrypt(plain.data(), plain.size());
-        TcpMsgHeader hdr;
-        hdr.msgType = MSG_ENCRYPTED;
-        hdr.length  = htons(static_cast<uint16_t>(enc.size()));
-        m_socket->write(reinterpret_cast<const char*>(&hdr), sizeof(hdr));
-        if (!enc.empty())
-            m_socket->write(reinterpret_cast<const char*>(enc.data()), enc.size());
+    if (body.size() > MAX_TCP_MSG_PAYLOAD) {
+        LogManager::instance().logError(
+            QString("[signal] Refusing oversized payload type=0x%1 size=%2")
+                .arg(msgType, 2, 16, QLatin1Char('0'))
+                .arg(static_cast<qulonglong>(body.size())));
         return;
     }
 
-    TcpMsgHeader hdr;
-    hdr.msgType = msgType;
-    hdr.length  = htons(static_cast<uint16_t>(body.size()));
-    m_socket->write(reinterpret_cast<const char*>(&hdr), sizeof(hdr));
+    if (!m_secureReady) {
+        LogManager::instance().logError(
+            QStringLiteral("[signal] Refusing business message before authentication"));
+        return;
+    }
+    std::vector<uint8_t> plain;
+    plain.reserve(1 + body.size());
+    plain.push_back(msgType);
     if (body.size() > 0)
-        m_socket->write(reinterpret_cast<const char*>(body.data()), body.size());
+        plain.insert(plain.end(), body.data(), body.data() + body.size());
+    std::vector<uint8_t> enc = m_secureCipher.encrypt(plain.data(), plain.size());
+    if (enc.size() > MAX_TCP_MSG_PAYLOAD) {
+        LogManager::instance().logError(
+            QStringLiteral("[signal] Encrypted payload exceeds protocol limit"));
+        return;
+    }
+    TcpMsgHeader hdr;
+    hdr.msgType = MSG_ENCRYPTED;
+    hdr.length  = htons(static_cast<uint16_t>(enc.size()));
+    m_socket->write(reinterpret_cast<const char*>(&hdr), sizeof(hdr));
+    if (!enc.empty())
+        m_socket->write(reinterpret_cast<const char*>(enc.data()), enc.size());
 }
 
 void SignalClient::sendMsg(uint8_t msgType) {
     if (m_socket->state() != QAbstractSocket::ConnectedState) return;
     ByteBuffer empty;
     sendMsg(msgType, empty);
+}
+
+RoomListItem SignalClient::readRoomListItem(ByteBuffer& bb) {
+    RoomListItem info;
+    memset(&info, 0, sizeof(info));
+    info.roomId = bb.readU32();
+    const std::string name = bb.readString();
+    strncpy(info.roomName, name.c_str(), MAX_ROOM_NAME_LEN);
+    info.roomName[MAX_ROOM_NAME_LEN] = '\0';
+    info.playerCount = bb.readU8();
+    info.maxPlayers = bb.readU8();
+    info.tcpPolicy = normalizeTrafficPolicy(
+        bb.readU8(), bb.readU8(), bb.readU8(), makeDefaultTcpPolicy());
+    info.udpPolicy = normalizeTrafficPolicy(
+        bb.readU8(), bb.readU8(), bb.readU8(), makeDefaultUdpPolicy());
+    info.passwordProtected = bb.readU8();
+    info.mtu = bb.readU16();
+    return info;
+}
+
+void SignalClient::emitCurrentRoomList() {
+    emit roomList(m_roomListCache.values());
 }
 
 // Incoming message dispatch
@@ -512,9 +589,11 @@ bool SignalClient::processMessage(uint8_t msgType,
             }
             m_serverAuthRequired = authRequired;
             if (!authRequired) {
-                m_pingTimer->start(KEEPALIVE_INTERVAL_MS);
-                emit connected();
-                return true;
+                QPointer<SignalClient> guard(this);
+                emit serverError(QStringLiteral("不安全服务端被拒绝：服务端未强制鉴权。"));
+                if (guard.isNull()) return false;
+                m_socket->abort();
+                return false;
             }
             bb.readBytes(m_serverNonce, 16);
             bb.readBytes(m_serverPubKey, 32);
@@ -538,7 +617,12 @@ bool SignalClient::processMessage(uint8_t msgType,
             QByteArray serverProof(32, '\0');
             bb.readBytes(serverProof.data(), 32);
 
-            QByteArray inter = PayloadCipher::computeIntermediate(m_serverPassword);
+            QByteArray inter;
+            if (!PayloadCipher::computeIntermediate(m_serverPassword, &inter)) {
+                emit serverError(QStringLiteral("Authentication KDF failed."));
+                m_socket->abort();
+                return false;
+            }
             QByteArray authHash = PayloadCipher::hashFromIntermediate(inter);
             uint8_t expected[32];
             computeServerAuthProof(
@@ -628,6 +712,9 @@ bool SignalClient::processMessage(uint8_t msgType,
             }
             QByteArray leaseToken(RECONNECT_TOKEN_SIZE, '\0');
             bb.readBytes(leaseToken.data(), RECONNECT_TOKEN_SIZE);
+            if (!m_pendingAuthHash.isEmpty())
+                crypto_wipe(reinterpret_cast<uint8_t*>(m_pendingAuthHash.data()),
+                            static_cast<size_t>(m_pendingAuthHash.size()));
             m_pendingAuthHash.clear();
             emit joinResponse(roomId, vip, tcpPolicy, udpPolicy, mtu,
                               passwordProtected, members, leaseToken);
@@ -655,30 +742,76 @@ bool SignalClient::processMessage(uint8_t msgType,
             emit logoutAck();
             return true;
 
-        case MSG_ROOM_LIST:
-        case MSG_ROOM_LIST_PUSH: {
+        case MSG_ROOM_LIST: {
+            const uint64_t revision = bb.readU64();
+            const uint16_t pageIndex = bb.readU16();
+            const uint16_t pageCount = bb.readU16();
             const uint16_t count = bb.readU16();
-            QList<RoomListItem> rooms;
-            rooms.reserve(count);
-            for (uint16_t i = 0; i < count; ++i) {
-                RoomListItem info;
-                info.roomId = bb.readU32();
-                const std::string name = bb.readString();
-                strncpy(info.roomName, name.c_str(), MAX_ROOM_NAME_LEN);
-                info.roomName[MAX_ROOM_NAME_LEN] = '\0';
-                info.playerCount = bb.readU8();
-                info.maxPlayers = bb.readU8();
-                info.tcpPolicy = normalizeTrafficPolicy(
-                    bb.readU8(), bb.readU8(), bb.readU8(),
-                    makeDefaultTcpPolicy());
-                info.udpPolicy = normalizeTrafficPolicy(
-                    bb.readU8(), bb.readU8(), bb.readU8(),
-                    makeDefaultUdpPolicy());
-                info.passwordProtected = bb.readU8();
-                info.mtu = bb.readU16();
-                rooms.append(info);
+            if (pageIndex == 0) {
+                m_snapshotRooms.clear();
+                m_snapshotRevision = revision;
+                m_snapshotPageCount = pageCount;
+                m_snapshotNextPage = 0;
             }
-            emit roomList(rooms);
+            if (revision != m_snapshotRevision ||
+                pageCount != m_snapshotPageCount ||
+                pageIndex != m_snapshotNextPage) {
+                m_snapshotRooms.clear();
+                m_snapshotRevision = 0;
+                m_snapshotPageCount = 0;
+                m_snapshotNextPage = 0;
+                emit roomListResyncRequired();
+                return true;
+            }
+            for (uint16_t i = 0; i < count; ++i) {
+                const RoomListItem info = readRoomListItem(bb);
+                if (m_snapshotRooms.contains(info.roomId)) {
+                    m_snapshotRooms.clear();
+                    m_snapshotRevision = 0;
+                    m_snapshotPageCount = 0;
+                    m_snapshotNextPage = 0;
+                    emit roomListResyncRequired();
+                    return true;
+                }
+                m_snapshotRooms.insert(info.roomId, info);
+            }
+            ++m_snapshotNextPage;
+            if (m_snapshotNextPage == m_snapshotPageCount) {
+                m_roomListCache = m_snapshotRooms;
+                m_roomListRevision = m_snapshotRevision;
+                m_snapshotRooms.clear();
+                m_snapshotRevision = 0;
+                m_snapshotPageCount = 0;
+                m_snapshotNextPage = 0;
+                emitCurrentRoomList();
+            }
+            return true;
+        }
+        case MSG_ROOM_LIST_PUSH: {
+            const uint64_t baseRevision = bb.readU64();
+            const uint64_t revision = bb.readU64();
+            const uint16_t count = bb.readU16();
+            if (baseRevision != m_roomListRevision) {
+                m_snapshotRooms.clear();
+                m_snapshotRevision = 0;
+                m_snapshotPageCount = 0;
+                m_snapshotNextPage = 0;
+                emit roomListResyncRequired();
+                return true;
+            }
+            QMap<uint32_t, RoomListItem> updated = m_roomListCache;
+            for (uint16_t i = 0; i < count; ++i) {
+                const uint8_t operation = bb.readU8();
+                if (operation == ROOM_LIST_UPSERT) {
+                    const RoomListItem info = readRoomListItem(bb);
+                    updated.insert(info.roomId, info);
+                } else {
+                    updated.remove(bb.readU32());
+                }
+            }
+            m_roomListCache = updated;
+            m_roomListRevision = revision;
+            emitCurrentRoomList();
             return true;
         }
         case MSG_RELAY_READY:
@@ -687,9 +820,11 @@ bool SignalClient::processMessage(uint8_t msgType,
 
         case MSG_TCP_RELAY_DATA: {
             const uint32_t srcPeerId = bb.readU32();
-            bb.readU32();
+            const uint32_t dstPeerId = bb.readU32();
             const TrafficClass cls =
                 static_cast<TrafficClass>(bb.readU8());
+            if (dstPeerId != m_myPeerId)
+                return true;
             const size_t dataLen = bb.remaining();
             const char* dataStart = reinterpret_cast<const char*>(
                 payload + len - dataLen);
@@ -712,11 +847,18 @@ bool SignalClient::processMessage(uint8_t msgType,
             if (m_pendingAuthHash.size() == CIPHER_KEY_SIZE) {
                 QByteArray challenge(CIPHER_CHALLENGE_SIZE, '\0');
                 bb.readBytes(challenge.data(), CIPHER_CHALLENGE_SIZE);
-                const QByteArray response = PayloadCipher::challengeResponse(
+                QByteArray response = PayloadCipher::challengeResponse(
                     m_pendingAuthHash, challenge);
                 ByteBuffer responseBody;
                 responseBody.writeBytes(response.constData(), response.size());
                 sendMsg(MSG_AUTH_RESPONSE, responseBody);
+                crypto_wipe(reinterpret_cast<uint8_t*>(challenge.data()),
+                            static_cast<size_t>(challenge.size()));
+                crypto_wipe(reinterpret_cast<uint8_t*>(response.data()),
+                            static_cast<size_t>(response.size()));
+                crypto_wipe(reinterpret_cast<uint8_t*>(m_pendingAuthHash.data()),
+                            static_cast<size_t>(m_pendingAuthHash.size()));
+                m_pendingAuthHash.clear();
             } else {
                 m_pendingAuthHash.clear();
                 LogManager::instance().logError(
@@ -728,6 +870,9 @@ bool SignalClient::processMessage(uint8_t msgType,
 
         case MSG_ERROR: {
             const QString message = QString::fromStdString(bb.readString());
+            if (!m_pendingAuthHash.isEmpty())
+                crypto_wipe(reinterpret_cast<uint8_t*>(m_pendingAuthHash.data()),
+                            static_cast<size_t>(m_pendingAuthHash.size()));
             m_pendingAuthHash.clear();
             emit serverError(message);
             return true;

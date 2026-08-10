@@ -13,6 +13,26 @@ env:
   LINUX_BUILD_IMAGE: ubuntu:20.04
 
 jobs:
+  tests-linux:
+    name: Protocol and production tests Linux
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure isolated tests
+        shell: bash
+        run: cmake -S tests -B build-tests/linux/ci -DCMAKE_BUILD_TYPE=Release
+
+      - name: Build isolated tests
+        shell: bash
+        run: cmake --build build-tests/linux/ci --parallel
+
+      - name: Run isolated tests
+        shell: bash
+        run: ctest --test-dir build-tests/linux/ci --output-on-failure
+
   server-linux:
     name: Server Linux
     runs-on: ubuntu-24.04

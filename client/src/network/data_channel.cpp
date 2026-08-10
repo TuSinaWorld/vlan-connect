@@ -69,21 +69,6 @@ bool DataChannel::isConnected() const {
            m_socket->state() == QAbstractSocket::ConnectedState;
 }
 
-void DataChannel::configurePlaintextSession() {
-    if (m_socket->state() != QAbstractSocket::UnconnectedState) {
-        LogManager::instance().logError(
-            QStringLiteral("[datachannel] Cannot change security mode while connected"));
-        return;
-    }
-    if (!m_secureMaster.isEmpty())
-        crypto_wipe(reinterpret_cast<uint8_t*>(m_secureMaster.data()),
-                    static_cast<size_t>(m_secureMaster.size()));
-    m_secureMaster.clear();
-    m_secureSessionId = 0;
-    m_cipher.reset();
-    m_securityMode = DataPlaneSecurityMode::Plaintext;
-}
-
 bool DataChannel::installSecureSession(uint32_t sessionId,
                                        const QByteArray& master) {
     if (m_socket->state() != QAbstractSocket::UnconnectedState) {
@@ -141,21 +126,18 @@ void DataChannel::onSocketConnected() {
     m_socket->setSocketOption(QAbstractSocket::LowDelayOption, 1);
 
     ByteBuffer bb;
-    if (m_securityMode == DataPlaneSecurityMode::Secure) {
-        ByteBuffer inner;
-        inner.writeU32(m_peerId);
-        std::vector<uint8_t> enc = m_cipher.encrypt(inner.data(), inner.size());
-        uint8_t sid[4];
-        writeU32BE(sid, m_secureSessionId);
-        bb.writeBytes(sid, 4);
-        if (!enc.empty())
-            bb.writeBytes(enc.data(), enc.size());
-    } else if (m_securityMode == DataPlaneSecurityMode::Plaintext) {
-        bb.writeU32(m_peerId);
-    } else {
+    if (m_securityMode != DataPlaneSecurityMode::Secure) {
         m_socket->abort();
         return;
     }
+    ByteBuffer inner;
+    inner.writeU32(m_peerId);
+    std::vector<uint8_t> enc = m_cipher.encrypt(inner.data(), inner.size());
+    uint8_t sid[4];
+    writeU32BE(sid, m_secureSessionId);
+    bb.writeBytes(sid, 4);
+    if (!enc.empty())
+        bb.writeBytes(enc.data(), enc.size());
     sendMsg(MSG_DATA_CHANNEL_INIT, bb);
 
     LogManager::instance().logDetail(QString("[datachannel] TCP connected, sent DATA_CHANNEL_INIT for peer %1").arg(m_peerId));
@@ -309,14 +291,15 @@ bool DataChannel::processMessage(uint8_t msgType,
         case MSG_TCP_RELAY_DATA: {
             ByteBuffer bb(payload, len);
             const uint32_t srcId = bb.readU32();
-            bb.readU32();
+            const uint32_t dstId = bb.readU32();
             const TrafficClass cls =
                 static_cast<TrafficClass>(bb.readU8());
             const size_t dataLen = bb.remaining();
             const QByteArray data(
                 reinterpret_cast<const char*>(payload + len - dataLen),
                 static_cast<int>(dataLen));
-            emit relayDataReceived(srcId, cls, data);
+            if (dstId == m_peerId)
+                emit relayDataReceived(srcId, cls, data);
             return true;
         }
         case MSG_PONG:
@@ -373,8 +356,9 @@ void DataChannel::onReconnectTimer() {
 
 void DataChannel::sendMsg(uint8_t msgType, const ByteBuffer& body) {
     if (m_socket->state() != QAbstractSocket::ConnectedState ||
-        m_securityMode == DataPlaneSecurityMode::Unconfigured)
+        m_securityMode != DataPlaneSecurityMode::Secure)
         return;
+    if (body.size() > MAX_TCP_MSG_PAYLOAD) return;
 
     if (m_securityMode == DataPlaneSecurityMode::Secure &&
         msgType != MSG_DATA_CHANNEL_INIT) {
@@ -384,6 +368,7 @@ void DataChannel::sendMsg(uint8_t msgType, const ByteBuffer& body) {
         if (body.size() > 0)
             plain.insert(plain.end(), body.data(), body.data() + body.size());
         std::vector<uint8_t> enc = m_cipher.encrypt(plain.data(), plain.size());
+        if (enc.size() > MAX_TCP_MSG_PAYLOAD) return;
         TcpMsgHeader hdr;
         hdr.msgType = MSG_ENCRYPTED;
         hdr.length  = htons(static_cast<uint16_t>(enc.size()));

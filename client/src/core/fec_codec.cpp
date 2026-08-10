@@ -136,7 +136,7 @@ void FecEncoder::update(uint32_t) {
 // ─────────────────────── FecDecoder ───────────────────────
 
 FecDecoder::FecDecoder(OutputFunc output)
-    : m_cm256(sharedCM256()), m_output(output)
+    : m_cm256(sharedCM256()), m_output(output), m_bufferedBytes(0)
 {
 }
 
@@ -158,36 +158,55 @@ void FecDecoder::addPacket(const char* data, int len) {
     uint8_t N     = fh->dataCount;
     uint8_t total = fh->totalCount;
 
-    if (N == 0 || total < N) return;
+    if (N < 1 || N > 10 || total < N || total > 3 * N || idx >= total)
+        return;
 
     const char* blockData = data + sizeof(FecHeader);
     int blockLen = len - sizeof(FecHeader);
     if (blockLen <= 0) return;
 
-    FecGroup& g = m_groups[gid];
-    if (g.blocks.isEmpty()) {
-        g.dataCount  = N;
-        g.totalCount = total;
-        g.blockBytes = blockLen;
-        g.createTime = currentTimeMs();
-        g.decoded    = false;
+    QMap<uint8_t, FecGroup>::iterator groupIt = m_groups.find(gid);
+    if (groupIt != m_groups.end() &&
+        (groupIt->dataCount != N || groupIt->totalCount != total ||
+         groupIt->blockBytes != blockLen)) {
+        removeGroup(gid);
+        return;
+    }
+    if (groupIt == m_groups.end()) {
+        if (!ensureCapacity(static_cast<size_t>(blockLen), true)) return;
+        FecGroup group;
+        group.blocks.clear();
+        group.emittedOriginals.clear();
+        group.dataCount  = N;
+        group.totalCount = total;
+        group.blockBytes = blockLen;
+        group.createTime = currentTimeMs();
+        group.decoded    = false;
+        m_groups.insert(gid, group);
+        groupIt = m_groups.find(gid);
+        FecGroup& g = groupIt.value();
         if (g_verboseLog)
             LogManager::instance().logDetail(QString("[fec-dec] New group gid=%1 N=%2 total=%3 blockBytes=%4").arg(gid).arg(N).arg(total).arg(blockLen));
     }
+    if (groupIt->decoded) return;
 
-    if (g.decoded) return;
-
-    if (!g.blocks.contains(idx)) {
+    if (!groupIt->blocks.contains(idx)) {
+        if (!ensureCapacity(static_cast<size_t>(blockLen), false)) return;
+        groupIt = m_groups.find(gid);
+        if (groupIt == m_groups.end()) return;
         QByteArray block(blockData, blockLen);
-        if (block.size() < g.blockBytes)
-            block.append(QByteArray(g.blockBytes - block.size(), '\0'));
-        g.blocks[idx] = block;
+        groupIt->blocks[idx] = block;
+        m_bufferedBytes += static_cast<size_t>(block.size());
 
         if (idx < N) {
             emitOriginalBlock(block);
-            g.emittedOriginals.insert(idx);
+            groupIt->emittedOriginals.insert(idx);
         }
     }
+
+    groupIt = m_groups.find(gid);
+    if (groupIt == m_groups.end()) return;
+    FecGroup& g = groupIt.value();
 
     if (g_verboseLog)
         LogManager::instance().logDetail(QString("[fec-dec] addPacket gid=%1 idx=%2 received=%3/%4 emitted=%5").arg(gid).arg(idx).arg(g.blocks.size()).arg(g.dataCount).arg(g.emittedOriginals.size()));
@@ -294,8 +313,38 @@ void FecDecoder::cleanup(uint32_t nowMs) {
             if (!g.decoded)
                 LogManager::instance().logDetail(QString("[fec-dec] cleanup gid=%1 incomplete: received=%2/%3 emitted=%4").arg(gid).arg(g.blocks.size()).arg(g.dataCount).arg(g.emittedOriginals.size()));
         }
-        m_groups.remove(gid);
+        removeGroup(gid);
     }
+}
+
+void FecDecoder::removeGroup(uint8_t groupId) {
+    QMap<uint8_t, FecGroup>::iterator it = m_groups.find(groupId);
+    if (it == m_groups.end()) return;
+    size_t bytes = 0;
+    for (QMap<uint8_t, QByteArray>::const_iterator block =
+             it->blocks.constBegin(); block != it->blocks.constEnd(); ++block)
+        bytes += static_cast<size_t>(block.value().size());
+    m_bufferedBytes = bytes > m_bufferedBytes
+        ? 0 : m_bufferedBytes - bytes;
+    m_groups.erase(it);
+}
+
+bool FecDecoder::ensureCapacity(size_t incomingBytes, bool newGroup) {
+    if (incomingBytes > FEC_MAX_BUFFERED_BYTES) return false;
+    while (!m_groups.isEmpty() &&
+           ((newGroup && m_groups.size() >=
+               static_cast<int>(FEC_MAX_ACTIVE_GROUPS)) ||
+            m_bufferedBytes + incomingBytes > FEC_MAX_BUFFERED_BYTES)) {
+        QMap<uint8_t, FecGroup>::const_iterator oldest = m_groups.constBegin();
+        for (QMap<uint8_t, FecGroup>::const_iterator it = m_groups.constBegin();
+             it != m_groups.constEnd(); ++it) {
+            if (it->createTime < oldest->createTime) oldest = it;
+        }
+        removeGroup(oldest.key());
+    }
+    return (!newGroup || m_groups.size() <
+                static_cast<int>(FEC_MAX_ACTIVE_GROUPS)) &&
+           m_bufferedBytes + incomingBytes <= FEC_MAX_BUFFERED_BYTES;
 }
 
 } // namespace VLan

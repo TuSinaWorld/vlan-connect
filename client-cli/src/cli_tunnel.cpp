@@ -1,5 +1,6 @@
 #include "cli_tunnel.h"
 #include "cli_log.h"
+#include "overlay_packet_validator.h"
 #include <cstring>
 #include <vector>
 
@@ -8,6 +9,7 @@ namespace VLan {
 CliTunnelManager::CliTunnelManager()
     : m_tun(nullptr), m_udpFd(SOCK_INVALID), m_localUdpPort(0),
       m_serverIP(0), m_serverPort(0), m_myPeerId(0), m_myVirtualIP(0),
+      m_roomMtu(ROOM_MTU_DEFAULT),
       m_dataPlaneState(DataPlaneState::Stopped),
       m_securityMode(DataPlaneSecurityMode::Unconfigured),
       m_secureSessionId(0)
@@ -54,15 +56,6 @@ bool CliTunnelManager::initUdpSocket() {
 void CliTunnelManager::setServerEndpoint(uint32_t ip, uint16_t port) {
     m_serverIP = ip;
     m_serverPort = port;
-}
-
-void CliTunnelManager::configurePlaintextSession() {
-    if (!dataPlaneCanReconfigure(m_dataPlaneState)) {
-        LOG_ERR("[tunnel] Refusing to change security while data plane is running");
-        return;
-    }
-    clearSecurityContext();
-    m_securityMode = DataPlaneSecurityMode::Plaintext;
 }
 
 bool CliTunnelManager::installSecureSession(uint32_t sessionId, const Buffer& master) {
@@ -319,6 +312,9 @@ void CliTunnelManager::onUdpReadable() {
         if (!dataPlaneAllowsTraffic(m_dataPlaneState, m_securityMode)) {
             continue;
         }
+        if (ntohl(senderAddr.sin_addr.s_addr) != m_serverIP ||
+            ntohs(senderAddr.sin_port) != m_serverPort)
+            continue;
 
         uint8_t pktType = static_cast<uint8_t>(buf[0]);
         Buffer plain;
@@ -348,7 +344,12 @@ void CliTunnelManager::onUdpReadable() {
             if (n < static_cast<int>(sizeof(UdpRelayHeader))) break;
             const UdpRelayHeader* hdr = reinterpret_cast<const UdpRelayHeader*>(buf);
             uint32_t srcPeerId = ntohl(hdr->srcPeerId);
-            TrafficClass cls = hdr->trafficClass == TRAFFIC_TCP ? TRAFFIC_TCP : TRAFFIC_UDP;
+            uint32_t dstPeerId = ntohl(hdr->dstPeerId);
+            if (dstPeerId != m_myPeerId ||
+                (hdr->trafficClass != TRAFFIC_TCP &&
+                 hdr->trafficClass != TRAFFIC_UDP))
+                break;
+            TrafficClass cls = static_cast<TrafficClass>(hdr->trafficClass);
             auto it = m_kcpByPeerClass.find(tunnelKey(srcPeerId, cls));
             if (it != m_kcpByPeerClass.end()) {
                 const char* kcpData = buf + sizeof(UdpRelayHeader);
@@ -361,7 +362,12 @@ void CliTunnelManager::onUdpReadable() {
             if (n < static_cast<int>(sizeof(UdpRelayHeader) + sizeof(FragHeader))) break;
             const UdpRelayHeader* hdr = reinterpret_cast<const UdpRelayHeader*>(buf);
             uint32_t srcPeerId = ntohl(hdr->srcPeerId);
-            TrafficClass cls = hdr->trafficClass == TRAFFIC_TCP ? TRAFFIC_TCP : TRAFFIC_UDP;
+            uint32_t dstPeerId = ntohl(hdr->dstPeerId);
+            if (dstPeerId != m_myPeerId ||
+                (hdr->trafficClass != TRAFFIC_TCP &&
+                 hdr->trafficClass != TRAFFIC_UDP))
+                break;
+            TrafficClass cls = static_cast<TrafficClass>(hdr->trafficClass);
             auto it = m_rawByPeerClass.find(tunnelKey(srcPeerId, cls));
             if (it != m_rawByPeerClass.end()) {
                 const char* fragData = buf + sizeof(UdpRelayHeader);
@@ -391,7 +397,9 @@ void CliTunnelManager::routeFromTun(const Buffer& ipPacket) {
     if (!dataPlaneAllowsTraffic(m_dataPlaneState, m_securityMode)) {
         return;
     }
-    if (ipPacket.size() < 20) return;
+    if (!validateOutboundOverlayIpv4(ipPacket.data(), ipPacket.size(),
+                                     m_roomMtu, m_myVirtualIP).isValid())
+        return;
     uint32_t dstIP = extractDstIP(ipPacket.data(), ipPacket.size());
 
     if (isBroadcast(dstIP) || dstIP == VNET_BROADCAST) {
@@ -403,19 +411,24 @@ void CliTunnelManager::routeFromTun(const Buffer& ipPacket) {
     }
 }
 
-void CliTunnelManager::routeToTun(const Buffer& ipPacket) {
+void CliTunnelManager::routeToTun(uint32_t peerId, const Buffer& ipPacket) {
     if (!dataPlaneAllowsTraffic(m_dataPlaneState, m_securityMode)) {
         return;
     }
+    CliPeerConnection* peer = peerById(peerId);
+    if (!peer || !validateInboundOverlayIpv4(
+            ipPacket.data(), ipPacket.size(), m_roomMtu,
+            peer->virtualIP(), m_myVirtualIP).isValid())
+        return;
     if (m_tun) m_tun->writePacket(ipPacket);
 }
 
-void CliTunnelManager::onPeerDataReceived(uint32_t, const Buffer& ipPacket) {
+void CliTunnelManager::onPeerDataReceived(uint32_t peerId, const Buffer& ipPacket) {
     if (m_dataPlaneState != DataPlaneState::Running ||
         m_securityMode == DataPlaneSecurityMode::Unconfigured) {
         return;
     }
-    routeToTun(ipPacket);
+    routeToTun(peerId, ipPacket);
 }
 
 void CliTunnelManager::updateKcp() {

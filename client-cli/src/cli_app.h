@@ -9,6 +9,8 @@
 #include <thread>
 #include <string>
 #include <set>
+#include <memory>
+#include <csignal>
 
 namespace VLan {
 
@@ -33,7 +35,7 @@ public:
     void setPlayerName(const std::string& name);
     void setVerbose(bool v);
 
-    int run();
+    int run(const volatile sig_atomic_t* stopRequested = nullptr);
     void requestStop();
 
 private:
@@ -74,8 +76,27 @@ private:
     void onLogoutAck();
     void onTransportDead(uint32_t peerId, TrafficClass cls);
 
-    void setupTun();
+    enum class TunSetupStage {
+        None,
+        Initialize,
+        Address,
+        Session,
+        DataPlane
+    };
+    struct TunSetupResult {
+        bool success;
+        TunSetupStage stage;
+        std::string error;
+        TunSetupResult(bool ok = true,
+                       TunSetupStage failedStage = TunSetupStage::None,
+                       const std::string& text = std::string())
+            : success(ok), stage(failedStage), error(text) {}
+    };
+    TunSetupResult setupTun();
     void teardownTun();
+    void rollbackRoomAfterTunFailure(const TunSetupResult& result);
+    void handleTunRuntimeFailure(const std::string& error);
+    void resetRoomRuntimeState(bool clearSavedRoom);
     void setupRelayTunnel(uint32_t peerId, TrafficClass cls);
     void setupRawUdpRelayTunnel(uint32_t peerId, TrafficClass cls);
     void setupTcpRelayTunnel(uint32_t peerId, TrafficClass cls);
@@ -95,7 +116,29 @@ private:
                              uint32_t virtualIP, const Buffer& token);
     void clearResumeLease();
 
-    void stdinReadLoop();
+    struct StdinReaderState {
+        std::atomic<bool> running;
+#ifdef _WIN32
+        void* stopEvent;
+#else
+        int stopPipe[2];
+#endif
+        StdinReaderState() : running(false)
+#ifdef _WIN32
+            , stopEvent(nullptr)
+#endif
+        {
+#ifndef _WIN32
+            stopPipe[0] = -1;
+            stopPipe[1] = -1;
+#endif
+        }
+    };
+    static void stdinReadLoop(
+        const std::shared_ptr<StdinReaderState>& state,
+        ThreadSafeQueue<std::string>* queue);
+    bool startStdinReader();
+    void stopStdinReader();
 
     std::string   m_serverHost;
     std::string   m_resolvedIP;
@@ -119,6 +162,8 @@ private:
     std::atomic<bool> m_running;
     ThreadSafeQueue<std::string> m_cmdQueue;
     std::thread   m_stdinThread;
+    std::shared_ptr<StdinReaderState> m_stdinState;
+    const volatile sig_atomic_t* m_stopRequested;
 
     uint32_t m_lastPingTime;
     uint32_t m_lastKcpUpdateTime;
@@ -127,7 +172,7 @@ private:
     uint32_t m_lastLatencyCheckTime;
     uint32_t m_lastDataChannelPingTime;
 
-    static const int MAX_RECONNECT_ATTEMPTS = 3;
+    static const int MAX_RECONNECT_ATTEMPTS = 5;
 
     bool          m_wantReconnect;
     int           m_reconnectAttempts;
@@ -137,6 +182,7 @@ private:
     bool          m_manualDisconnecting;
     bool          m_logoutPending;
     bool          m_exitAfterDisconnect;
+    bool          m_roomReady;
     uint32_t      m_logoutDeadline;
     bool          m_hasResumeLease;
     uint32_t      m_resumeRoomId;

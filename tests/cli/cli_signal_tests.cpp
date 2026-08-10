@@ -1,5 +1,6 @@
 #include "../../common/byte_buffer.h"
 #include "../../common/signal_message_validator.h"
+#include "cli_common.h"
 #include "../support/frame_test_utils.h"
 #include <cassert>
 #include <vector>
@@ -7,19 +8,19 @@
 using namespace VLan;
 using namespace VLanTest;
 
-static void testVersionSevenOnly() {
-    std::vector<uint8_t> v7;
-    v7.push_back(0);
-    v7.push_back(static_cast<uint8_t>(PROTOCOL_VERSION));
-    v7.push_back(0);
+static void testVersionEightOnly() {
+    std::vector<uint8_t> v8(2 + 1 + 16 + 32, 0);
+    v8[0] = static_cast<uint8_t>(PROTOCOL_VERSION >> 8);
+    v8[1] = static_cast<uint8_t>(PROTOCOL_VERSION);
+    v8[2] = 1;
     assert(validateServerSignalPayload(
-        MSG_SERVER_HELLO, v7.data(), v7.size()).isValid());
+        MSG_SERVER_HELLO, v8.data(), v8.size()).isValid());
 
-    std::vector<uint8_t> v6 = v7;
-    v6[1] = static_cast<uint8_t>(PROTOCOL_VERSION - 1);
+    std::vector<uint8_t> v7 = v8;
+    v7[1] = static_cast<uint8_t>(PROTOCOL_VERSION - 1);
     const MessageValidationResult old =
         validateServerSignalPayload(
-            MSG_SERVER_HELLO, v6.data(), v6.size());
+            MSG_SERVER_HELLO, v7.data(), v7.size());
     assert(old.status == MessageValidationStatus::Malformed);
     assert(old.error == MessageValidationError::InvalidVersion);
 }
@@ -72,10 +73,27 @@ static void testSignalRelayFallbackPayload() {
     assert(parsed.remaining() == sizeof(packet));
 }
 
+static void testProductionTcpSendLimit() {
+    TcpConnection connection;
+    std::vector<uint8_t> payload(MAX_TCP_MSG_PAYLOAD, 0xaa);
+    ByteBuffer atLimit;
+    atLimit.writeBytes(payload.data(), payload.size());
+    assert(connection.sendTcpMsg(MSG_ERROR, atLimit));
+    const size_t queuedAtLimit = connection.sendBuf.size();
+    assert(queuedAtLimit == sizeof(TcpMsgHeader) + MAX_TCP_MSG_PAYLOAD);
+
+    payload.push_back(0xbb);
+    ByteBuffer oversized;
+    oversized.writeBytes(payload.data(), payload.size());
+    assert(!connection.sendTcpMsg(MSG_ERROR, oversized));
+    assert(connection.sendBuf.size() == queuedAtLimit);
+}
+
 int main() {
-    testVersionSevenOnly();
+    testVersionEightOnly();
     testBatchExtractionAndUnknownMessage();
     testOversizedHeader();
     testSignalRelayFallbackPayload();
+    testProductionTcpSendLimit();
     return 0;
 }

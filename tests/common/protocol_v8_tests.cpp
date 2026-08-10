@@ -1,6 +1,7 @@
 #include "../../common/byte_buffer.h"
 #include "../../common/secure_frame.h"
 #include "../../common/signal_message_validator.h"
+#include <cstring>
 #include <cstdio>
 #include <utility>
 #include <vector>
@@ -50,7 +51,9 @@ void writeDefaultPolicy(ByteBuffer* body, bool tcpPolicy) {
 void testServerHello() {
     ByteBuffer hello;
     hello.writeU16(PROTOCOL_VERSION);
-    hello.writeU8(0);
+    hello.writeU8(1);
+    uint8_t handshake[48] = {};
+    hello.writeBytes(handshake, sizeof(handshake));
     expectSignalValid("server hello", MSG_SERVER_HELLO, hello);
 
     for (size_t len = 0; len < hello.size(); ++len) {
@@ -60,7 +63,8 @@ void testServerHello() {
 
     ByteBuffer oldVersion;
     oldVersion.writeU16(PROTOCOL_VERSION - 1);
-    oldVersion.writeU8(0);
+    oldVersion.writeU8(1);
+    oldVersion.writeBytes(handshake, sizeof(handshake));
     MessageValidationResult oldResult = validateServerSignalPayload(
         MSG_SERVER_HELLO, bytes(oldVersion), oldVersion.size());
     expectStatus("old protocol version", oldResult,
@@ -79,7 +83,6 @@ void testServerHello() {
     ByteBuffer authenticated;
     authenticated.writeU16(PROTOCOL_VERSION);
     authenticated.writeU8(1);
-    uint8_t handshake[48] = {};
     authenticated.writeBytes(handshake, sizeof(handshake));
     expectSignalValid("authenticated server hello",
                       MSG_SERVER_HELLO, authenticated);
@@ -140,6 +143,9 @@ void testRoomMessages() {
                           truncated.data(), truncated.size());
 
     ByteBuffer roomList;
+    roomList.writeU64(9);
+    roomList.writeU16(0);
+    roomList.writeU16(1);
     roomList.writeU16(1);
     roomList.writeU32(100);
     roomList.writeString("Room");
@@ -150,6 +156,33 @@ void testRoomMessages() {
     roomList.writeU8(0);
     roomList.writeU16(ROOM_MTU_DEFAULT);
     expectSignalValid("room list", MSG_ROOM_LIST, roomList);
+
+    ByteBuffer duplicate;
+    duplicate.writeU64(9);
+    duplicate.writeU16(0);
+    duplicate.writeU16(1);
+    duplicate.writeU16(2);
+    duplicate.writeBytes(roomList.data() + 14, roomList.size() - 14);
+    duplicate.writeBytes(roomList.data() + 14, roomList.size() - 14);
+    expectSignalMalformed("duplicate room list id", MSG_ROOM_LIST,
+                          bytes(duplicate), duplicate.size());
+
+    ByteBuffer delta;
+    delta.writeU64(9);
+    delta.writeU64(10);
+    delta.writeU16(2);
+    delta.writeU8(ROOM_LIST_UPSERT);
+    delta.writeBytes(roomList.data() + 14, roomList.size() - 14);
+    delta.writeU8(ROOM_LIST_REMOVE);
+    delta.writeU32(101);
+    expectSignalValid("room list delta", MSG_ROOM_LIST_PUSH, delta);
+
+    ByteBuffer emptyDelta;
+    emptyDelta.writeU64(10);
+    emptyDelta.writeU64(11);
+    emptyDelta.writeU16(0);
+    expectSignalMalformed("empty room list delta", MSG_ROOM_LIST_PUSH,
+                          bytes(emptyDelta), emptyDelta.size());
 }
 
 void testDataMessages() {
@@ -185,6 +218,13 @@ void testDataMessages() {
 }
 
 void testByteBufferReadError() {
+    ByteBuffer wide;
+    wide.writeU64(UINT64_C(0x0102030405060708));
+    if (wide.readU64() != UINT64_C(0x0102030405060708) || !wide.atEnd()) {
+        std::fprintf(stderr, "ByteBuffer u64 round trip failed\n");
+        ++g_failures;
+    }
+
     ByteBuffer empty(static_cast<const uint8_t*>(nullptr), 0);
     if (empty.size() != 0) {
         std::fprintf(stderr, "Empty null ByteBuffer was not empty\n");
@@ -216,6 +256,92 @@ void testByteBufferReadError() {
     }
 }
 
+void* failAllocation(size_t) {
+    return nullptr;
+}
+
+void ignoreDeallocation(void*) {}
+
+bool failRandom(uint8_t* out, size_t len) {
+    if (out && len) out[0] = 0xff;
+    return false;
+}
+
+void testInjectedCryptoFailures() {
+    uint8_t output[CIPHER_KEY_SIZE];
+    std::memset(output, 0xff, sizeof(output));
+    const uint8_t password[] = { '1','2','3','4','5','6','7','8' };
+    if (computeIntermediateWithAllocator(
+            password, sizeof(password), output,
+            &failAllocation, &ignoreDeallocation)) {
+        std::fprintf(stderr, "Injected KDF allocation failure was ignored\n");
+        ++g_failures;
+    }
+    for (size_t i = 0; i < sizeof(output); ++i) {
+        if (output[i] != 0) {
+            std::fprintf(stderr, "KDF failure did not clear output\n");
+            ++g_failures;
+            break;
+        }
+    }
+
+    std::memset(output, 0xff, sizeof(output));
+    if (secureRandomBytesWithProvider(
+            output, sizeof(output), &failRandom)) {
+        std::fprintf(stderr, "Injected RNG failure was ignored\n");
+        ++g_failures;
+    }
+    for (size_t i = 0; i < sizeof(output); ++i) {
+        if (output[i] != 0) {
+            std::fprintf(stderr, "RNG failure did not clear output\n");
+            ++g_failures;
+            break;
+        }
+    }
+}
+
+void testRoomListPayloadBoundaries() {
+    ByteBuffer page;
+    page.writeU64(1);
+    page.writeU16(0);
+    page.writeU16(1);
+    page.writeU16(750);
+    for (uint32_t i = 0; i < 750; ++i) {
+        page.writeU32(i + 1);
+        page.writeString(std::string(i < 749 ? 63 : 49, 'R'));
+        page.writeU8(1);
+        page.writeU8(MAX_PLAYERS);
+        writeDefaultPolicy(&page, true);
+        writeDefaultPolicy(&page, false);
+        page.writeU8(0);
+        page.writeU16(ROOM_MTU_DEFAULT);
+    }
+    if (page.size() != ROOM_LIST_PAGE_PAYLOAD) {
+        std::fprintf(stderr, "Room-list boundary fixture has size %zu\n",
+                     page.size());
+        ++g_failures;
+        return;
+    }
+    const MessageValidationResult atLimitResult =
+        validateServerSignalPayload(MSG_ROOM_LIST,
+                                    page.data(), page.size());
+    if (atLimitResult.status != MessageValidationStatus::Valid) {
+        std::fprintf(stderr, "Valid 60,000-byte room-list page was rejected\n");
+        ++g_failures;
+    }
+
+    std::vector<uint8_t> oversized(page.data(), page.data() + page.size());
+    oversized.push_back(0);
+    const MessageValidationResult oversizedResult =
+        validateServerSignalPayload(MSG_ROOM_LIST, oversized.data(),
+                                    oversized.size());
+    if (oversizedResult.status != MessageValidationStatus::Malformed ||
+        oversizedResult.offset != ROOM_LIST_PAGE_PAYLOAD) {
+        std::fprintf(stderr, "Room-list payload limit was not enforced\n");
+        ++g_failures;
+    }
+}
+
 void expectAllPrefixesAndTailMalformed(
     const char* name, uint8_t type, const ByteBuffer& body)
 {
@@ -235,7 +361,9 @@ void testAllKnownSignalShapes() {
 
     ByteBuffer hello;
     hello.writeU16(PROTOCOL_VERSION);
-    hello.writeU8(0);
+    hello.writeU8(1);
+    uint8_t helloHandshake[48] = {};
+    hello.writeBytes(helloHandshake, sizeof(helloHandshake));
     messages.push_back(std::make_pair(MSG_SERVER_HELLO, hello));
 
     ByteBuffer authOk;
@@ -293,6 +421,9 @@ void testAllKnownSignalShapes() {
     messages.push_back(std::make_pair(MSG_PONG, empty));
 
     ByteBuffer roomList;
+    roomList.writeU64(1);
+    roomList.writeU16(0);
+    roomList.writeU16(1);
     roomList.writeU16(1);
     roomList.writeU32(1);
     roomList.writeString("Room");
@@ -303,7 +434,14 @@ void testAllKnownSignalShapes() {
     roomList.writeU8(0);
     roomList.writeU16(ROOM_MTU_DEFAULT);
     messages.push_back(std::make_pair(MSG_ROOM_LIST, roomList));
-    messages.push_back(std::make_pair(MSG_ROOM_LIST_PUSH, roomList));
+
+    ByteBuffer roomPush;
+    roomPush.writeU64(1);
+    roomPush.writeU64(2);
+    roomPush.writeU16(1);
+    roomPush.writeU8(ROOM_LIST_UPSERT);
+    roomPush.writeBytes(roomList.data() + 14, roomList.size() - 14);
+    messages.push_back(std::make_pair(MSG_ROOM_LIST_PUSH, roomPush));
 
     ByteBuffer challenge;
     challenge.writeBytes(proof, sizeof(proof));
@@ -352,13 +490,15 @@ int main() {
     testRoomMessages();
     testDataMessages();
     testByteBufferReadError();
+    testInjectedCryptoFailures();
+    testRoomListPayloadBoundaries();
     testAllKnownSignalShapes();
 
     if (g_failures != 0) {
-        std::fprintf(stderr, "protocol_v7_tests: %d failure(s)\n",
+        std::fprintf(stderr, "protocol_v8_tests: %d failure(s)\n",
                      g_failures);
         return 1;
     }
-    std::fprintf(stdout, "protocol_v7_tests: ok\n");
+    std::fprintf(stdout, "protocol_v8_tests: ok\n");
     return 0;
 }

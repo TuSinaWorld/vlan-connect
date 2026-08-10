@@ -170,14 +170,25 @@ void CliTunAdapter::readLoop() {
         if (waitResult == WAIT_TIMEOUT) continue;
         if (waitResult == WAIT_FAILED) {
             LOG_ERR("Wintun read wait failed (error %lu)", GetLastError());
+            m_errorQueue.push("Wintun read wait failed");
             break;
         }
-        if (waitResult != WAIT_OBJECT_0) break;
+        if (waitResult != WAIT_OBJECT_0) {
+            m_errorQueue.push("Wintun read session became invalid");
+            break;
+        }
 
         while (m_running) {
             DWORD packetSize = 0;
             BYTE* packet = m_fnReceivePacket(m_session, &packetSize);
-            if (!packet) break;
+            if (!packet) {
+                const DWORD error = GetLastError();
+                if (error != ERROR_NO_MORE_ITEMS) {
+                    m_errorQueue.push("WintunReceivePacket failed");
+                    m_running = false;
+                }
+                break;
+            }
             Buffer received(packet, packet + packetSize);
             m_fnReleaseReceivePacket(m_session, packet);
             if (!m_running) break;

@@ -6,6 +6,7 @@
 #include <QTimer>
 #include <QByteArray>
 #include <QHostAddress>
+#include <QMap>
 #include "protocol.h"
 #include "payload_cipher.h"
 #include "secure_frame.h"
@@ -33,6 +34,7 @@ public:
     bool secureEnabled() const { return m_secureReady; }
     uint32_t secureSessionId() const { return m_secureSessionId; }
     const QByteArray& secureMaster() const { return m_secureMaster; }
+    QHostAddress peerAddress() const { return m_socket->peerAddress(); }
 
     void setServerPassword(const QString& password);
     void continueServerAuth();
@@ -84,6 +86,7 @@ signals:
     void peerResumed(PeerInfo info);
     void peerLeft(uint32_t peerId);
     void roomList(QList<RoomListItem> rooms);
+    void roomListResyncRequired();
     void relayReady(uint32_t peerId);
     void relayDataReceived(uint32_t srcPeerId,
                            VLan::TrafficClass cls,
@@ -103,6 +106,7 @@ private slots:
     void onRecvTimeoutCheck();
 
 private:
+    void createSocket();
     void sendMsg(uint8_t msgType, const ByteBuffer& body);
     void sendMsg(uint8_t msgType);
     bool processMessage(uint8_t msgType, const uint8_t* payload, size_t len);
@@ -112,6 +116,9 @@ private:
     void handleStreamCorruption();
     void handleMalformedFrame(uint8_t msgType, size_t len,
                               const char* error, size_t offset);
+    RoomListItem readRoomListItem(ByteBuffer& bb);
+    void resetRoomListState();
+    void emitCurrentRoomList();
 
     QTcpSocket* m_socket;
     QTimer*     m_pingTimer;
@@ -137,6 +144,12 @@ private:
     uint8_t     m_serverPubKey[32];
     QByteArray  m_secureMaster;
     SecureFrameCipher m_secureCipher;
+    uint64_t    m_roomListRevision;
+    uint64_t    m_snapshotRevision;
+    uint16_t    m_snapshotPageCount;
+    uint16_t    m_snapshotNextPage;
+    QMap<uint32_t, RoomListItem> m_roomListCache;
+    QMap<uint32_t, RoomListItem> m_snapshotRooms;
 };
 
 } // namespace VLan

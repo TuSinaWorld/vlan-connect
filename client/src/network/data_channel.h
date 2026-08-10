@@ -20,7 +20,6 @@ public:
     void connectToServer(const QString& host, quint16 port, uint32_t peerId);
     void disconnect();
     bool isConnected() const;
-    void configurePlaintextSession();
     bool installSecureSession(uint32_t sessionId, const QByteArray& master);
     void clearSecurityContext();
     DataPlaneSecurityMode securityMode() const { return m_securityMode; }

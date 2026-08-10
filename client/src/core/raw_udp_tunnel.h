@@ -73,6 +73,8 @@ private:
     void sendLatencyPing();
     void sendLatencyPong(const char* timestampData);
     void cleanupStaleEntries();
+    void removeReassemblyEntry(uint16_t msgId);
+    bool ensureReassemblyCapacity(size_t incomingBytes, bool newMessage);
     int  maxFragmentPayload() const;
 
     QUdpSocket*   m_socket;
@@ -91,6 +93,7 @@ private:
     bool     m_dead;
 
     QMap<uint16_t, ReassemblyEntry> m_reassembly;
+    size_t m_reassemblyBytes;
 
     FecMode      m_fecMode;
     FecEncoder*  m_fecEncoder;

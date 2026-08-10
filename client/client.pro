@@ -73,6 +73,8 @@ HEADERS += \
     ../common/msvc2015_compat.h \
     ../common/payload_cipher.h \
     ../common/secure_frame.h \
+    ../common/signal_message_validator.h \
+    ../common/overlay_packet_validator.h \
     ../3rdparty/monocypher/monocypher.h
 
 RESOURCES += resources/resources.qrc

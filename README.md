@@ -22,7 +22,8 @@ VLan 是一个虚拟局域网联机工具。它由 Linux 中继服务端、Windo
 - 房间设置: 房间名、最大人数、房间密码、MTU。
 - MTU 选项: `1280`、`1400`、`1420`，程序内部会扣除传输开销。
 - 房间密码只用于加入房间校验，不参与传输加密。
-- 服务端鉴权密码是可选的。启用后，信令、TCP Relay data channel、UDP relay frame 和 TUN payload 会在鉴权后加密传输。
+- 服务端鉴权是强制要求。信令、TCP Relay data channel、UDP relay frame 和 TUN payload 只在完成鉴权并建立安全会话后传输；GUI/CLI 会拒绝未要求鉴权的服务端。
+- 服务端、GUI 和 CLI 仅支持协议 v8，必须作为同一版本批次发布。
 
 ## 目录结构
 
@@ -43,17 +44,15 @@ cd server
 make
 ```
 
-前台运行，不启用服务端鉴权:
-
-```bash
-./vlan-server -p 11510
-```
-
-前台运行，启用服务端鉴权:
+前台运行（`--auth-file` 必填）:
 
 ```bash
 ./vlan-server -p 11510 --auth-file /path/to/password.txt
 ```
+
+密码文件只允许第一行密码及后续空行，密码必须为 8–256 字节，不能包含 NUL，也不能全部为空白。服务端不再接受 `--auth` 或服务端密码环境变量。
+
+容量参数 `--max-clients`、`--max-pending`、`--max-rooms`、`--max-clients-per-ip`、`--max-pending-per-ip` 和 `--max-send-buffer-mb` 只能从内置硬上限向下调整；完整说明见部署文档。
 
 服务端端口:
 
@@ -82,7 +81,7 @@ GUI 客户端会在本机用户配置中保存语言、默认服务器地址、�
 启动示例:
 
 ```bash
-vlan-cli -s 127.0.0.1 -p 11510 -n Player1
+vlan-cli -s 127.0.0.1 -p 11510 -n Player1 --auth-file ./auth.password
 ```
 
 ## 许可证与第三方组件

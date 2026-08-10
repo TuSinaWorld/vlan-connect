@@ -255,9 +255,6 @@ MainWindow::MainWindow(QWidget* parent)
             this, &MainWindow::onErrorOccurred);
     connect(m_roomMgr, &RoomManager::tunSpeedUpdated,
             this, &MainWindow::onTunSpeedUpdated);
-    connect(m_roomMgr->signalClient(), &SignalClient::connectFailed,
-            this, &MainWindow::onConnectFailed);
-
     setRoomControlsEnabled(false);
     refreshDashboardState();
     updateTrayState();
@@ -429,7 +426,7 @@ void MainWindow::setupUI() {
         connect(m_settingsServerEdit, &QLineEdit::editingFinished, this, [this]() {
             AppSettings::setDefaultServerHost(m_settingsServerEdit->text());
             if (m_serverEdit && !m_roomMgr->signalClient()->isConnected() &&
-                !m_roomMgr->signalClient()->isConnecting()) {
+                !m_roomMgr->isConnecting()) {
                 m_serverEdit->setText(settingsEndpointText());
             }
         });
@@ -439,7 +436,7 @@ void MainWindow::setupUI() {
                 this, [this](int value) {
             AppSettings::setDefaultServerPort(static_cast<quint16>(value));
             if (m_serverEdit && !m_roomMgr->signalClient()->isConnected() &&
-                !m_roomMgr->signalClient()->isConnecting()) {
+                !m_roomMgr->isConnecting()) {
                 m_serverEdit->setText(settingsEndpointText());
             }
         });
@@ -448,7 +445,7 @@ void MainWindow::setupUI() {
         connect(m_settingsNameEdit, &QLineEdit::editingFinished, this, [this]() {
             AppSettings::setDefaultPlayerName(m_settingsNameEdit->text());
             if (m_nameEdit && !m_roomMgr->signalClient()->isConnected() &&
-                !m_roomMgr->signalClient()->isConnecting()) {
+                !m_roomMgr->isConnecting()) {
                 m_nameEdit->setText(m_settingsNameEdit->text().trimmed());
             }
         });
@@ -964,7 +961,7 @@ void MainWindow::updateTrayState()
     }
 
     bool connected = m_roomMgr && m_roomMgr->signalClient()->isConnected();
-    bool connecting = m_roomMgr && m_roomMgr->signalClient()->isConnecting();
+    bool connecting = m_roomMgr && m_roomMgr->isConnecting();
     bool inRoom = m_roomMgr && m_roomMgr->inRoom();
 
     QString stateText;
@@ -1006,7 +1003,7 @@ void MainWindow::refreshDashboardState()
     }
 
     bool connected = m_roomMgr->signalClient()->isConnected();
-    bool connecting = m_roomMgr->signalClient()->isConnecting();
+    bool connecting = m_roomMgr->isConnecting();
     bool inRoom = m_roomMgr->inRoom();
 
     if (m_dashConnectionLabel) {
@@ -1105,7 +1102,7 @@ void MainWindow::quitProgram()
         m_trayIcon->hide();
     }
     if (m_roomMgr->signalClient()->isConnected() ||
-        m_roomMgr->signalClient()->isConnecting()) {
+        m_roomMgr->isConnecting()) {
         m_roomMgr->disconnectFromServer();
         QTimer::singleShot(1200, this, [this]() {
             if (m_quitRequested)
@@ -1125,7 +1122,7 @@ void MainWindow::finishProgramQuit()
 
 void MainWindow::onConnectClicked() {
     if (m_roomMgr->signalClient()->isConnected() ||
-        m_roomMgr->signalClient()->isConnecting()) {
+        m_roomMgr->isConnecting()) {
         m_roomMgr->disconnectFromServer();
         onConnectionStatusChanged(false);
         updateTrayState();
@@ -1486,7 +1483,7 @@ void MainWindow::applyLanguage()
             .arg(formatSpeed(m_lastDownloadRate)));
     }
     bool connected = m_roomMgr && m_roomMgr->signalClient()->isConnected();
-    bool connecting = m_roomMgr && m_roomMgr->signalClient()->isConnecting();
+    bool connecting = m_roomMgr && m_roomMgr->isConnecting();
     updateConnectButton(connected);
     if (connecting && m_connectBtn)
         m_connectBtn->setText(UiStrings::text("login.cancel"));

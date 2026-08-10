@@ -48,11 +48,12 @@ public:
     void leaveRoom();
     void refreshRoomList();
 
-    bool inRoom() const { return m_currentRoomId != 0; }
+    bool inRoom() const { return m_roomReady; }
     uint32_t currentRoomId() const { return m_currentRoomId; }
     uint32_t myVirtualIP()   const { return m_myVirtualIP; }
     uint32_t myPeerId()      const;
     uint16_t roomMtu()       const { return m_roomMtu; }
+    bool isConnecting() const;
 
     SignalClient*  signalClient()  { return m_signal; }
     TunnelManager* tunnelManager() { return m_tunnel; }
@@ -99,6 +100,8 @@ private slots:
     void onLogoutAck();
     void onSecureSessionEstablished(uint32_t sessionId, QByteArray master);
     void onHostResolved(const QHostInfo& hostInfo);
+    void onSignalConnectFailed(QString reason);
+    void onTunRuntimeError(QString message);
 
 private slots:
     void onTcpRelayHealthCheck();
@@ -112,8 +115,26 @@ private slots:
 private:
     void resolveAndConnect();
     void proceedWithConnection();
-    void setupTun();
+    enum class TunSetupStage {
+        None,
+        Initialize,
+        Address,
+        Session,
+        DataPlane
+    };
+    struct TunSetupResult {
+        bool success;
+        TunSetupStage stage;
+        QString error;
+        TunSetupResult(bool ok = true,
+                       TunSetupStage failedStage = TunSetupStage::None,
+                       const QString& text = QString())
+            : success(ok), stage(failedStage), error(text) {}
+    };
+    TunSetupResult setupTun();
     void teardownTun();
+    void rollbackRoomAfterTunFailure(const TunSetupResult& result);
+    void resetRoomRuntimeState(bool clearSavedRoom);
     void setupRelayTunnel(uint32_t peerId, TrafficClass cls);
     void setupRawUdpRelayTunnel(uint32_t peerId, TrafficClass cls);
     void setupTcpRelayTunnel(uint32_t peerId, TrafficClass cls);
@@ -122,6 +143,9 @@ private:
     void onTransportDead(uint32_t peerId, TrafficClass cls);
     void handleReconnectRoomList(QList<VLan::RoomListItem> rooms);
     void scheduleReconnectAttempt();
+    void cancelConnectionAttempt();
+    void tryNextResolvedAddress();
+    void handleConnectionAttemptExhausted(const QString& reason);
     void finishManualDisconnect();
     void rebuildPeerTransports(uint32_t peerId);
     void startResumeLeaseDeadline();
@@ -149,6 +173,17 @@ private:
 
     QString      m_serverHost;
     QHostAddress m_resolvedAddr;
+    QList<QHostAddress> m_resolvedCandidates;
+    int          m_resolvedCandidateIndex;
+    int          m_lookupId;
+    quint64      m_connectionGeneration;
+    enum class ConnectionPhase {
+        Idle,
+        Resolving,
+        Connecting,
+        Connected
+    };
+    ConnectionPhase m_connectionPhase;
     quint16  m_port;
     QString  m_playerName;
     QString  m_serverPassword;
@@ -168,13 +203,16 @@ private:
     bool          m_roomPasswordProtected;
     QString       m_roomPassword;
 
-    static const int MAX_RECONNECT_ATTEMPTS = 3;
+    static const int MAX_RECONNECT_ATTEMPTS = 5;
     bool          m_wantReconnect;
     int           m_reconnectAttempts;
     bool          m_wasInRoom;
     bool          m_pendingResumeRoom;
     bool          m_manualDisconnecting;
     bool          m_logoutPending;
+    bool          m_reconnectScheduled;
+    bool          m_roomReady;
+    bool          m_tearingDownTun;
     bool          m_hasResumeLease;
     uint32_t      m_resumeRoomId;
     uint32_t      m_resumePeerId;

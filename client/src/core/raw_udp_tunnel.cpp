@@ -24,6 +24,7 @@ RawUdpTunnel::RawUdpTunnel(QUdpSocket* socket,
       m_relayMode(false), m_relaySrcPeerId(0), m_relayDstPeerId(0),
       m_trafficClass(trafficClass),
       m_nextMsgId(0), m_dead(false),
+      m_reassemblyBytes(0),
       m_fecMode(fecMode), m_fecEncoder(nullptr), m_fecDecoder(nullptr),
       m_roomMtu(normalizeRoomMtu(mtu)),
       m_secureFrames(secureFrames),
@@ -48,13 +49,14 @@ RawUdpTunnel::~RawUdpTunnel() {
 
 int RawUdpTunnel::send(const QByteArray& ipPacket) {
     if (ipPacket.isEmpty()) return 0;
+    if (ipPacket.size() > static_cast<int>(m_roomMtu)) return -1;
 
     uint16_t msgId = m_nextMsgId++;
     int totalLen = ipPacket.size();
     int maxPayload = maxFragmentPayload();
 
     int fragTotal = (totalLen + maxPayload - 1) / maxPayload;
-    if (fragTotal > 256) {
+    if (fragTotal <= 0 || fragTotal > 255) {
         LogManager::instance().logError(QString("[raw_udp] Packet too large to fragment: %1 maxPayload=%2").arg(totalLen).arg(maxPayload));
         return -1;
     }
@@ -150,7 +152,19 @@ void RawUdpTunnel::processFrag(const char* data, int len) {
     const char* payload = data + sizeof(FragHeader);
     int payloadLen = len - sizeof(FragHeader);
 
-    if (payloadLen <= 0) return;
+    if (payloadLen <= 0 || fragTotal == 0 || fragIndex >= fragTotal ||
+        totalLen == 0 || totalLen > m_roomMtu)
+        return;
+    const int maxPayload = maxFragmentPayload();
+    const int expectedTotal =
+        (static_cast<int>(totalLen) + maxPayload - 1) / maxPayload;
+    if (expectedTotal != fragTotal)
+        return;
+    const int expectedLength = fragIndex + 1 == fragTotal
+        ? static_cast<int>(totalLen) - maxPayload * (fragTotal - 1)
+        : maxPayload;
+    if (payloadLen != expectedLength)
+        return;
 
     if (fragTotal == 1 && payloadLen == 1 && payload[0] == RAW_UDP_KEEPALIVE_MARKER
         && totalLen == 1) {
@@ -178,39 +192,61 @@ void RawUdpTunnel::processFrag(const char* data, int len) {
     if (fragTotal == 1) {
         if (g_verboseLog)
             LogManager::instance().logDetail(QString("[raw_udp] processFrag single-frag msgId=%1 payloadLen=%2").arg(msgId).arg(payloadLen));
-        emit dataReceived(QByteArray(payload, payloadLen));
+        if (payloadLen == totalLen)
+            emit dataReceived(QByteArray(payload, payloadLen));
         return;
     }
 
     if (g_verboseLog)
         LogManager::instance().logDetail(QString("[raw_udp] processFrag msgId=%1 frag=%2/%3 payloadLen=%4 totalLen=%5").arg(msgId).arg(fragIndex).arg(fragTotal).arg(payloadLen).arg(totalLen));
 
-    ReassemblyEntry& entry = m_reassembly[msgId];
-    if (entry.fragments.isEmpty()) {
+    QMap<uint16_t, ReassemblyEntry>::iterator existing =
+        m_reassembly.find(msgId);
+    if (existing != m_reassembly.end() &&
+        (existing->totalLen != totalLen ||
+         existing->fragTotal != fragTotal)) {
+        removeReassemblyEntry(msgId);
+        return;
+    }
+    if (existing == m_reassembly.end()) {
+        if (!ensureReassemblyCapacity(static_cast<size_t>(payloadLen), true))
+            return;
+        ReassemblyEntry entry;
         entry.totalLen     = totalLen;
         entry.fragTotal    = fragTotal;
         entry.receivedCount = 0;
         entry.createTime   = currentTimeMs();
+        m_reassembly.insert(msgId, entry);
+        existing = m_reassembly.find(msgId);
     }
-
-    if (!entry.fragments.contains(fragIndex)) {
+    if (!existing->fragments.contains(fragIndex)) {
+        if (!ensureReassemblyCapacity(static_cast<size_t>(payloadLen), false))
+            return;
+        existing = m_reassembly.find(msgId);
+        if (existing == m_reassembly.end()) return;
+        ReassemblyEntry& entry = existing.value();
         entry.fragments[fragIndex] = QByteArray(payload, payloadLen);
         entry.receivedCount++;
+        m_reassemblyBytes += static_cast<size_t>(payloadLen);
     }
 
+    existing = m_reassembly.find(msgId);
+    if (existing == m_reassembly.end()) return;
+    ReassemblyEntry& entry = existing.value();
     if (entry.receivedCount >= entry.fragTotal) {
         QByteArray assembled;
         assembled.reserve(entry.totalLen);
         for (uint8_t i = 0; i < entry.fragTotal; ++i) {
             auto it = entry.fragments.find(i);
             if (it == entry.fragments.end()) {
-                m_reassembly.remove(msgId);
+                removeReassemblyEntry(msgId);
                 return;
             }
             assembled.append(it.value());
         }
-        m_reassembly.remove(msgId);
-        emit dataReceived(assembled);
+        const bool exact = assembled.size() == entry.totalLen;
+        removeReassemblyEntry(msgId);
+        if (exact) emit dataReceived(assembled);
     }
 }
 
@@ -271,8 +307,42 @@ void RawUdpTunnel::cleanupStaleEntries() {
     if (!stale.isEmpty())
         LogManager::instance().logDetail(QString("[raw_udp] cleanupStaleEntries: removing %1 entries").arg(stale.size()));
     for (uint16_t id : stale) {
-        m_reassembly.remove(id);
+        removeReassemblyEntry(id);
     }
+}
+
+void RawUdpTunnel::removeReassemblyEntry(uint16_t msgId) {
+    QMap<uint16_t, ReassemblyEntry>::iterator it = m_reassembly.find(msgId);
+    if (it == m_reassembly.end()) return;
+    size_t bytes = 0;
+    for (QMap<uint8_t, QByteArray>::const_iterator frag =
+             it->fragments.constBegin(); frag != it->fragments.constEnd(); ++frag)
+        bytes += static_cast<size_t>(frag.value().size());
+    m_reassemblyBytes = bytes > m_reassemblyBytes
+        ? 0 : m_reassemblyBytes - bytes;
+    m_reassembly.erase(it);
+}
+
+bool RawUdpTunnel::ensureReassemblyCapacity(size_t incomingBytes,
+                                            bool newMessage) {
+    if (incomingBytes > RAW_UDP_MAX_REASSEMBLY_BYTES) return false;
+    while ((!m_reassembly.isEmpty()) &&
+           ((newMessage && m_reassembly.size() >=
+               static_cast<int>(RAW_UDP_MAX_ACTIVE_MESSAGES)) ||
+            m_reassemblyBytes + incomingBytes >
+                RAW_UDP_MAX_REASSEMBLY_BYTES)) {
+        QMap<uint16_t, ReassemblyEntry>::const_iterator oldest =
+            m_reassembly.constBegin();
+        for (QMap<uint16_t, ReassemblyEntry>::const_iterator it =
+                 m_reassembly.constBegin(); it != m_reassembly.constEnd(); ++it) {
+            if (it->createTime < oldest->createTime) oldest = it;
+        }
+        removeReassemblyEntry(oldest.key());
+    }
+    return (!newMessage || m_reassembly.size() <
+                static_cast<int>(RAW_UDP_MAX_ACTIVE_MESSAGES)) &&
+           m_reassemblyBytes + incomingBytes <=
+                RAW_UDP_MAX_REASSEMBLY_BYTES;
 }
 
 int RawUdpTunnel::maxFragmentPayload() const {
