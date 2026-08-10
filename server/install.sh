@@ -790,7 +790,7 @@ atomic_symlink() {
 
 wait_for_service() {
     local attempt
-    for attempt in {1..10}; do
+    for ((attempt = 0; attempt < 10; ++attempt)); do
         if systemctl is-active --quiet "$SERVICE_NAME"; then
             return 0
         fi
@@ -830,7 +830,8 @@ restore_deployment() {
 
 preserve_legacy_binary() {
     if [[ -f "$BIN_PATH" && ! -L "$BIN_PATH" ]]; then
-        local legacy_dir="$RELEASES_DIR/legacy-$(date +%Y%m%d_%H%M%S)"
+        local legacy_dir
+        legacy_dir="$RELEASES_DIR/legacy-$(date +%Y%m%d_%H%M%S)"
         install -d -o root -g root -m 0755 "$legacy_dir"
         install -o root -g root -m 0755 "$BIN_PATH" "$legacy_dir/vlan-server"
     fi
