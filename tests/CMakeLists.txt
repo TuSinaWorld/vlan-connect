@@ -124,6 +124,11 @@ if(WIN32)
     target_link_libraries(wintun_lifecycle_tests PRIVATE
         Qt5::Core iphlpapi)
 else()
+    find_program(BASH_EXECUTABLE bash)
+    if(NOT BASH_EXECUTABLE)
+        message(FATAL_ERROR "bash is required for server installer tests")
+    endif()
+
     add_executable(wintun_lifecycle_tests
         wintun/wintun_lifecycle_tests.cpp)
 
@@ -174,4 +179,7 @@ add_test(NAME wintun_lifecycle_tests COMMAND wintun_lifecycle_tests)
 if(NOT WIN32)
     add_test(NAME linux_tun_netlink_tests COMMAND linux_tun_netlink_tests)
     add_test(NAME cli_raw_fec_tests COMMAND cli_raw_fec_tests)
+    add_test(NAME server_install_script_tests
+        COMMAND "${BASH_EXECUTABLE}"
+            "${VLAN_ROOT}/tests/server/install_script_tests.sh")
 endif()
