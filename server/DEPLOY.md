@@ -14,6 +14,8 @@
 | 文件或目录 | 目标路径 | 用途 |
 |---|---|---|
 | `vlan-server` | `/usr/local/bin/vlan-server` | 服务端可执行文件 |
+| 版本目录 | `/opt/vlan-server/releases/<tag>/` | 一键安装器保留的已安装版本 |
+| 当前版本 | `/opt/vlan-server/current` | 原子指向当前版本的软链接 |
 | `server/vlan-server.service` | `/etc/systemd/system/vlan-server.service` | systemd unit |
 | `server/vlan-server.env.example` | `/usr/local/bin/vlan-server.env` | 服务端环境配置 |
 | `server/auth.password.example` | `/usr/local/bin/auth.password` | 服务端鉴权密码文件模板 |
@@ -31,6 +33,87 @@
 - 房间密码只用于加入房间校验，不参与服务端鉴权，也不作为传输加密密钥。
 
 本仓库提供的 `server/vlan-server.service` 默认启用服务端鉴权，并通过 `--auth-file /usr/local/bin/auth.password` 读取密码文件。
+
+## 一键源码安装和更新
+
+推荐在使用 systemd 的 Debian、Ubuntu、RHEL、Rocky Linux、AlmaLinux 或 Fedora 服务器上使用一键安装器。脚本必须以 root 运行，会自动安装编译依赖，从官方仓库选择最新的 `vX.Y.Z` 正式 tag，在临时目录完成源码编译，然后部署并启用服务。
+
+交互安装或更新:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/TuSinaWorld/vlan-connect/main/server/install.sh | sudo bash
+```
+
+首次安装会询问 TCP/UDP 共用端口和服务端鉴权密码。端口留空使用 `11510`；密码留空会从 `/dev/urandom` 生成 64 位十六进制密码，并仅在成功安装后显示一次。用户可以选择继续配置日志大小和全部容量限制。
+
+脚本默认使用 `auto` 操作：未安装时执行安装，已有安装时更新到最新正式 tag，并保留现有端口、密码和容量配置。也可以显式指定操作:
+
+```bash
+# 只允许首次安装
+curl -fsSL https://raw.githubusercontent.com/TuSinaWorld/vlan-connect/main/server/install.sh \
+  | sudo bash -s -- install
+
+# 要求已有安装并更新
+curl -fsSL https://raw.githubusercontent.com/TuSinaWorld/vlan-connect/main/server/install.sh \
+  | sudo bash -s -- update
+
+# 安装指定正式 tag；显式指定旧 tag 时允许降级
+curl -fsSL https://raw.githubusercontent.com/TuSinaWorld/vlan-connect/main/server/install.sh \
+  | sudo bash -s -- update --version v0.3.0
+
+# 更新程序并重新进入配置流程
+curl -fsSL https://raw.githubusercontent.com/TuSinaWorld/vlan-connect/main/server/install.sh \
+  | sudo bash -s -- update --reconfigure
+```
+
+无人值守安装建议通过 root 可读的临时密码文件传入秘密，避免把密码写在命令行历史中:
+
+```bash
+sudo install -o root -g root -m 0600 /path/to/password.txt /root/vlan-auth.password
+curl -fsSL https://raw.githubusercontent.com/TuSinaWorld/vlan-connect/main/server/install.sh \
+  | sudo bash -s -- --non-interactive --port 11510 \
+      --password-file /root/vlan-auth.password
+```
+
+支持的配置参数:
+
+```text
+--port N
+--password-file FILE
+--log-max-mb N
+--max-clients N
+--max-pending N
+--max-rooms N
+--max-clients-per-ip N
+--max-pending-per-ip N
+--max-send-buffer-mb N
+--version vX.Y.Z
+--non-interactive
+--reconfigure
+```
+
+无人值守环境也可以使用对应的 `VLAN_INSTALL_*` 环境变量。密码优先使用 `VLAN_INSTALL_PASSWORD_FILE`；`VLAN_INSTALL_PASSWORD` 仅作为受控自动化环境的备用方式。参数优先级为命令行或密码文件、安装器环境变量、已有配置、交互输入、默认值。
+
+安装器不会执行 `ufw` 或 `firewall-cmd`。结束时会显示需要开放的 TCP 和 UDP 端口，管理员仍需配置主机防火墙以及云厂商安全组。
+
+### 更新安全和自动回滚
+
+- 依赖安装、tag 查询和编译全部在停止现有服务前完成。
+- 二进制安装到 `/opt/vlan-server/releases/<tag>/`，通过 `/opt/vlan-server/current` 和 `/usr/local/bin/vlan-server` 软链接原子切换。
+- 更新前会临时快照当前二进制链接、systemd unit、环境文件、密码、文档和版本状态。
+- 新服务无法在 10 秒内进入 active 时，会恢复全部快照并重新启动旧版本。
+- 普通自动更新拒绝降级；只有显式 `--version` 可以选择旧版本。
+- 同一 tag 已安装、服务已启用且运行正常时不会重复编译；文件缺失或服务异常时会执行修复安装。
+- 并发运行的安装器会通过 `/run/lock/vlan-server-installer.lock` 互斥。
+
+如需先审查脚本再执行:
+
+```bash
+curl -fsSLo /tmp/vlan-server-install.sh \
+  https://raw.githubusercontent.com/TuSinaWorld/vlan-connect/main/server/install.sh
+less /tmp/vlan-server-install.sh
+sudo bash /tmp/vlan-server-install.sh
+```
 
 ## 方式一: 使用 Release 二进制包安装
 
@@ -309,6 +392,8 @@ sudo systemctl start vlan-server
 
 ## 更新服务端
 
+推荐重复执行[一键源码安装和更新](#一键源码安装和更新)中的命令；安装器会保留现有配置，并在新服务启动失败时自动回滚。以下步骤仅用于手工部署。
+
 如果使用 Release 二进制包:
 
 ```bash
@@ -348,6 +433,18 @@ journalctl -u vlan-server -n 100 --no-pager
 - TCP/UDP `11510` 被其它进程占用。
 - 云安全组或系统防火墙只放行了 TCP，没有放行 UDP。
 - `/usr/local/bin/vlan-server.env` 内容有误。
+- 无法连接 GitHub，或目标正式 tag 不存在。
+- 当前系统不是 systemd，或发行版不在 apt/dnf/yum 支持范围内。
+- 编译依赖安装失败。安装器会在停止旧服务前退出，不影响现有服务。
+
+一键更新失败后可检查服务状态和回滚结果:
+
+```bash
+sudo systemctl status vlan-server --no-pager
+sudo journalctl -u vlan-server -n 100 --no-pager
+sudo cat /var/lib/vlan-server/installed-version
+readlink -f /opt/vlan-server/current
+```
 
 ## 卸载
 
@@ -357,6 +454,9 @@ sudo rm -f /etc/systemd/system/vlan-server.service
 sudo systemctl daemon-reload
 sudo rm -f /usr/local/bin/vlan-server
 sudo rm -f /usr/local/bin/vlan-server.env /usr/local/bin/auth.password
+sudo rm -rf /opt/vlan-server
+sudo rm -rf /usr/local/share/doc/vlan-server
+sudo rm -f /run/lock/vlan-server-installer.lock
 ```
 
 如果需要同时删除日志和状态目录:

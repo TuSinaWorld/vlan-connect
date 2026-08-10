@@ -8,6 +8,14 @@ VLan 是一个虚拟局域网联机工具。它由 Linux 中继服务端、Windo
 - CLI 客户端启动和交互命令: [client-cli/README.md](client-cli/README.md)
 - GUI 客户端构建: 见本文的 [GUI 客户端](#gui-客户端)
 
+Linux systemd 服务器可以从最新正式 tag 自动源码编译并安装:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/TuSinaWorld/vlan-connect/main/server/install.sh | sudo bash
+```
+
+同一条命令在已有安装上会执行更新并保留端口和密码。脚本支持 apt、dnf/yum，安装成功后会显示需要在防火墙和云安全组开放的 TCP/UDP 端口；完整参数和回滚行为见 [server/DEPLOY.md](server/DEPLOY.md)。
+
 如果从 GitHub Release 安装服务端，不要只下载 `vlan-server-linux-*.tar.gz` 后直接运行。服务端安装还需要 `server/vlan-server.service`、`server/vlan-server.env.example`、`server/auth.password.example` 等文件，这些文件在 `vlan-connect-source-*.tar.gz` 源码包里。具体步骤见 [server/DEPLOY.md](server/DEPLOY.md)。
 
 ## 功能概览
@@ -36,6 +44,12 @@ VLan 是一个虚拟局域网联机工具。它由 Linux 中继服务端、Windo
 ## 服务端
 
 完整部署文档见 [server/DEPLOY.md](server/DEPLOY.md)。
+
+一键安装或更新:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/TuSinaWorld/vlan-connect/main/server/install.sh | sudo bash
+```
 
 源码构建:
 

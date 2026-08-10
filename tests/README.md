@@ -16,6 +16,7 @@
 
 - `protocol_v8_tests`：ByteBuffer u64、v8 分页快照/delta 以及信令/数据 payload 严格校验。
 - `server_auth_file_tests`：服务端鉴权密码文件边界和非法内容校验。
+- `server_install_script_tests`：一键安装器的 Bash/ShellCheck 静态检查、参数边界、tag 选择、安全配置解析和回滚辅助逻辑。
 - `server_session_tests`：状态转换和信令 FD 索引约束。
 - `gui_signal_tests`：GUI 信令帧处理和回调行为。
 - `cli_signal_tests`：CLI 信令帧处理和 v7 拒绝。
