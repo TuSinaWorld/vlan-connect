@@ -70,6 +70,92 @@ assert_failure "newline in password" validate_password_value $'12345678\n'
 
 tmp_dir="$(mktemp -d)"
 trap 'rm -rf -- "$tmp_dir"' EXIT
+
+archive_root="$tmp_dir/vlan-connect-v1.2.3"
+install -d "$archive_root/server"
+printf 'all:\n' > "$archive_root/server/Makefile"
+printf '[Unit]\n' > "$archive_root/server/vlan-server.service"
+printf '# Deploy\n' > "$archive_root/server/DEPLOY.md"
+valid_archive="$tmp_dir/vlan-connect-source-v1.2.3.tar.gz"
+tar -C "$tmp_dir" -czf "$valid_archive" "$(basename "$archive_root")"
+archive_metadata="$(inspect_source_archive "$valid_archive")"
+assert_equal $'vlan-connect-v1.2.3\tv1.2.3' "$archive_metadata" \
+    "local source archive metadata"
+
+invalid_root="$tmp_dir/vlan-connect-1.2.3"
+cp -a "$archive_root" "$invalid_root"
+invalid_root_archive="$tmp_dir/invalid-root.tar.gz"
+tar -C "$tmp_dir" -czf "$invalid_root_archive" "$(basename "$invalid_root")"
+assert_failure "archive root requires vX.Y.Z" \
+    inspect_source_archive "$invalid_root_archive"
+
+printf 'extra\n' > "$tmp_dir/extra-root"
+multi_root_archive="$tmp_dir/multi-root.tar.gz"
+tar -C "$tmp_dir" -czf "$multi_root_archive" \
+    "$(basename "$archive_root")" "$(basename "$tmp_dir/extra-root")"
+assert_failure "archive must have one top-level directory" \
+    inspect_source_archive "$multi_root_archive"
+
+printf 'escape\n' > "$tmp_dir/escape"
+traversal_archive="$tmp_dir/traversal.tar.gz"
+tar -C "$tmp_dir" -czf "$traversal_archive" \
+    --transform='s|^escape$|vlan-connect-v1.2.3/../escape|' \
+    "$(basename "$archive_root")" escape
+assert_failure "archive path traversal is rejected" \
+    inspect_source_archive "$traversal_archive"
+
+ln -s server/Makefile "$archive_root/link"
+linked_archive="$tmp_dir/linked.tar.gz"
+tar -C "$tmp_dir" -czf "$linked_archive" "$(basename "$archive_root")"
+assert_failure "archive links are rejected" inspect_source_archive "$linked_archive"
+rm -f -- "$archive_root/link"
+
+SOURCE_ARCHIVE_OPTION="$valid_archive"
+VERSION_OPTION=""
+CURRENT_VERSION=""
+TARGET_VERSION=""
+WORK_DIR=""
+SOURCE_DIR=""
+SOURCE_ARCHIVE_CACHE=""
+SOURCE_ARCHIVE_ROOT=""
+git() { return 99; }
+assert_success "local archive resolution bypasses git" resolve_target_version
+assert_equal "v1.2.3" "$TARGET_VERSION" "local archive detected version"
+assert_equal "vlan-connect-v1.2.3" "$SOURCE_ARCHIVE_ROOT" \
+    "local archive detected root"
+[[ -f "$SOURCE_ARCHIVE_CACHE" ]] || fail "local archive must be cached before deployment"
+make_calls="$tmp_dir/make-calls"
+make() {
+    printf '%s\n' "$*" >> "$make_calls"
+    printf '#!/bin/sh\nexit 0\n' > "$SOURCE_DIR/server/vlan-server"
+    chmod 0755 "$SOURCE_DIR/server/vlan-server"
+}
+assert_success "local archive build extracts cached source" build_release
+grep -Fqx -- "-C $SOURCE_DIR/server" "$make_calls" ||
+    fail "local archive build must invoke the server Makefile"
+unset -f make
+rm -rf -- "$WORK_DIR"
+WORK_DIR=""
+SOURCE_DIR=""
+SOURCE_ARCHIVE_CACHE=""
+SOURCE_ARCHIVE_ROOT=""
+SOURCE_ARCHIVE_OPTION=""
+unset -f git
+
+git_calls="$tmp_dir/git-calls"
+git() {
+    printf '%s\n' "$*" >> "$git_calls"
+    printf 'deadbeef\trefs/tags/v9.8.7\n'
+}
+VERSION_OPTION=""
+CURRENT_VERSION=""
+TARGET_VERSION=""
+assert_success "default version resolution still queries git" resolve_target_version
+assert_equal "v9.8.7" "$TARGET_VERSION" "default remote version selection"
+grep -Fqx "ls-remote --tags --refs $REPO_URL" "$git_calls" ||
+    fail "default version resolution must query the official repository"
+unset -f git
+
 printf '12345678\r\n\n' > "$tmp_dir/password-valid"
 PASSWORD_VALUE=""
 assert_success "valid password file" load_password_file "$tmp_dir/password-valid"

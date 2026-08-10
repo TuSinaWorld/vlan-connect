@@ -30,6 +30,7 @@ SHOW_HELP=0
 CONFIG_OVERRIDE=0
 
 VERSION_OPTION="${VLAN_INSTALL_VERSION-}"
+SOURCE_ARCHIVE_OPTION="${VLAN_INSTALL_SOURCE_ARCHIVE-}"
 PORT_OPTION="${VLAN_INSTALL_PORT-}"
 PASSWORD_FILE_OPTION="${VLAN_INSTALL_PASSWORD_FILE-}"
 PASSWORD_DIRECT_OPTION="${VLAN_INSTALL_PASSWORD-}"
@@ -57,6 +58,8 @@ CURRENT_VERSION=""
 INSTALL_MODE=""
 WORK_DIR=""
 SOURCE_DIR=""
+SOURCE_ARCHIVE_CACHE=""
+SOURCE_ARCHIVE_ROOT=""
 ROLLBACK_DIR=""
 DEPLOYMENT_ACTIVE=0
 PREVIOUS_SERVICE_ENABLED=0
@@ -92,6 +95,7 @@ Actions:
 
 Options:
   --version vX.Y.Z             Install a specific stable tag
+  --source-archive FILE        Build from a local release source archive
   --port N                     TCP and UDP listen port (1-65535)
   --password-file FILE         Read the server password from FILE
   --non-interactive            Do not prompt; use defaults when unset
@@ -106,7 +110,7 @@ Options:
   -h, --help                   Show this help
 
 Environment equivalents:
-  VLAN_INSTALL_VERSION, VLAN_INSTALL_PORT,
+  VLAN_INSTALL_VERSION, VLAN_INSTALL_SOURCE_ARCHIVE, VLAN_INSTALL_PORT,
   VLAN_INSTALL_PASSWORD_FILE, VLAN_INSTALL_PASSWORD,
   VLAN_INSTALL_LOG_MAX_MB, VLAN_INSTALL_MAX_CLIENTS,
   VLAN_INSTALL_MAX_PENDING, VLAN_INSTALL_MAX_ROOMS,
@@ -137,6 +141,11 @@ parse_args() {
         --version)
             option_requires_value "$1" "${2-}"
             VERSION_OPTION="$2"
+            shift 2
+            ;;
+        --source-archive)
+            option_requires_value "$1" "${2-}"
+            SOURCE_ARCHIVE_OPTION="$2"
             shift 2
             ;;
         --port)
@@ -248,6 +257,50 @@ is_positive_uint() {
 
 is_stable_version() {
     [[ "$1" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]
+}
+
+inspect_source_archive() {
+    local archive="$1"
+    local entries verbose_entries entry archive_root="" candidate version=""
+    local has_makefile=0 has_unit=0 has_deploy_doc=0
+    [[ -f "$archive" && -r "$archive" ]] || return 1
+
+    entries="$(LC_ALL=C tar -tzf "$archive" 2>/dev/null)" || return 1
+    [[ -n "$entries" ]] || return 1
+    verbose_entries="$(LC_ALL=C tar -tvzf "$archive" 2>/dev/null)" || return 1
+    while IFS= read -r entry || [[ -n "$entry" ]]; do
+        case "${entry:0:1}" in
+        -|d) ;;
+        *) return 1 ;;
+        esac
+    done <<< "$verbose_entries"
+
+    while IFS= read -r entry || [[ -n "$entry" ]]; do
+        entry="${entry#./}"
+        entry="${entry%/}"
+        [[ -n "$entry" && "$entry" != /* ]] || return 1
+        [[ "$entry" != *$'\r'* ]] || return 1
+        [[ "$entry" != ".." && "$entry" != ../* &&
+           "$entry" != */../* && "$entry" != */.. ]] || return 1
+
+        candidate="${entry%%/*}"
+        if [[ -z "$archive_root" ]]; then
+            archive_root="$candidate"
+        elif [[ "$candidate" != "$archive_root" ]]; then
+            return 1
+        fi
+
+        case "$entry" in
+        "$archive_root/server/Makefile") has_makefile=1 ;;
+        "$archive_root/server/vlan-server.service") has_unit=1 ;;
+        "$archive_root/server/DEPLOY.md") has_deploy_doc=1 ;;
+        esac
+    done <<< "$entries"
+
+    [[ "$archive_root" =~ ^vlan-connect-(v[0-9]+\.[0-9]+\.[0-9]+)$ ]] || return 1
+    version="${BASH_REMATCH[1]}"
+    (( has_makefile == 1 && has_unit == 1 && has_deploy_doc == 1 )) || return 1
+    printf '%s\t%s\n' "$archive_root" "$version"
 }
 
 select_latest_tag_from_lines() {
@@ -503,6 +556,38 @@ read_current_version() {
 
 resolve_target_version() {
     local refs
+    if [[ -n "$SOURCE_ARCHIVE_OPTION" ]]; then
+        local archive_size metadata detected_version
+        command -v tar >/dev/null 2>&1 ||
+            die "tar is required for --source-archive"
+        [[ -f "$SOURCE_ARCHIVE_OPTION" && -r "$SOURCE_ARCHIVE_OPTION" ]] ||
+            die "local source archive is not a readable regular file: $SOURCE_ARCHIVE_OPTION"
+        archive_size="$(LC_ALL=C wc -c < "$SOURCE_ARCHIVE_OPTION")" ||
+            die "failed to read local source archive size"
+        (( archive_size > 0 && archive_size <= 268435456 )) ||
+            die "local source archive must be between 1 byte and 256 MiB"
+
+        create_work_dir
+        SOURCE_ARCHIVE_CACHE="$WORK_DIR/source-archive.tar.gz"
+        install -m 0600 -- "$SOURCE_ARCHIVE_OPTION" "$SOURCE_ARCHIVE_CACHE" ||
+            die "failed to copy local source archive"
+        metadata="$(inspect_source_archive "$SOURCE_ARCHIVE_CACHE")" ||
+            die "invalid local source archive; expected one vlan-connect-vX.Y.Z directory with required server files and no links"
+        IFS=$'\t' read -r SOURCE_ARCHIVE_ROOT detected_version <<< "$metadata"
+
+        if [[ -n "$VERSION_OPTION" ]]; then
+            is_stable_version "$VERSION_OPTION" ||
+                die "invalid version '$VERSION_OPTION'; expected vX.Y.Z"
+            [[ "$VERSION_OPTION" == "$detected_version" ]] ||
+                die "--version $VERSION_OPTION does not match archive version $detected_version"
+        fi
+        TARGET_VERSION="$detected_version"
+        if [[ -n "$CURRENT_VERSION" ]] && version_is_greater "$CURRENT_VERSION" "$TARGET_VERSION"; then
+            warn "local source downgrade requested: $CURRENT_VERSION -> $TARGET_VERSION"
+        fi
+        return
+    fi
+
     if [[ -n "$VERSION_OPTION" ]]; then
         is_stable_version "$VERSION_OPTION" ||
             die "invalid version '$VERSION_OPTION'; expected vX.Y.Z"
@@ -694,15 +779,28 @@ installation_is_healthy() {
 }
 
 create_work_dir() {
+    [[ -z "$WORK_DIR" ]] || return 0
     WORK_DIR="$(mktemp -d /tmp/vlan-server-install.XXXXXX)"
     SOURCE_DIR="$WORK_DIR/source"
     ROLLBACK_DIR="$WORK_DIR/rollback"
 }
 
 build_release() {
-    log "Cloning official source tag $TARGET_VERSION"
-    git clone --quiet --depth 1 --branch "$TARGET_VERSION" --single-branch \
-        "$REPO_URL" "$SOURCE_DIR"
+    if [[ -n "$SOURCE_ARCHIVE_CACHE" ]]; then
+        local extract_dir="$WORK_DIR/extracted"
+        log "Extracting local source archive for $TARGET_VERSION"
+        install -d -m 0700 "$extract_dir"
+        tar --extract --gzip --file="$SOURCE_ARCHIVE_CACHE" \
+            --directory="$extract_dir" --no-same-owner --no-same-permissions ||
+            die "failed to extract local source archive"
+        [[ -d "$extract_dir/$SOURCE_ARCHIVE_ROOT" ]] ||
+            die "local source archive root is missing after extraction"
+        mv -- "$extract_dir/$SOURCE_ARCHIVE_ROOT" "$SOURCE_DIR"
+    else
+        log "Cloning official source tag $TARGET_VERSION"
+        git clone --quiet --depth 1 --branch "$TARGET_VERSION" --single-branch \
+            "$REPO_URL" "$SOURCE_DIR"
+    fi
     [[ -f "$SOURCE_DIR/server/Makefile" &&
        -f "$SOURCE_DIR/server/vlan-server.service" &&
        -f "$SOURCE_DIR/server/DEPLOY.md" ]] ||

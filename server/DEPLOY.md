@@ -66,6 +66,27 @@ curl -fsSL https://raw.githubusercontent.com/TuSinaWorld/vlan-connect/main/serve
   | sudo bash -s -- update --reconfigure
 ```
 
+### GitHub 不可访问时使用本地源码包
+
+在可以访问 GitHub 的电脑上下载 `server/install.sh` 和同一正式版本的
+`vlan-connect-source-vX.Y.Z.tar.gz` Release 资产，再通过 SCP、运维平台或可信的
+内部文件服务传到目标服务器。例如文件已经放到 `/tmp`:
+
+```bash
+sudo bash /tmp/install.sh \
+  --source-archive /tmp/vlan-connect-source-vX.Y.Z.tar.gz
+```
+
+安装器会从归档内唯一的 `vlan-connect-vX.Y.Z/` 顶层目录识别版本，不查询远程
+tag，也不执行 `git clone`。归档必须不超过 256 MiB，只能包含普通文件和目录，
+且必须具有 `server/Makefile`、systemd unit 和部署文档；多顶层目录、路径穿越、
+软链接、硬链接及其它特殊条目都会被拒绝。
+
+`--version` 在本地源码包模式下不是必需参数；如果同时提供，其值必须与归档
+目录识别出的版本完全一致。本地源码包仍然需要 apt、dnf 或 yum 可用，以安装
+编译依赖。没有指定 `--source-archive` 时，安装和更新继续使用原有的官方 GitHub
+tag 查询及浅克隆流程。
+
 无人值守安装建议通过 root 可读的临时密码文件传入秘密，避免把密码写在命令行历史中:
 
 ```bash
@@ -88,21 +109,22 @@ curl -fsSL https://raw.githubusercontent.com/TuSinaWorld/vlan-connect/main/serve
 --max-pending-per-ip N
 --max-send-buffer-mb N
 --version vX.Y.Z
+--source-archive FILE
 --non-interactive
 --reconfigure
 ```
 
-无人值守环境也可以使用对应的 `VLAN_INSTALL_*` 环境变量。密码优先使用 `VLAN_INSTALL_PASSWORD_FILE`；`VLAN_INSTALL_PASSWORD` 仅作为受控自动化环境的备用方式。参数优先级为命令行或密码文件、安装器环境变量、已有配置、交互输入、默认值。
+无人值守环境也可以使用对应的 `VLAN_INSTALL_*` 环境变量，包括 `VLAN_INSTALL_SOURCE_ARCHIVE`。密码优先使用 `VLAN_INSTALL_PASSWORD_FILE`；`VLAN_INSTALL_PASSWORD` 仅作为受控自动化环境的备用方式。参数优先级为命令行或密码文件、安装器环境变量、已有配置、交互输入、默认值。
 
 安装器不会执行 `ufw` 或 `firewall-cmd`。结束时会显示需要开放的 TCP 和 UDP 端口，管理员仍需配置主机防火墙以及云厂商安全组。
 
 ### 更新安全和自动回滚
 
-- 依赖安装、tag 查询和编译全部在停止现有服务前完成。
+- 依赖安装、在线模式的 tag 查询、本地归档检查和编译全部在停止现有服务前完成。
 - 二进制安装到 `/opt/vlan-server/releases/<tag>/`，通过 `/opt/vlan-server/current` 和 `/usr/local/bin/vlan-server` 软链接原子切换。
 - 更新前会临时快照当前二进制链接、systemd unit、环境文件、密码、文档和版本状态。
 - 新服务无法在 10 秒内进入 active 时，会恢复全部快照并重新启动旧版本。
-- 普通自动更新拒绝降级；只有显式 `--version` 可以选择旧版本。
+- 普通在线自动更新拒绝降级；显式 `--version` 或主动提供的本地旧版本源码包可以选择旧版本，并会显示警告。
 - 同一 tag 已安装、服务已启用且运行正常时不会重复编译；文件缺失或服务异常时会执行修复安装。
 - 并发运行的安装器会通过 `/run/lock/vlan-server-installer.lock` 互斥。
 
@@ -433,7 +455,7 @@ journalctl -u vlan-server -n 100 --no-pager
 - TCP/UDP `11510` 被其它进程占用。
 - 云安全组或系统防火墙只放行了 TCP，没有放行 UDP。
 - `/usr/local/bin/vlan-server.env` 内容有误。
-- 无法连接 GitHub，或目标正式 tag 不存在。
+- 无法连接 GitHub，或目标正式 tag 不存在；这种情况下可以改用正式 Release 的本地源码包安装模式。
 - 当前系统不是 systemd，或发行版不在 apt/dnf/yum 支持范围内。
 - 编译依赖安装失败。安装器会在停止旧服务前退出，不影响现有服务。
 

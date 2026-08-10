@@ -16,6 +16,14 @@ curl -fsSL https://raw.githubusercontent.com/TuSinaWorld/vlan-connect/main/serve
 
 同一条命令在已有安装上会执行更新并保留端口和密码。脚本支持 apt、dnf/yum，安装成功后会显示需要在防火墙和云安全组开放的 TCP/UDP 端口；完整参数和回滚行为见 [server/DEPLOY.md](server/DEPLOY.md)。
 
+目标服务器无法访问 GitHub 时，可以先把正式 Release 的源码包和安装脚本传到服务器，再从归档目录名自动识别版本并离线获取源码：
+
+```bash
+sudo bash /tmp/install.sh --source-archive /tmp/vlan-connect-source-vX.Y.Z.tar.gz
+```
+
+该模式不查询 GitHub tag，也不执行 `git clone`；编译依赖仍通过系统的 apt、dnf 或 yum 软件源安装。
+
 如果从 GitHub Release 安装服务端，不要只下载 `vlan-server-linux-*.tar.gz` 后直接运行。服务端安装还需要 `server/vlan-server.service`、`server/vlan-server.env.example`、`server/auth.password.example` 等文件，这些文件在 `vlan-connect-source-*.tar.gz` 源码包里。具体步骤见 [server/DEPLOY.md](server/DEPLOY.md)。
 
 ## 功能概览
