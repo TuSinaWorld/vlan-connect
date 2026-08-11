@@ -612,9 +612,13 @@ resolve_target_version() {
 }
 
 open_tty_if_available() {
-    if (( NON_INTERACTIVE == 0 )) && [[ -r /dev/tty && -w /dev/tty ]]; then
-        exec 3<>/dev/tty
+    INTERACTIVE=0
+    (( NON_INTERACTIVE == 0 )) || return 0
+    if [[ -r /dev/tty && -w /dev/tty ]] &&
+       { exec 3<>/dev/tty; } 2>/dev/null; then
         INTERACTIVE=1
+    else
+        warn "no interactive terminal is available; using existing values or defaults (use --port and --password-file to configure explicitly)"
     fi
 }
 
@@ -689,10 +693,20 @@ apply_option_overrides() {
 }
 
 prompt_configuration() {
-    (( INTERACTIVE == 1 )) || return 0
+    if (( INTERACTIVE == 0 )); then
+        log "Basic configuration uses TCP/UDP listen port $PORT"
+        return 0
+    fi
+
+    printf '\nRequired basic configuration:\n' >&3
     if [[ -z "$PORT_OPTION" &&
           ( "$INSTALL_MODE" == "install" || "$RECONFIGURE" == 1 ) ]]; then
         PORT="$(prompt_value "TCP/UDP listen port" "$PORT")"
+    elif [[ -n "$PORT_OPTION" ]]; then
+        printf 'TCP/UDP listen port: %s (configured by option)\n' "$PORT" >&3
+    else
+        printf 'TCP/UDP listen port: %s (preserved; use --reconfigure to change)\n' \
+            "$PORT" >&3
     fi
 
     if [[ -z "$PASSWORD_FILE_OPTION" && -z "$PASSWORD_DIRECT_OPTION" ]]; then
@@ -700,10 +714,17 @@ prompt_configuration() {
             prompt_new_password
         elif (( RECONFIGURE == 1 )) && prompt_yes_no "Change the server authentication password?"; then
             prompt_new_password
+        else
+            printf 'Server authentication password: preserved\n' >&3
         fi
+    elif [[ -n "$PASSWORD_FILE_OPTION" ]]; then
+        printf 'Server authentication password: loaded from password file\n' >&3
+    else
+        printf 'Server authentication password: supplied non-interactively\n' >&3
     fi
 
     if (( RECONFIGURE == 1 )) || [[ "$INSTALL_MODE" == "install" ]]; then
+        printf '\nOptional advanced configuration:\n' >&3
         if prompt_yes_no "Configure advanced log and capacity limits?"; then
             LOG_MAX_MB="$(prompt_value "Maximum log size in MiB" "$LOG_MAX_MB")"
             MAX_CLIENTS="$(prompt_value "Maximum signaling clients" "${MAX_CLIENTS:-256}")"
@@ -1063,10 +1084,11 @@ main() {
     require_root_and_systemd
     acquire_lock
     detect_installation
+    log "Detected installation mode: $INSTALL_MODE"
     install_dependencies
     read_current_version
-    resolve_target_version
     resolve_configuration
+    resolve_target_version
 
     log "Selected release: $TARGET_VERSION"
     if (( CONFIG_OVERRIDE == 0 && RECONFIGURE == 0 )) && installation_is_healthy; then

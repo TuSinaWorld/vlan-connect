@@ -205,6 +205,67 @@ apply_option_overrides
 assert_equal "13000" "$PORT" "CLI/env port precedence"
 assert_equal "22" "$LOG_MAX_MB" "CLI/env log precedence"
 
+prompt_events="$tmp_dir/prompt-events"
+prompt_output="$tmp_dir/prompt-output"
+(
+    INTERACTIVE=1
+    INSTALL_MODE="install"
+    RECONFIGURE=0
+    PORT_OPTION=""
+    PASSWORD_FILE_OPTION=""
+    PASSWORD_DIRECT_OPTION=""
+    PORT=11510
+    PASSWORD_VALUE=""
+    exec 3> "$prompt_output"
+    prompt_value() {
+        printf 'port\n' >> "$prompt_events"
+        printf '%s\n' "$2"
+    }
+    prompt_new_password() {
+        printf 'password\n' >> "$prompt_events"
+        PASSWORD_VALUE="12345678"
+    }
+    prompt_yes_no() {
+        printf 'advanced\n' >> "$prompt_events"
+        return 1
+    }
+    prompt_configuration
+)
+assert_equal $'port\npassword\nadvanced' \
+    "$(tr -d '\r' < "$prompt_events")" \
+    "required port prompt must precede password and optional advanced settings"
+grep -Fq 'Required basic configuration:' "$prompt_output" ||
+    fail "interactive install must label required basic configuration"
+grep -Fq 'Optional advanced configuration:' "$prompt_output" ||
+    fail "interactive install must label optional advanced configuration"
+
+update_prompt_output="$tmp_dir/update-prompt-output"
+(
+    INTERACTIVE=1
+    INSTALL_MODE="update"
+    RECONFIGURE=0
+    PORT_OPTION=""
+    PASSWORD_FILE_OPTION=""
+    PASSWORD_DIRECT_OPTION=""
+    PORT=12000
+    PASSWORD_VALUE="12345678"
+    exec 3> "$update_prompt_output"
+    prompt_configuration
+)
+grep -Fq 'TCP/UDP listen port: 12000 (preserved; use --reconfigure to change)' \
+    "$update_prompt_output" || fail "default update must display the preserved port"
+grep -Fq 'Server authentication password: preserved' "$update_prompt_output" ||
+    fail "default update must report that the password is preserved"
+
+configuration_line="$(grep -n '^    resolve_configuration$' "$INSTALLER" | cut -d: -f1)"
+target_version_line="$(grep -n '^    resolve_target_version$' "$INSTALLER" | cut -d: -f1)"
+[[ -n "$configuration_line" && -n "$target_version_line" ]] ||
+    fail "installer main flow calls must be discoverable"
+if [[ -n "$configuration_line" && -n "$target_version_line" ]] &&
+   (( configuration_line >= target_version_line )); then
+    fail "basic configuration must run before remote version resolution"
+fi
+
 ROLLBACK_DIR="$tmp_dir/rollback"
 install -d "$ROLLBACK_DIR"
 original_path="$tmp_dir/config"
