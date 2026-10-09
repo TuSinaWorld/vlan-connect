@@ -3,6 +3,10 @@
 #include "../support/frame_test_utils.h"
 #include <cassert>
 #include <vector>
+#ifdef VLAN_GUI_POLICY_TESTS
+#include <QCoreApplication>
+void runGuiPolicyDecodeTests();
+#endif
 
 using namespace VLan;
 using namespace VLanTest;
@@ -95,7 +99,14 @@ static void testSignalRelayFallbackPayload() {
     assert(parsed.remaining() == sizeof(packet));
 }
 
-int main() {
+int main(int argc, char** argv) {
+#ifdef VLAN_GUI_POLICY_TESTS
+    QCoreApplication application(argc, argv);
+    runGuiPolicyDecodeTests();
+#else
+    (void)argc;
+    (void)argv;
+#endif
     testFragmentedAndBatchedFrames();
     testCallbackDisconnectStopsBatch();
     testKnownMessageTailIsMalformed();

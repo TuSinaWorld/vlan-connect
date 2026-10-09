@@ -17,12 +17,13 @@ TunnelManager::TunnelManager(QObject* parent)
       m_roomMtu(ROOM_MTU_DEFAULT),
       m_tunUploadBytes(0), m_tunDownloadBytes(0),
       m_tunGeneration(0),
+      m_lastDropLogMs(0), m_hasDropLog(false),
       m_dataPlaneState(DataPlaneState::Stopped),
       m_securityMode(DataPlaneSecurityMode::Unconfigured),
       m_secureSessionId(0)
 {
     m_udpSocket = new QUdpSocket(this);
-    m_udpSocket->bind(QHostAddress(QHostAddress::Any), quint16(0));
+    m_udpSocket->bind(QHostAddress(QHostAddress::AnyIPv4), quint16(0));
     connect(m_udpSocket, &QUdpSocket::readyRead, this, &TunnelManager::onUdpReadyRead);
 
     m_kcpTimer = new QTimer(this);
@@ -98,17 +99,30 @@ void TunnelManager::clearSecurityContext() {
     m_securityMode = DataPlaneSecurityMode::Unconfigured;
 }
 
-bool TunnelManager::startDataPlane() {
+bool TunnelManager::startDataPlane(bool requiresUdp) {
     if (m_dataPlaneState == DataPlaneState::Running)
         return true;
-    if (!m_tun || m_securityMode == DataPlaneSecurityMode::Unconfigured) {
+    if (!m_tun || m_securityMode == DataPlaneSecurityMode::Unconfigured ||
+        m_serverAddr.isNull() || m_serverUdpPort == 0 || m_myPeerId == 0 ||
+        m_myVirtualIP == 0) {
         LogManager::instance().logError("[tunnel] Cannot start unconfigured data plane");
         return false;
+    }
+    if (m_udpSocket->state() != QAbstractSocket::BoundState &&
+        !m_udpSocket->bind(QHostAddress(QHostAddress::AnyIPv4), quint16(0))) {
+        LogManager::instance().logError(QString("[tunnel] UDP bind failed: %1")
+                                       .arg(m_udpSocket->errorString()));
+        if (requiresUdp)
+            return false;
     }
     setTunAdapter(m_tun);
     m_dataPlaneState = DataPlaneState::Running;
     m_kcpTimer->start(5);
-    m_udpKeepaliveTimer->start(UDP_KEEPALIVE_INTERVAL_MS);
+    if (requiresUdp) {
+        m_udpKeepaliveTimer->start(UDP_KEEPALIVE_INTERVAL_MS);
+        // Register the authenticated UDP endpoint before peers start probing.
+        onUdpKeepalive();
+    }
     return true;
 }
 
@@ -319,11 +333,16 @@ void TunnelManager::routeFromTun(const QByteArray& ipPacket) {
     if (!dataPlaneAllowsTraffic(m_dataPlaneState, m_securityMode)) {
         return;
     }
-    if (!validateOutboundOverlayIpv4(
+    const OverlayPacketResult validation = validateOutboundOverlayIpv4(
             reinterpret_cast<const uint8_t*>(ipPacket.constData()),
             static_cast<size_t>(ipPacket.size()), m_roomMtu,
-            m_myVirtualIP).isValid())
+            m_myVirtualIP);
+    if (!validation.isValid()) {
+        if (validation.error != OverlayPacketError::NotIpv4)
+            recordPacketDrop(QString("tun-out/%1")
+                             .arg(overlayPacketErrorName(validation.error)));
         return;
+    }
     m_tunUploadBytes += static_cast<quint64>(ipPacket.size());
 
     uint32_t dstIP = extractDstIP(
@@ -333,13 +352,17 @@ void TunnelManager::routeFromTun(const QByteArray& ipPacket) {
         if (g_verboseLog)
             LogManager::instance().logDetail(QString("[tunnel] routeFromTun BROADCAST size=%1 peers=%2").arg(ipPacket.size()).arg(m_peerById.size()));
         for (auto it = m_peerById.begin(); it != m_peerById.end(); ++it) {
-            it.value()->sendData(ipPacket);
+            if (it.value()->sendData(ipPacket) < 0)
+                recordPacketDrop("peer-send-unavailable", it.key());
         }
     } else {
         PeerConnection* peer = peerByVirtualIP(dstIP);
         if (g_verboseLog)
             LogManager::instance().logDetail(QString("[tunnel] routeFromTun UNICAST dst=%1 size=%2 found=%3").arg(virtualIPToString(dstIP)).arg(ipPacket.size()).arg(peer != nullptr));
-        if (peer) peer->sendData(ipPacket);
+        if (!peer)
+            recordPacketDrop("no-peer-route");
+        else if (peer->sendData(ipPacket) < 0)
+            recordPacketDrop("peer-send-unavailable", peer->peerId());
     }
 }
 
@@ -358,20 +381,46 @@ void TunnelManager::routeToTun(uint32_t peerId, const QByteArray& ipPacket) {
         return;
     }
     PeerConnection* peer = peerById(peerId);
-    if (!peer || !validateInboundOverlayIpv4(
+    if (!peer) {
+        recordPacketDrop("unknown-inbound-peer", peerId);
+        return;
+    }
+    const OverlayPacketResult validation = validateInboundOverlayIpv4(
             reinterpret_cast<const uint8_t*>(ipPacket.constData()),
             static_cast<size_t>(ipPacket.size()), m_roomMtu,
-            peer->virtualIP(), m_myVirtualIP).isValid())
+            peer->virtualIP(), m_myVirtualIP);
+    if (!validation.isValid()) {
+        recordPacketDrop(QString("tun-in/%1")
+                         .arg(overlayPacketErrorName(validation.error)), peerId);
         return;
+    }
     if (g_verboseLog)
         LogManager::instance().logDetail(QString("[tunnel] routeToTun size=%1").arg(ipPacket.size()));
     if (m_tun && m_tun->writePacket(ipPacket))
         m_tunDownloadBytes += static_cast<quint64>(ipPacket.size());
+    else
+        recordPacketDrop("tun-write-failed", peerId);
+}
+
+void TunnelManager::recordPacketDrop(const QString& reason, uint32_t peerId) {
+    ++m_packetDrops[reason];
+    const uint32_t now = currentTimeMs();
+    if (m_hasDropLog && now - m_lastDropLogMs < 5000) return;
+    m_hasDropLog = true;
+    m_lastDropLogMs = now;
+    QStringList counts;
+    for (auto it = m_packetDrops.constBegin(); it != m_packetDrops.constEnd(); ++it)
+        counts.append(QString("%1=%2").arg(it.key()).arg(it.value()));
+    LogManager::instance().logError(
+        QString("[tunnel] Packet dropped: reason=%1 peer=%2 counts={%3}")
+        .arg(reason).arg(peerId).arg(counts.join(", ")));
 }
 
 void TunnelManager::resetTrafficCounters() {
     m_tunUploadBytes = 0;
     m_tunDownloadBytes = 0;
+    m_packetDrops.clear();
+    m_hasDropLog = false;
 }
 
 void TunnelManager::trafficCounters(quint64* uploadBytes, quint64* downloadBytes) const {
@@ -404,7 +453,8 @@ void TunnelManager::sendUdpDatagram(const QByteArray& datagram,
         memcpy(pkt.data() + 1 + SECURE_SESSION_ID_SIZE,
                enc.data(), enc.size());
     }
-    m_udpSocket->writeDatagram(pkt, addr, port);
+    if (m_udpSocket->writeDatagram(pkt, addr, port) != pkt.size())
+        recordPacketDrop(QString("udp-send/%1").arg(m_udpSocket->errorString()));
 }
 
 // ───────── UDP receive ─────────
@@ -421,24 +471,34 @@ void TunnelManager::onUdpReadyRead() {
         if (!dataPlaneAllowsTraffic(m_dataPlaneState, m_securityMode)) {
             continue;
         }
-        if (sender != m_serverAddr || senderPort != m_serverUdpPort)
+        if (sender != m_serverAddr || senderPort != m_serverUdpPort) {
+            recordPacketDrop("udp-endpoint-mismatch");
             continue;
+        }
         if (datagram.isEmpty()) continue;
         uint8_t pktType = static_cast<uint8_t>(datagram[0]);
 
         if (m_securityMode != DataPlaneSecurityMode::Secure ||
-            pktType != UDP_ENCRYPTED)
+            pktType != UDP_ENCRYPTED) {
+            recordPacketDrop("udp-plaintext-rejected");
             continue;
-        if (datagram.size() < 1 + SECURE_SESSION_ID_SIZE + SECURE_FRAME_OVERHEAD)
+        }
+        if (datagram.size() < 1 + SECURE_SESSION_ID_SIZE + SECURE_FRAME_OVERHEAD) {
+            recordPacketDrop("udp-truncated");
             continue;
+        }
         uint32_t sid = readU32BE(reinterpret_cast<const uint8_t*>(datagram.constData()) + 1);
-        if (sid != m_secureSessionId)
+        if (sid != m_secureSessionId) {
+            recordPacketDrop("udp-session-mismatch");
             continue;
+        }
         std::vector<uint8_t> plain;
         const uint8_t* frame = reinterpret_cast<const uint8_t*>(datagram.constData()) + 1 + SECURE_SESSION_ID_SIZE;
         size_t frameLen = static_cast<size_t>(datagram.size() - 1 - SECURE_SESSION_ID_SIZE);
-        if (!m_udpCipher.decrypt(frame, frameLen, &plain) || plain.empty())
+        if (!m_udpCipher.decrypt(frame, frameLen, &plain) || plain.empty()) {
+            recordPacketDrop("udp-decrypt-or-replay-rejected");
             continue;
+        }
         datagram = QByteArray(reinterpret_cast<const char*>(plain.data()),
                               static_cast<int>(plain.size()));
         pktType = static_cast<uint8_t>(datagram[0]);

@@ -1,6 +1,7 @@
 #include "../../common/byte_buffer.h"
 #include "../../common/secure_frame.h"
 #include "../../common/signal_message_validator.h"
+#include "../../common/traffic_policy_codec.h"
 #include <cstring>
 #include <cstdio>
 #include <utility>
@@ -46,6 +47,49 @@ void writeDefaultPolicy(ByteBuffer* body, bool tcpPolicy) {
     body->writeU8(static_cast<uint8_t>(policy.transportMode));
     body->writeU8(static_cast<uint8_t>(policy.fecMode));
     body->writeU8(static_cast<uint8_t>(policy.kcpProfile));
+}
+
+void testTrafficPolicyWireOrder() {
+    const uint8_t modes[] = { MODE_RELAY_RAW_UDP, MODE_RELAY_KCP, MODE_RELAY_TCP };
+    for (size_t i = 0; i < sizeof(modes); ++i) {
+        for (uint8_t fec = FEC_NONE; fec <= FEC_200; ++fec) {
+            if (modes[i] == MODE_RELAY_TCP && fec != FEC_NONE) continue;
+            for (uint8_t profile = KCP_PROFILE_REALTIME;
+                 profile <= KCP_PROFILE_BULK; ++profile) {
+                ByteBuffer wire;
+                // Distinct TCP/UDP policies also expose reads across boundaries.
+                wire.writeU8(modes[i]);
+                wire.writeU8(fec);
+                wire.writeU8(profile);
+                wire.writeU8(MODE_RELAY_TCP);
+                wire.writeU8(FEC_NONE);
+                wire.writeU8(KCP_PROFILE_REALTIME);
+                wire.writeU16(ROOM_MTU_SAFE);
+                const RoomTrafficPolicy tcp =
+                    readTrafficPolicy(wire, makeDefaultTcpPolicy());
+                const RoomTrafficPolicy udp =
+                    readTrafficPolicy(wire, makeDefaultUdpPolicy());
+                if (tcp.transportMode != modes[i] || tcp.fecMode != fec ||
+                    tcp.kcpProfile != profile ||
+                    udp.transportMode != MODE_RELAY_TCP ||
+                    udp.fecMode != FEC_NONE ||
+                    udp.kcpProfile != KCP_PROFILE_REALTIME ||
+                    wire.readU16() != ROOM_MTU_SAFE || !wire.atEnd()) {
+                    std::fprintf(stderr, "traffic policy wire order: mode=%u fec=%u profile=%u\n",
+                                 modes[i], fec, profile);
+                    ++g_failures;
+                }
+            }
+        }
+    }
+    const uint8_t truncated[] = { MODE_RELAY_TCP, FEC_NONE };
+    for (size_t length = 0; length < 3; ++length) {
+        ByteBuffer wire(truncated, length);
+        bool rejected = false;
+        try { readTrafficPolicy(wire, makeDefaultTcpPolicy()); }
+        catch (const ByteBufferReadError&) { rejected = true; }
+        if (!rejected) ++g_failures;
+    }
 }
 
 void testServerHello() {
@@ -488,6 +532,7 @@ int main() {
     testServerHello();
     testFixedMessages();
     testRoomMessages();
+    testTrafficPolicyWireOrder();
     testDataMessages();
     testByteBufferReadError();
     testInjectedCryptoFailures();

@@ -64,13 +64,14 @@ public:
     void setRoomMtu(uint16_t mtu) { m_roomMtu = normalizeRoomMtu(mtu); }
     bool installSecureSession(uint32_t sessionId, const QByteArray& master);
     void clearSecurityContext();
-    bool startDataPlane();
+    bool startDataPlane(bool requiresUdp = true);
     void stopDataPlane();
     DataPlaneState dataPlaneState() const { return m_dataPlaneState; }
     DataPlaneSecurityMode securityMode() const { return m_securityMode; }
     void resetTrafficCounters();
     void trafficCounters(quint64* uploadBytes, quint64* downloadBytes) const;
     void addTunDownloadBytes(quint64 bytes);
+    void recordPacketDrop(const QString& reason, uint32_t peerId = 0);
 
 signals:
     void peerDataReceived(uint32_t peerId, QByteArray data);
@@ -125,6 +126,9 @@ private:
     quint64      m_tunUploadBytes;
     quint64      m_tunDownloadBytes;
     quint64      m_tunGeneration;
+    QMap<QString, quint64> m_packetDrops;
+    uint32_t     m_lastDropLogMs;
+    bool         m_hasDropLog;
     DataPlaneState m_dataPlaneState;
     DataPlaneSecurityMode m_securityMode;
     uint32_t     m_secureSessionId;

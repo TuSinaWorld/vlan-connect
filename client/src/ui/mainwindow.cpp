@@ -231,6 +231,8 @@ MainWindow::MainWindow(QWidget* parent)
     setupUI();
     loadPersistentSettings();
     initTray();
+    // Include startup diagnostics emitted before the window connected to LogManager.
+    onDetailLogToggled(m_showDetailLog);
 
     connect(m_roomMgr, &RoomManager::connectionStatusChanged,
             this, &MainWindow::onConnectionStatusChanged);

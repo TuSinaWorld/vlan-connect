@@ -899,19 +899,19 @@ void SignalServer::handleUdpPacket(int fd) {
         if (srcId != src->peerId || dstId == 0 || src->roomId == 0 ||
             (hdr->trafficClass != TRAFFIC_TCP &&
              hdr->trafficClass != TRAFFIC_UDP)) {
-            logDataDropSampled("encrypted UDP identity/class mismatch");
+            logDataDropSampled("encrypted UDP identity/class mismatch", src->peerId, dstId);
             break;
         }
         src->udpAddr = from;
         src->udpAddrKnown = true;
         ClientSession* dstClient = findClientByPeerId(dstId);
         if (!dstClient || !dstClient->udpAddrKnown) {
-            logDataDropSampled("encrypted UDP destination unavailable");
+            logDataDropSampled("encrypted UDP destination unavailable", srcId, dstId);
             break;
         }
         ClientSession& dst = *dstClient;
         if (dst.roomId == 0 || dst.roomId != src->roomId) {
-            logDataDropSampled("encrypted UDP cross-room destination");
+            logDataDropSampled("encrypted UDP cross-room destination", srcId, dstId);
             break;
         }
         sendEncryptedUdp(fd, dst, plain, dst.udpAddr);
@@ -2314,11 +2314,12 @@ void SignalServer::clearSendBuffer(ClientSession& c, bool dataChannel) {
         ? 0 : m_globalSendBytes - count;
 }
 
-void SignalServer::logDataDropSampled(const char* reason) {
+void SignalServer::logDataDropSampled(const char* reason,
+                                     uint32_t sourcePeerId, uint32_t destinationPeerId) {
     const time_t now = time(nullptr);
     if (m_lastDataDropLog == 0 || now - m_lastDataDropLog >= 5) {
-        LOG_DETAIL("[server] Dropped data packet: %s (suppressed=%zu)",
-                   reason, m_suppressedDataDrops);
+        LOG_ERROR("[server] Dropped data packet: %s srcPeer=%u dstPeer=%u (suppressed=%zu)",
+                  reason, sourcePeerId, destinationPeerId, m_suppressedDataDrops);
         m_lastDataDropLog = now;
         m_suppressedDataDrops = 0;
     } else {

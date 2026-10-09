@@ -2,6 +2,7 @@
 #include "cli_log.h"
 #include "signal_message_validator.h"
 #include "tcp_frame_probe.h"
+#include "traffic_policy_codec.h"
 #include <cstring>
 #include <algorithm>
 
@@ -257,10 +258,8 @@ CliRoomListItem CliSignalClient::readRoomListItem(ByteBuffer& bb) {
     info.roomName = bb.readString();
     info.playerCount = bb.readU8();
     info.maxPlayers = bb.readU8();
-    info.tcpPolicy = normalizeTrafficPolicy(
-        bb.readU8(), bb.readU8(), bb.readU8(), makeDefaultTcpPolicy());
-    info.udpPolicy = normalizeTrafficPolicy(
-        bb.readU8(), bb.readU8(), bb.readU8(), makeDefaultUdpPolicy());
+    info.tcpPolicy = readTrafficPolicy(bb, makeDefaultTcpPolicy());
+    info.udpPolicy = readTrafficPolicy(bb, makeDefaultUdpPolicy());
     info.passwordProtected = bb.readU8();
     info.mtu = bb.readU16();
     return info;
@@ -521,12 +520,10 @@ bool CliSignalClient::processMessage(uint8_t msgType,
         case MSG_ROOM_CREATED: {
             const uint32_t roomId = bb.readU32();
             const uint32_t virtualIP = bb.readU32();
-            const RoomTrafficPolicy tcpPolicy = normalizeTrafficPolicy(
-                bb.readU8(), bb.readU8(), bb.readU8(),
-                makeDefaultTcpPolicy());
-            const RoomTrafficPolicy udpPolicy = normalizeTrafficPolicy(
-                bb.readU8(), bb.readU8(), bb.readU8(),
-                makeDefaultUdpPolicy());
+            const RoomTrafficPolicy tcpPolicy =
+                readTrafficPolicy(bb, makeDefaultTcpPolicy());
+            const RoomTrafficPolicy udpPolicy =
+                readTrafficPolicy(bb, makeDefaultUdpPolicy());
             const bool passwordProtected = bb.readU8() != 0;
             const uint16_t mtu = bb.readU16();
             Buffer leaseToken(RECONNECT_TOKEN_SIZE);
@@ -539,12 +536,10 @@ bool CliSignalClient::processMessage(uint8_t msgType,
         case MSG_JOIN_RESP: {
             const uint32_t roomId = bb.readU32();
             const uint32_t virtualIP = bb.readU32();
-            const RoomTrafficPolicy tcpPolicy = normalizeTrafficPolicy(
-                bb.readU8(), bb.readU8(), bb.readU8(),
-                makeDefaultTcpPolicy());
-            const RoomTrafficPolicy udpPolicy = normalizeTrafficPolicy(
-                bb.readU8(), bb.readU8(), bb.readU8(),
-                makeDefaultUdpPolicy());
+            const RoomTrafficPolicy tcpPolicy =
+                readTrafficPolicy(bb, makeDefaultTcpPolicy());
+            const RoomTrafficPolicy udpPolicy =
+                readTrafficPolicy(bb, makeDefaultUdpPolicy());
             const bool passwordProtected = bb.readU8() != 0;
             const uint16_t mtu = bb.readU16();
             const uint8_t count = bb.readU8();

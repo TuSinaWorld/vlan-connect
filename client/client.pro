@@ -69,6 +69,8 @@ HEADERS += \
     ../3rdparty/cm256cc/export.h \
     ../common/protocol.h \
     ../common/byte_buffer.h \
+    ../common/traffic_policy_codec.h \
+    ../common/relay_probe_watchdog.h \
     ../common/net_common.h \
     ../common/msvc2015_compat.h \
     ../common/payload_cipher.h \

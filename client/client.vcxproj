@@ -164,6 +164,8 @@
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="..\common\byte_buffer.h" />
+    <ClInclude Include="..\common\traffic_policy_codec.h" />
+    <ClInclude Include="..\common\relay_probe_watchdog.h" />
     <ClInclude Include="..\3rdparty\kcp\ikcp.h" />
     <ClInclude Include="..\3rdparty\cm256cc\cm256.h" />
     <ClInclude Include="..\3rdparty\cm256cc\gf256.h" />

@@ -84,6 +84,12 @@
     <ClInclude Include="..\common\byte_buffer.h">
       <Filter>Header Files</Filter>
     </ClInclude>
+    <ClInclude Include="..\common\traffic_policy_codec.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="..\common\relay_probe_watchdog.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
     <ClInclude Include="..\3rdparty\kcp\ikcp.h">
       <Filter>Header Files</Filter>
     </ClInclude>

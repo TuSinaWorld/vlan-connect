@@ -83,6 +83,24 @@ target_include_directories(gui_signal_tests PRIVATE
     ${VLAN_COMMON_INCLUDES})
 vlan_test_output(gui_signal_tests)
 
+find_package(Qt5 COMPONENTS Core Network QUIET)
+if(Qt5Core_FOUND AND Qt5Network_FOUND)
+    target_sources(gui_signal_tests PRIVATE
+        gui/policy_decode_tests.cpp
+        "${VLAN_ROOT}/client/src/network/signal_client.cpp"
+        "${VLAN_ROOT}/client/src/ui/log_manager.cpp"
+        "${VLAN_ROOT}/client/src/ui/ui_strings.cpp"
+        ${VLAN_MONOCYPHER})
+    set_target_properties(gui_signal_tests PROPERTIES AUTOMOC ON)
+    target_compile_definitions(gui_signal_tests PRIVATE VLAN_GUI_POLICY_TESTS)
+    target_link_libraries(gui_signal_tests PRIVATE Qt5::Core Qt5::Network)
+    if(WIN32)
+        target_link_libraries(gui_signal_tests PRIVATE ws2_32 bcrypt)
+    endif()
+else()
+    message(STATUS "Qt Core/Network unavailable: production GUI policy callback tests skipped")
+endif()
+
 add_executable(cli_signal_tests
     cli/cli_signal_tests.cpp)
 target_include_directories(cli_signal_tests PRIVATE
@@ -122,7 +140,7 @@ if(WIN32)
     target_compile_definitions(wintun_lifecycle_tests PRIVATE
         WIN32_LEAN_AND_MEAN NOMINMAX)
     target_link_libraries(wintun_lifecycle_tests PRIVATE
-        Qt5::Core iphlpapi)
+        Qt5::Core iphlpapi ws2_32)
 else()
     find_program(BASH_EXECUTABLE bash)
     if(NOT BASH_EXECUTABLE)
