@@ -1,6 +1,9 @@
 #include "log_manager.h"
 #include <QDateTime>
 #include <QMutexLocker>
+#include <QDir>
+#include <QFile>
+#include <QStandardPaths>
 
 namespace VLan {
 
@@ -13,6 +16,18 @@ LogManager::LogManager(QObject* parent) : QObject(parent) {}
 
 void LogManager::installHandler() {
     qInstallMessageHandler(LogManager::messageHandler);
+    const QString base = QStandardPaths::writableLocation(QStandardPaths::AppLocalDataLocation);
+    const QString directory = base + "/logs";
+    if (!base.isEmpty() && QDir().mkpath(directory)) {
+        m_logPath = directory + "/client.log";
+        QFile file(m_logPath);
+        if (!file.open(QIODevice::WriteOnly | QIODevice::Append))
+            m_logPath.clear();
+    }
+    if (m_logPath.isEmpty())
+        logError(QStringLiteral("[log] Cannot save diagnostic logs; check local application data permissions"));
+    else
+        logNormal(QString("[log] Diagnostic log: %1").arg(m_logPath));
 }
 
 void LogManager::messageHandler(QtMsgType type, const QMessageLogContext&,
@@ -79,9 +94,29 @@ void LogManager::appendEntry(const QString& msg, LogLevel level, LogColor color)
         m_entries.append(e);
         if (m_entries.size() > MAX_ENTRIES)
             m_entries.removeFirst();
+        persistEntry(e);
     }
 
     emit logMessage(formatHtml(e), static_cast<int>(level));
+}
+
+void LogManager::persistEntry(const LogEntry& entry) {
+    // Called with m_mutex held. Store already-masked normal/error messages;
+    // packet-by-packet detail stays in the in-memory verbose view.
+    if (m_logPath.isEmpty() || entry.level != LOG_LEVEL_NORMAL) return;
+    QFile file(m_logPath);
+    if (file.size() >= 512 * 1024) {
+        QFile::remove(m_logPath + ".2");
+        if (QFile::exists(m_logPath + ".1") &&
+            !QFile::rename(m_logPath + ".1", m_logPath + ".2"))
+            return;
+        if (!QFile::rename(m_logPath, m_logPath + ".1")) return;
+    }
+    if (!file.open(QIODevice::WriteOnly | QIODevice::Append)) return;
+    const QString line = QString("[%1] %2\n")
+        .arg(QDateTime::currentDateTime().toString(Qt::ISODateWithMs))
+        .arg(entry.message);
+    file.write(line.toUtf8());
 }
 
 QString LogManager::formatHtml(const LogEntry& e) {

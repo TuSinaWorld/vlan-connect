@@ -8,6 +8,7 @@
 #include <QMap>
 #include <QTimer>
 #include "protocol.h"
+#include "relay_probe_watchdog.h"
 
 namespace VLan {
 
@@ -229,6 +230,7 @@ private:
     RoomTrafficPolicy m_savedUdpPolicy;
     QList<RoomListItem> m_cachedRoomList;
     QMap<TransportKey, bool> m_pendingRebuild;
+    QMap<TransportKey, RelayProbeWatchdog> m_probeWatchdogs;
 };
 
 } // namespace VLan

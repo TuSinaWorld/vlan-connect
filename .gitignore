@@ -14,6 +14,7 @@
 /client/GeneratedFiles/
 
 # Build outputs
+/build-tests/
 /client/debug/
 /client/release/
 /client-cli/linux/vlan-cli

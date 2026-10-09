@@ -157,7 +157,8 @@ private:
                           const uint8_t* second, size_t secondLen);
     void consumeSendBuffer(ClientSession& c, bool dataChannel, size_t count);
     void clearSendBuffer(ClientSession& c, bool dataChannel);
-    void logDataDropSampled(const char* reason);
+    void logDataDropSampled(const char* reason,
+                            uint32_t sourcePeerId = 0, uint32_t destinationPeerId = 0);
     void logSendRejectSampled(const char* reason, uint32_t peerId,
                               size_t queuedBytes);
 

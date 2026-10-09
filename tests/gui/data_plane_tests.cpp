@@ -1,6 +1,7 @@
 #include "../../common/protocol.h"
 #include "../../common/secure_frame.h"
 #include "../../common/overlay_packet_validator.h"
+#include "../../common/relay_probe_watchdog.h"
 #include <cassert>
 #include <cstdint>
 #include <vector>
@@ -102,9 +103,26 @@ static void testCipherResetRestartsCounters() {
     assert(readU64BE(afterReset.data()) == 0);
 }
 
+static void testProbeWatchdog() {
+    RelayProbeWatchdog watchdog;
+    assert(!watchdog.observe(0, false));
+    assert(!watchdog.observe(9999, false));
+    assert(watchdog.observe(10000, false));
+    assert(!watchdog.observe(60000, false));
+    assert(!watchdog.observe(60001, true));
+    assert(!watchdog.observe(60002, false));
+    assert(watchdog.observe(70002, false));
+
+    RelayProbeWatchdog wrapping;
+    assert(!wrapping.observe(UINT32_MAX - 4999, false));
+    assert(!wrapping.observe(4999, false));
+    assert(wrapping.observe(5000, false));
+}
+
 int main() {
     testStateMatrix();
     testOverlayValidation();
     testCipherResetRestartsCounters();
+    testProbeWatchdog();
     return 0;
 }

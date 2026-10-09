@@ -1,6 +1,7 @@
 ﻿#include "tun_adapter.h"
 #include "protocol.h"
 #include "net_common.h"
+#include <netioapi.h>
 #include <QProcess>
 #include "../ui/log_manager.h"
 #include <cstring>
@@ -56,6 +57,7 @@ bool TunAdapter::initialize(const QString& adapterName) {
     if (m_adapter || m_session || isRunning())
         return false;
     if (!loadWinTun()) return false;
+    m_adapterName = adapterName;
 
     std::wstring wname = adapterName.toStdWString();
     m_adapter = m_api->createAdapter(wname.c_str(), L"VLan", nullptr);
@@ -70,36 +72,43 @@ bool TunAdapter::initialize(const QString& adapterName) {
 bool TunAdapter::configureIP(uint32_t ip, uint32_t mask, int mtu) {
     m_ip   = ip;
     m_mask = mask;
+    m_configurationError.clear();
+    const auto fail = [this](const QString& message) {
+        m_configurationError = message;
+        emit errorOccurred(message);
+        return false;
+    };
 
     QString sIP   = virtualIPToString(ip);
     QString sMask = virtualIPToString(mask);
 
-    // Use netsh to configure the adapter IP
-    int prefixLen = 0;
-    uint32_t m = mask;
-    while (m & 0x80000000) { ++prefixLen; m <<= 1; }
-
-    QString cmd = QString("netsh interface ip set address name=\"VLan\" "
-                          "static %1 %2").arg(sIP).arg(sMask);
-    LogManager::instance().logDetail(QString("[TUN] Configuring IP: %1").arg(cmd));
-
-    int ret = QProcess::execute("cmd", QStringList() << "/C" << cmd);
+    LogManager::instance().logNormal(QString("[TUN] Configuring adapter=%1 IP=%2 mask=%3 MTU=%4")
+                                    .arg(m_adapterName).arg(sIP).arg(sMask).arg(mtu));
+    int ret = QProcess::execute("netsh", QStringList()
+        << "interface" << "ipv4" << "set" << "address"
+        << ("name=" + m_adapterName) << "static" << sIP << sMask
+        << "gateway=none" << "store=active");
     if (ret != 0) {
-        emit errorOccurred("Failed to configure IP on virtual adapter");
-        return false;
+        return fail(QString("Failed to configure virtual adapter IP (netsh exit %1)").arg(ret));
     }
 
-    // Set metric high so default route stays on physical NIC
-    QString metricCmd = QString("netsh interface ip set interface \"VLan\" metric=9999");
-    QProcess::execute("cmd", QStringList() << "/C" << metricCmd);
+    // Windows adds the interface metric to the route metric. There is no
+    // default gateway on this adapter; metric=9999 only made overlay and
+    // limited broadcast routes lose to physical/VPN interfaces.
+    ret = QProcess::execute("netsh", QStringList()
+        << "interface" << "ipv4" << "set" << "interface"
+        << ("interface=" + m_adapterName) << "metric=5" << "store=active");
+    if (ret != 0)
+        return fail(QString("Failed to configure virtual adapter metric (netsh exit %1)").arg(ret));
 
     if (mtu > 0) {
-        QString mtuCmd = QString("netsh interface ipv4 set subinterface \"VLan\" mtu=%1 store=active").arg(mtu);
-        int mtuRet = QProcess::execute("cmd", QStringList() << "/C" << mtuCmd);
+        int mtuRet = QProcess::execute("netsh", QStringList()
+            << "interface" << "ipv4" << "set" << "subinterface"
+            << m_adapterName << QString("mtu=%1").arg(mtu) << "store=active");
         if (mtuRet == 0)
             LogManager::instance().logDetail(QString("[TUN] MTU set to %1").arg(mtu));
         else
-            LogManager::instance().logError(QString("[TUN] Failed to set MTU to %1 (exit code %2)").arg(mtu).arg(mtuRet));
+            return fail(QString("Failed to set virtual adapter MTU=%1 (netsh exit %2)").arg(mtu).arg(mtuRet));
     }
 
     // Allow all inbound traffic from the virtual subnet through Windows Firewall
@@ -125,31 +134,61 @@ bool TunAdapter::configureIP(uint32_t ip, uint32_t mask, int mtu) {
         LogManager::instance().logDetail(QString("[TUN] Firewall rule added: allow inbound from 10.10.0.0/24"));
     } else {
         LogManager::instance().logError(QString("[TUN] Failed to add firewall rule after 3 attempts"));
-        emit errorOccurred(QString::fromUtf8(
-            "防火墙规则添加失败，游戏端口可能无法联通。请检查 Windows 防火墙服务是否正常运行。"));
     }
     emit firewallRuleChanged(true, fwRet == 0);
+    if (fwRet != 0)
+        return fail(QString::fromUtf8(
+            "防火墙规则添加失败，已取消入房。请检查 Windows 防火墙服务及管理员权限。"));
 
     // Route limited broadcasts (255.255.255.255) through VLan so that
     // game room discovery via UDP broadcast works across the virtual LAN.
     QProcess::execute("netsh", QStringList()
         << "interface" << "ipv4" << "delete" << "route"
-        << "255.255.255.255/32" << "VLan"
+        << "255.255.255.255/32" << m_adapterName
         << "store=active");
 
     int bcastRet = QProcess::execute("netsh", QStringList()
         << "interface" << "ipv4" << "add" << "route"
-        << "255.255.255.255/32" << "VLan"
-        << sIP << "metric=1" << "store=active");
+        << "255.255.255.255/32" << m_adapterName
+        << "0.0.0.0" << "metric=1" << "store=active");
 
     if (bcastRet == 0) {
         m_broadcastRouteActive = true;
         LogManager::instance().logDetail(QString("[TUN] Broadcast route added: 255.255.255.255/32 via VLan"));
     } else {
-        LogManager::instance().logError(QString("[TUN] Failed to add broadcast route (exit code %1)").arg(bcastRet));
+        return fail(QString("Failed to add virtual LAN broadcast route (netsh exit %1)").arg(bcastRet));
     }
 
     return true;
+}
+
+bool TunAdapter::checkRoute(uint32_t destination, QString* error) const {
+    NET_LUID luid = {};
+    const std::wstring name = m_adapterName.toStdWString();
+    DWORD result = ConvertInterfaceAliasToLuid(name.c_str(), &luid);
+    SOCKADDR_INET target = {};
+    target.Ipv4.sin_family = AF_INET;
+    target.Ipv4.sin_addr.s_addr = htonl(destination);
+    MIB_IPFORWARD_ROW2 route = {};
+    SOCKADDR_INET source = {};
+    if (result == NO_ERROR) {
+        // Wintun must have an active session. Address DAD and media-up can
+        // complete after netsh returns; allow a bounded readiness interval.
+        for (int attempt = 0; attempt < 60; ++attempt) {
+            result = GetBestRoute2(nullptr, 0, nullptr, &target, 0, &route, &source);
+            if (result == NO_ERROR && route.InterfaceLuid.Value == luid.Value &&
+                source.Ipv4.sin_addr.s_addr == htonl(m_ip))
+                return true;
+            Sleep(50);
+        }
+    }
+    if (error) {
+        *error = QString::fromUtf8(
+            "虚拟局域网路由冲突或不可用：目标 %1，所选接口 %2，源地址 %3，Windows 错误 %4。请检查 VPN/其它网卡的 10.10.0.0/24 路由。")
+            .arg(virtualIPToString(destination)).arg(route.InterfaceIndex)
+            .arg(virtualIPToString(ntohl(source.Ipv4.sin_addr.s_addr))).arg(result);
+    }
+    return false;
 }
 
 bool TunAdapter::startSession() {
@@ -212,7 +251,7 @@ void TunAdapter::shutdown() {
         m_broadcastRouteActive = false;
         int brDel = QProcess::execute("netsh", QStringList()
             << "interface" << "ipv4" << "delete" << "route"
-            << "255.255.255.255/32" << "VLan"
+            << "255.255.255.255/32" << m_adapterName
             << "store=active");
         if (brDel == 0)
             LogManager::instance().logDetail(QString("[TUN] Broadcast route removed"));

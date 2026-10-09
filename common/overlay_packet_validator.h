@@ -18,6 +18,20 @@ enum class OverlayPacketError : uint8_t {
     InvalidDestination
 };
 
+inline const char* overlayPacketErrorName(OverlayPacketError error) {
+    switch (error) {
+    case OverlayPacketError::None: return "none";
+    case OverlayPacketError::Truncated: return "truncated";
+    case OverlayPacketError::NotIpv4: return "not-ipv4";
+    case OverlayPacketError::InvalidHeaderLength: return "invalid-header-length";
+    case OverlayPacketError::InvalidTotalLength: return "invalid-total-length";
+    case OverlayPacketError::ExceedsMtu: return "exceeds-mtu";
+    case OverlayPacketError::InvalidSource: return "invalid-source";
+    case OverlayPacketError::InvalidDestination: return "invalid-destination";
+    }
+    return "unknown";
+}
+
 struct OverlayPacketResult {
     OverlayPacketError error;
     uint32_t source;

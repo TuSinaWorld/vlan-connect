@@ -14,14 +14,14 @@
 
 ## 测试目标
 
-- `protocol_v8_tests`：ByteBuffer u64、v8 分页快照/delta 以及信令/数据 payload 严格校验。
+- `protocol_v8_tests`：ByteBuffer u64、v8 分页快照/delta、流量策略逐字段解码以及信令/数据 payload 严格校验。
 - `server_auth_file_tests`：服务端鉴权密码文件边界和非法内容校验。
 - `server_install_script_tests`：一键安装器的 Bash/ShellCheck 静态检查、参数边界、tag 选择、安全配置解析和回滚辅助逻辑。
 - `server_session_tests`：状态转换和信令 FD 索引约束。
-- `gui_signal_tests`：GUI 信令帧处理和回调行为。
+- `gui_signal_tests`：GUI 信令帧处理和回调行为；Qt Core/Network 可用时，通过回环 TCP 鉴权会话调用生产 `SignalClient`，验证创建、三成员入房、列表快照及 delta 的协议/FEC/profile 回调。Linux CI 安装 Qt 以运行此部分；缺少 Qt 的本地环境会明确报告跳过。
 - `cli_signal_tests`：CLI 信令帧处理和 v7 拒绝。
 - `data_channel_tests`：GUI/CLI 数据通道畸形帧隔离。
-- `data_plane_tests`：仅安全模式的数据面状态以及 IPv4 overlay 校验。
+- `data_plane_tests`：仅安全模式的数据面状态、IPv4 overlay 校验及成员探针超时、恢复、时钟回绕。
 - `linux_tun_netlink_tests`：CLI Linux 原生 rtnetlink 消息、ACK 失败与回滚。
 - `cli_raw_fec_tests`：生产 Raw UDP/FEC 重组元数据、活动项上限、内存预算与最旧项淘汰。
 - `wintun_lifecycle_tests`：Fake Wintun 的 shutdown 和资源释放顺序。

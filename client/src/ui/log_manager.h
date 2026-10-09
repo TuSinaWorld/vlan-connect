@@ -52,12 +52,14 @@ private:
 
     void appendEntry(const QString& msg, LogLevel level, LogColor color);
     QString maskSensitive(const QString& msg) const;
+    void persistEntry(const LogEntry& entry);
     static void messageHandler(QtMsgType type, const QMessageLogContext& ctx,
                                const QString& msg);
 
     QList<LogEntry> m_entries;
     QStringList     m_maskedKeywords;
     QMutex          m_mutex;
+    QString         m_logPath;
 
     static const int MAX_ENTRIES = 2000;
 };

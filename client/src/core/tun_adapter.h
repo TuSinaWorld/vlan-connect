@@ -28,6 +28,8 @@ public:
 
     bool initialize(const QString& adapterName = QStringLiteral("VLan"));
     bool configureIP(uint32_t ip, uint32_t mask, int mtu = 0);
+    bool checkRoute(uint32_t destination, QString* error) const;
+    QString configurationError() const { return m_configurationError; }
     bool startSession();
     void shutdown();
 
@@ -59,6 +61,8 @@ private:
 
     uint32_t m_ip;
     uint32_t m_mask;
+    QString m_adapterName;
+    QString m_configurationError;
 
 };
 

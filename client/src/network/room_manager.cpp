@@ -812,6 +812,12 @@ void RoomManager::onPeerLeft(uint32_t peerId) {
     PeerConnection* peer = m_tunnel->peerById(peerId);
     QString name = peer ? peer->name() : QString("Peer%1").arg(peerId);
     clearPendingRebuild(peerId);
+    for (auto it = m_probeWatchdogs.begin(); it != m_probeWatchdogs.end(); ) {
+        if (it.key().peerId == peerId)
+            it = m_probeWatchdogs.erase(it);
+        else
+            ++it;
+    }
     m_tunnel->removePeer(peerId);
     emit peerDisconnected(peerId);
     emit statusMessage(UiStrings::text("status.playerLeft").arg(name));
@@ -943,13 +949,19 @@ void RoomManager::handleTcpRelayReceived(uint32_t srcPeerId, TrafficClass cls, Q
         peer->handleLatencyProbe(cls, data);
         return;
     }
-    if (!validateInboundOverlayIpv4(
+    const OverlayPacketResult validation = validateInboundOverlayIpv4(
             reinterpret_cast<const uint8_t*>(data.constData()),
             static_cast<size_t>(data.size()), m_roomMtu,
-            peer->virtualIP(), m_myVirtualIP).isValid())
+            peer->virtualIP(), m_myVirtualIP);
+    if (!validation.isValid()) {
+        m_tunnel->recordPacketDrop(QString("tcp-in/%1")
+                                  .arg(overlayPacketErrorName(validation.error)), srcPeerId);
         return;
+    }
     if (m_tun && m_tun->writePacket(data))
         m_tunnel->addTunDownloadBytes(static_cast<quint64>(data.size()));
+    else
+        m_tunnel->recordPacketDrop("tun-write-failed", srcPeerId);
 }
 
 void RoomManager::onDataChannelConnected() {
@@ -967,6 +979,9 @@ void RoomManager::onDataChannelRelayReceived(uint32_t srcPeerId, TrafficClass cl
 RoomManager::TunSetupResult RoomManager::setupTun() {
     if (m_tun)
         return TunSetupResult(true);
+    if ((m_resolvedAddr.toIPv4Address() & VNET_MASK) == VNET_SUBNET)
+        return TunSetupResult(false, TunSetupStage::Address,
+                              UiStrings::text("status.serverSubnetConflict"));
 
     m_tun = new TunAdapter(this);
     connect(m_tun, &TunAdapter::errorOccurred,
@@ -990,17 +1005,27 @@ RoomManager::TunSetupResult RoomManager::setupTun() {
     }
     int mtu = static_cast<int>(normalizeRoomMtu(m_roomMtu));
     if (!m_tun->configureIP(m_myVirtualIP, VNET_MASK, mtu)) {
+        const QString error = m_tun->configurationError();
         delete m_tun; m_tun = nullptr;
         return TunSetupResult(false, TunSetupStage::Address,
-                              UiStrings::text("status.tunIpFailed"));
+                              error.isEmpty() ? UiStrings::text("status.tunIpFailed") : error);
     }
     if (!m_tun->startSession()) {
         delete m_tun; m_tun = nullptr;
         return TunSetupResult(false, TunSetupStage::Session,
                               UiStrings::text("status.tunSessionFailed"));
     }
+    QString routeError;
+    if (!m_tun->checkRoute(0xffffffffu, &routeError) ||
+        !m_tun->checkRoute(VNET_BROADCAST, &routeError)) {
+        m_tun->shutdown();
+        delete m_tun; m_tun = nullptr;
+        return TunSetupResult(false, TunSetupStage::Address, routeError);
+    }
     m_tunnel->setTunAdapter(m_tun);
-    if (!m_tunnel->startDataPlane()) {
+    const bool requiresUdp = m_tcpPolicy.transportMode != MODE_RELAY_TCP ||
+                             m_udpPolicy.transportMode != MODE_RELAY_TCP;
+    if (!m_tunnel->startDataPlane(requiresUdp)) {
         m_tunnel->setTunAdapter(nullptr);
         m_tun->shutdown();
         delete m_tun;
@@ -1027,6 +1052,7 @@ void RoomManager::teardownTun() {
     if (m_tunnel)
         m_tunnel->stopDataPlane();
     m_pendingRebuild.clear();
+    m_probeWatchdogs.clear();
     if (m_latencyTimer)
         m_latencyTimer->stop();
     if (m_trafficTimer)
@@ -1129,6 +1155,7 @@ void RoomManager::onTcpRelayHealthCheck() {
 }
 
 void RoomManager::onLatencyUpdate() {
+    const uint32_t now = currentTimeMs();
     for (PeerConnection* peer : m_tunnel->allPeers()) {
         peer->sendLatencyPing(TRAFFIC_TCP);
         peer->sendLatencyPing(TRAFFIC_UDP);
@@ -1136,6 +1163,25 @@ void RoomManager::onLatencyUpdate() {
                                 peer->latencyMs(TRAFFIC_TCP));
         emit peerLatencyUpdated(peer->peerId(), TRAFFIC_UDP,
                                 peer->latencyMs(TRAFFIC_UDP));
+        for (int cls = TRAFFIC_TCP; cls <= TRAFFIC_UDP; ++cls) {
+            const TrafficClass trafficClass = static_cast<TrafficClass>(cls);
+            TransportKey key;
+            key.peerId = peer->peerId();
+            key.cls = trafficClass;
+            if (!m_probeWatchdogs[key].observe(now, peer->latencyMs(trafficClass) >= 0))
+                continue;
+            const bool usesUdp = peer->transport(trafficClass) == TRANSPORT_RELAY_KCP ||
+                                 peer->transport(trafficClass) == TRANSPORT_RELAY_RAW_UDP;
+            emit errorOccurred(UiStrings::text(usesUdp ? "status.udpRelayUnreachable"
+                                                      : "status.relayUnreachable")
+                               .arg(peer->name()).arg(trafficClassName(trafficClass)));
+            LogManager::instance().logError(
+                QString("[room] No peer probe reply: peer=%1 class=%2 transport=%3 server=%4:%5 dataChannel=%6")
+                .arg(peer->peerId()).arg(trafficClassName(trafficClass))
+                .arg(transportName(peer->transport(trafficClass)))
+                .arg(m_resolvedAddr.toString()).arg(m_port)
+                .arg(m_dataChannel && m_dataChannel->isConnected() ? "connected" : "unavailable"));
+        }
     }
 }
 

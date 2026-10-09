@@ -7,6 +7,7 @@ VLan 是一个虚拟局域网联机工具。它由 Linux 中继服务端、Windo
 - 服务端部署和 systemd 安装: [server/DEPLOY.md](server/DEPLOY.md)
 - CLI 客户端启动和交互命令: [client-cli/README.md](client-cli/README.md)
 - GUI 客户端构建: 见本文的 [GUI 客户端](#gui-客户端)
+- 成员互通故障排查: [docs/connectivity-troubleshooting.md](docs/connectivity-troubleshooting.md)
 
 Linux systemd 服务器可以从最新正式 tag 自动源码编译并安装:
 
