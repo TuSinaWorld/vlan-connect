@@ -61,6 +61,8 @@ apt-get install -y --no-install-recommends \
     ca-certificates
 
 echo "Building $1 in ${PRETTY_NAME} for $expected_arch"
-make -C "$source_dir"
+build_commit="${VLAN_BUILD_COMMIT:-$(git rev-parse HEAD 2>/dev/null || printf unknown)}"
+make -C "$source_dir" "BUILD_COMMIT=$build_commit"
+"$binary" --version
 
 bash .github/scripts/verify-linux-abi.sh "$binary" "$expected_arch"

@@ -123,7 +123,8 @@ private:
     void sendClientMsg(ClientSession& c, uint8_t msgType, const ByteBuffer& body);
     void sendClientMsg(ClientSession& c, uint8_t msgType);
     bool sendDataMsg(ClientSession& c, uint8_t msgType, const ByteBuffer& body);
-    void sendError(int fd, const std::string& text);
+    void sendError(int fd, const std::string& text,
+                   AuthErrorCode code = AuthErrorCode::General);
     void broadcastToRoom(uint32_t roomId, uint8_t msgType,
                          const ByteBuffer& body, uint32_t excludePeerId = 0);
     void notifyRelayPeers(ClientSession& c);
@@ -206,6 +207,7 @@ private:
     std::set<uint32_t>                 m_freePeerIds;
     bool                               m_authReady;
     uint8_t                            m_serverAuthHash[32];
+    uint8_t                            m_serverAuthSalt[AUTH_SALT_SIZE];
     std::map<uint32_t, int>            m_secureSessionMap;
     ServerLimits                       m_limits;
     size_t                             m_globalSendBytes;

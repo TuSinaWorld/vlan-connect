@@ -11,6 +11,7 @@
 #include <QComboBox>
 #include <QCheckBox>
 #include <QCloseEvent>
+#include <QShowEvent>
 #include <QListWidget>
 #include <QStackedWidget>
 #include <QSystemTrayIcon>
@@ -57,6 +58,7 @@ private slots:
     void finishProgramQuit();
 
 protected:
+    void showEvent(QShowEvent* event) override;
     void closeEvent(QCloseEvent* event) override;
 
 private:
@@ -70,6 +72,7 @@ private:
     };
 
     void setupUI();
+    void applyStartupGeometry();
     QWidget* createLoginPage();
     QWidget* createLobbyPage();
     QWidget* createCreateRoomPage();
@@ -94,6 +97,7 @@ private:
     RoomManager* m_roomMgr;
     RoomWidget*  m_roomWidget;
     bool         m_quitRequested;
+    bool         m_startupGeometryApplied;
 
     /* Shell */
     QListWidget*    m_navBar;

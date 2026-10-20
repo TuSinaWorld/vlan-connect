@@ -2,6 +2,10 @@
 #include "../../common/secure_frame.h"
 #include "../../common/signal_message_validator.h"
 #include "../../common/traffic_policy_codec.h"
+#include "../../common/auth_kdf_task.h"
+#include <cassert>
+#include <chrono>
+#include <thread>
 #include <cstring>
 #include <cstdio>
 #include <utility>
@@ -96,7 +100,7 @@ void testServerHello() {
     ByteBuffer hello;
     hello.writeU16(PROTOCOL_VERSION);
     hello.writeU8(1);
-    uint8_t handshake[48] = {};
+    uint8_t handshake[1 + AUTH_SALT_SIZE + 48] = {};
     hello.writeBytes(handshake, sizeof(handshake));
     expectSignalValid("server hello", MSG_SERVER_HELLO, hello);
 
@@ -406,7 +410,7 @@ void testAllKnownSignalShapes() {
     ByteBuffer hello;
     hello.writeU16(PROTOCOL_VERSION);
     hello.writeU8(1);
-    uint8_t helloHandshake[48] = {};
+    uint8_t helloHandshake[1 + AUTH_SALT_SIZE + 48] = {};
     hello.writeBytes(helloHandshake, sizeof(helloHandshake));
     messages.push_back(std::make_pair(MSG_SERVER_HELLO, hello));
 
@@ -488,10 +492,14 @@ void testAllKnownSignalShapes() {
     messages.push_back(std::make_pair(MSG_ROOM_LIST_PUSH, roomPush));
 
     ByteBuffer challenge;
+    challenge.writeU8(AUTH_KDF_PROFILE);
+    uint8_t salt[AUTH_SALT_SIZE] = {};
+    challenge.writeBytes(salt, sizeof(salt));
     challenge.writeBytes(proof, sizeof(proof));
     messages.push_back(std::make_pair(MSG_AUTH_CHALLENGE, challenge));
 
     ByteBuffer error;
+    error.writeU16(static_cast<uint16_t>(AuthErrorCode::General));
     error.writeString("error");
     messages.push_back(std::make_pair(MSG_ERROR, error));
 
@@ -526,9 +534,64 @@ void testAllKnownSignalShapes() {
     }
 }
 
+void testV9TranscriptAndReplay() {
+    assert(PROTOCOL_VERSION == 9 && ARGON2_NB_BLOCKS == 19456 && ARGON2_NB_PASSES == 2);
+    uint8_t shared[32] = {1}, hash[32] = {2}, clientNonce[16] = {3}, serverNonce[16] = {4};
+    uint8_t clientPub[32] = {5}, serverPub[32] = {6}, salt[16] = {7}, first[32], changed[32];
+    const uint8_t zero[32] = {}; assert(!validX25519Shared(zero) && validX25519Shared(shared));
+    deriveSecureMaster(first, shared, hash, clientNonce, serverNonce, clientPub, serverPub, salt);
+    uint8_t* inputs[] = {shared, hash, clientNonce, serverNonce, clientPub, serverPub, salt};
+    for (uint8_t* input : inputs) {
+        input[0] ^= 1;
+        deriveSecureMaster(changed, shared, hash, clientNonce, serverNonce, clientPub, serverPub, salt);
+        assert(crypto_verify32(first, changed) != 0); input[0] ^= 1;
+    }
+    deriveSecureMaster(changed, shared, hash, clientNonce, serverNonce, clientPub, serverPub, salt, 2);
+    assert(crypto_verify32(first, changed) != 0);
+    SecureFrameCipher sender, receiver; sender.init(first, true, "data"); receiver.init(first, false, "data");
+    const uint8_t message[] = {11,22,33};
+    std::vector<uint8_t> frame = sender.encrypt(message, sizeof(message)), plain;
+    assert(receiver.decrypt(frame.data(), frame.size(), &plain));
+    sender.init(first, true, "data"); receiver.init(first, false, "data");
+    assert(!receiver.decrypt(frame.data(), frame.size(), &plain));
+    std::vector<uint8_t> next = sender.encrypt(message, sizeof(message));
+    assert(readU64BE(next.data()) == 1 && receiver.decrypt(next.data(), next.size(), &plain));
+    sender.init(changed, true, "data"); receiver.init(changed, false, "data");
+    assert(!receiver.decrypt(frame.data(), frame.size(), &plain));
+    next = sender.encrypt(message, sizeof(message));
+    assert(readU64BE(next.data()) == 0 && receiver.decrypt(next.data(), next.size(), &plain));
+}
+
+void testV9BackgroundKdfCancellation() {
+    const uint8_t password[] = "independent-random-salts";
+    uint8_t salt[16] = {8}, otherSalt[16] = {9}, first[32], second[32], bad[32];
+    assert(hashPasswordSalted(password, sizeof(password)-1, salt, first));
+    assert(hashPasswordSalted(password, sizeof(password)-1, otherSalt, second));
+    assert(crypto_verify32(first, second) != 0);
+    memset(bad, 0xA5, sizeof(bad));
+    assert(!hashPasswordSalted(password, sizeof(password)-1, salt, bad, 255));
+    const uint8_t zero[32] = {}; assert(crypto_verify32(bad, zero) == 0);
+    AuthKdfTask task; AuthKdfTask::Result result;
+    task.start(password, sizeof(password)-1, salt); task.cancel();
+    std::this_thread::sleep_for(std::chrono::milliseconds(300));
+    assert(!task.poll(result));
+    task.start(password, sizeof(password)-1, salt);
+    task.start(password, sizeof(password)-1, otherSalt);
+    const auto started = std::chrono::steady_clock::now();
+    while (!task.poll(result)) {
+        assert(std::chrono::steady_clock::now() - started < std::chrono::seconds(5));
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    assert(result.success && crypto_verify32(result.hash, second) == 0 && !task.poll(result));
+    printf("v9 Argon2id profile1: 19MiB,2passes,1lane; background elapsedMs=%llu\n",
+        static_cast<unsigned long long>(result.elapsedMs));
+}
+
 } // namespace
 
 int main() {
+    testV9TranscriptAndReplay();
+    testV9BackgroundKdfCancellation();
     testServerHello();
     testFixedMessages();
     testRoomMessages();
@@ -540,10 +603,10 @@ int main() {
     testAllKnownSignalShapes();
 
     if (g_failures != 0) {
-        std::fprintf(stderr, "protocol_v8_tests: %d failure(s)\n",
+        std::fprintf(stderr, "protocol_v9_tests: %d failure(s)\n",
                      g_failures);
         return 1;
     }
-    std::fprintf(stdout, "protocol_v8_tests: ok\n");
+    std::fprintf(stdout, "protocol_v9_tests: ok\n");
     return 0;
 }

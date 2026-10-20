@@ -330,7 +330,7 @@ inline MessageValidationResult validateServerSignalPayload(
             cursor.setError(MessageValidationError::InvalidBoolean, 2);
             return malformed(cursor);
         }
-        if (authRequired != 0 && !cursor.skip(16 + 32))
+        if (authRequired != 0 && !cursor.skip(1 + AUTH_SALT_SIZE + 16 + 32))
             return malformed(cursor);
         return finish(cursor);
     }
@@ -524,11 +524,11 @@ inline MessageValidationResult validateServerSignalPayload(
     }
 
     case MSG_AUTH_CHALLENGE:
-        return fixedSize(len, 32);
+        return fixedSize(len, 1 + AUTH_SALT_SIZE + 32);
 
     case MSG_ERROR: {
         Cursor cursor(data, len);
-        if (!cursor.readString(1, MAX_TCP_MSG_PAYLOAD - 2, false))
+        if (!cursor.skip(2) || !cursor.readString(1, MAX_TCP_MSG_PAYLOAD - 4, false))
             return malformed(cursor);
         return finish(cursor);
     }

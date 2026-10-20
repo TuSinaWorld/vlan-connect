@@ -67,8 +67,10 @@ public:
     BYTE* receivePacket(
         WINTUN_SESSION_HANDLE, DWORD* packetSize) override {
         std::lock_guard<std::mutex> lock(m_mutex);
-        if (!m_packetPending || m_packetOutstanding)
+        if (!m_packetPending || m_packetOutstanding) {
+            SetLastError(ERROR_NO_MORE_ITEMS);
             return nullptr;
+        }
         m_packetPending = false;
         m_packetOutstanding = true;
         if (packetSize)

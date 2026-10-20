@@ -7,7 +7,7 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: Existing tag to publish, for example v0.1.0
+        description: Existing stable tag to publish, for example v0.3.1
         required: true
         type: string
 
@@ -26,6 +26,7 @@ jobs:
 
     outputs:
       tag: ${{ steps.release-tag.outputs.tag }}
+      commit: ${{ steps.source-commit.outputs.commit }}
 
     steps:
       - name: Checkout
@@ -42,6 +43,17 @@ jobs:
           else
             echo "tag=${GITHUB_REF_NAME}" >> "$GITHUB_OUTPUT"
           fi
+
+      - name: Verify canonical release version
+        id: source-commit
+        shell: bash
+        env:
+          RELEASE_TAG: ${{ steps.release-tag.outputs.tag }}
+        run: |
+          set -euo pipefail
+          [[ "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]
+          grep -Fx "#define VLAN_RELEASE_VERSION \"${RELEASE_TAG#v}\"" common/version.h
+          echo "commit=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
 
       - name: Verify release NOTICE
         shell: bash
@@ -60,7 +72,7 @@ jobs:
           set -euo pipefail
 
           cat > release_notes.md <<EOF
-          Automated build for ${RELEASE_TAG}.
+          Build for ${RELEASE_TAG}; protocol v9. Upgrade all GUI/CLI clients and servers together; v8 clients are incompatible.
 
           ## Assets
 
@@ -80,9 +92,12 @@ jobs:
           Linux binaries are built against the glibc 2.31 toolchain baseline
           and are intended for Debian 11, Ubuntu 20.04, and newer releases.
 
-          Optional manual Windows Qt GUI package:
+          Required Windows Qt 5.9.9 / MSVC 2015 GUI package (uploaded from a local exact-tag build):
 
-          vlan.with.Qt-windows-x64.rar
+          vlan-gui-windows-x86_64-${RELEASE_TAG}.zip
+
+          Releases remain draft until all assets and SHA256SUMS.txt have been verified.
+          Real multi-machine Wintun, routing, firewall and game connectivity are not verified by CI.
 
           Manual GUI packages must include LICENSE.txt, NOTICE.txt copied from
           this release tag, SOURCE.txt, THIRD-PARTY-BINARY-NOTICES.txt, and the
@@ -101,12 +116,12 @@ jobs:
           EOF
 
           if ! gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" > /dev/null 2>&1; then
-            gh release create "$RELEASE_TAG" \
+            gh release create "$RELEASE_TAG" --draft \
               --repo "$GITHUB_REPOSITORY" \
               --title "$RELEASE_TAG" \
               --notes-file release_notes.md
           else
-            gh release edit "$RELEASE_TAG" \
+            gh release edit "$RELEASE_TAG" --draft=true \
               --repo "$GITHUB_REPOSITORY" \
               --title "$RELEASE_TAG" \
               --notes-file release_notes.md
@@ -123,11 +138,12 @@ jobs:
           cp LICENSE LICENSE.txt
           cp NOTICE NOTICE.txt
           cmp NOTICE NOTICE.txt
+          git rev-parse HEAD > SOURCE-COMMIT.txt
           git archive \
             --format=tar.gz \
             --prefix="vlan-connect-${RELEASE_TAG}/" \
             -o "vlan-connect-source-${RELEASE_TAG}.tar.gz" \
-            HEAD
+            --add-file=SOURCE-COMMIT.txt HEAD
 
           gh release upload "$RELEASE_TAG" \
             LICENSE.txt \
@@ -161,6 +177,7 @@ jobs:
           docker run --rm \
             --volume "${GITHUB_WORKSPACE}:/workspace" \
             --workdir /workspace \
+            --env VLAN_BUILD_COMMIT=${{ needs.create-release.outputs.commit }} \
             "${LINUX_BUILD_IMAGE}" \
             bash .github/scripts/build-linux-glibc231.sh server "${{ matrix.arch }}"
 
@@ -189,6 +206,8 @@ jobs:
           VLan server binary release
 
           Release tag: ${RELEASE_TAG}
+          Build commit: ${{ needs.create-release.outputs.commit }}
+          Protocol version: 9
           Repository: https://github.com/${GITHUB_REPOSITORY}
           Source tag: https://github.com/${GITHUB_REPOSITORY}/tree/${RELEASE_TAG}
           Corresponding source archive asset: vlan-connect-source-${RELEASE_TAG}.tar.gz
@@ -251,6 +270,7 @@ jobs:
           docker run --rm \
             --volume "${GITHUB_WORKSPACE}:/workspace" \
             --workdir /workspace \
+            --env VLAN_BUILD_COMMIT=${{ needs.create-release.outputs.commit }} \
             "${LINUX_BUILD_IMAGE}" \
             bash .github/scripts/build-linux-glibc231.sh cli "${{ matrix.arch }}"
 
@@ -280,6 +300,8 @@ jobs:
           VLan CLI Linux binary release
 
           Release tag: ${RELEASE_TAG}
+          Build commit: ${{ needs.create-release.outputs.commit }}
+          Protocol version: 9
           Repository: https://github.com/${GITHUB_REPOSITORY}
           Source tag: https://github.com/${GITHUB_REPOSITORY}/tree/${RELEASE_TAG}
           Corresponding source archive asset: vlan-connect-source-${RELEASE_TAG}.tar.gz
@@ -342,6 +364,7 @@ jobs:
             exit /b 1
           )
           call "%VSINSTALL%\VC\Auxiliary\Build\vcvars64.bat"
+          set VLAN_BUILD_COMMIT=${{ needs.create-release.outputs.commit }}
           call build.bat
 
       - name: Package and upload CLI Windows
@@ -404,6 +427,8 @@ jobs:
           VLan CLI Windows binary release
 
           Release tag: $env:RELEASE_TAG
+          Build commit: ${{ needs.create-release.outputs.commit }}
+          Protocol version: 9
           Repository: https://github.com/$env:GITHUB_REPOSITORY
           Source tag: https://github.com/$env:GITHUB_REPOSITORY/tree/$env:RELEASE_TAG
           Corresponding source archive asset: vlan-connect-source-$env:RELEASE_TAG.tar.gz
@@ -449,3 +474,47 @@ jobs:
 
           Compress-Archive -Path (Join-Path $stage '*') -DestinationPath $zipPath -Force
           gh release upload "$env:RELEASE_TAG" $zipPath --repo "$env:GITHUB_REPOSITORY" --clobber
+
+  release-validation:
+    name: Validate release tests
+    runs-on: ubuntu-24.04
+    needs: create-release
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.create-release.outputs.tag }}
+      - name: Install test dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y shellcheck qtbase5-dev
+      - name: Build and run isolated tests
+        run: |
+          cmake -S tests -B build-tests/linux/release-ci -DCMAKE_BUILD_TYPE=Release
+          cmake --build build-tests/linux/release-ci --parallel
+          ctest --test-dir build-tests/linux/release-ci --output-on-failure
+      - name: Test real server and CLI authentication on loopback
+        run: |
+          make -C server -j2
+          make -C client-cli/linux -j2
+          python3 tests/server/production_auth_smoke.py --server server/vlan-server --cli client-cli/linux/vlan-cli
+
+  finalize-release:
+    name: Verify all release assets and publish
+    runs-on: ubuntu-24.04
+    needs: [create-release, server-linux, cli-linux, cli-windows, release-validation]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.create-release.outputs.tag }}
+      - name: Check completeness and corresponding source before publication
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ needs.create-release.outputs.tag }}
+          RELEASE_COMMIT: ${{ needs.create-release.outputs.commit }}
+        run: |
+          set -euo pipefail
+          mkdir -p release-assets
+          gh release download "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --dir release-assets
+          python3 .github/scripts/verify-release-assets.py "$RELEASE_TAG" "$RELEASE_COMMIT" release-assets
+          gh release upload "$RELEASE_TAG" release-assets/SHA256SUMS.txt --repo "$GITHUB_REPOSITORY" --clobber
+          gh release edit "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --draft=false

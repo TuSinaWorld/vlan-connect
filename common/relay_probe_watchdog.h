@@ -9,6 +9,8 @@ class RelayProbeWatchdog {
 public:
     RelayProbeWatchdog() : m_waiting(false), m_reported(false), m_since(0) {}
 
+    bool outageReported() const { return m_reported; }
+
     // Report once for an uninterrupted outage, including transport rebuilds.
     // A fresh peer reply, removal, or room teardown resets the outage.
     bool observe(uint32_t now, bool hasFreshReply) {

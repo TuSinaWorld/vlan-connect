@@ -4,6 +4,10 @@ TARGET = VLanClient
 TEMPLATE = app
 
 CONFIG += c++11
+
+isEmpty(BUILD_COMMIT): BUILD_COMMIT = $$system(git -C $$shell_quote($$PWD) rev-parse --short=12 HEAD)
+isEmpty(BUILD_COMMIT): BUILD_COMMIT = unknown
+DEFINES += VLAN_BUILD_COMMIT=\\\"$$BUILD_COMMIT\\\"
 QMAKE_CXXFLAGS += /utf-8
 QMAKE_CFLAGS   += /utf-8
 
@@ -68,6 +72,7 @@ HEADERS += \
     ../3rdparty/cm256cc/gf256.h \
     ../3rdparty/cm256cc/export.h \
     ../common/protocol.h \
+    ../common/version.h \
     ../common/byte_buffer.h \
     ../common/traffic_policy_codec.h \
     ../common/relay_probe_watchdog.h \
@@ -81,10 +86,15 @@ HEADERS += \
 
 RESOURCES += resources/resources.qrc
 
-RC_ICONS = resources/vlan.ico
+win32 {
+    # Use the same manifest for DPI awareness and UAC in every qmake build.
+    RC_FILE = resources/app.rc
+    RC_INCLUDEPATH += $$PWD/resources
+    CONFIG -= embed_manifest_exe
+    QMAKE_LFLAGS += /MANIFEST:NO
+}
 
-LIBS += -lws2_32 -liphlpapi -lbcrypt
+LIBS += -lws2_32 -liphlpapi -lbcrypt -lgdi32 -luser32 -lole32 -loleaut32
 
-# MSVC 2015 can't find rc.exe from the newer Windows SDK; point to it explicitly
-RC_INCLUDEPATH = "C:/Program Files (x86)/Windows Kits/10/Include/10.0.26100.0/um"
-QMAKE_RC = "C:/Program Files (x86)/Windows Kits/10/bin/10.0.26100.0/x64/rc.exe"
+# rc.exe and Windows SDK include files come from the selected Developer
+# Command Prompt/toolchain environment, rather than a machine-specific SDK path.

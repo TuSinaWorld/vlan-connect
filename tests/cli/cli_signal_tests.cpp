@@ -8,19 +8,20 @@
 using namespace VLan;
 using namespace VLanTest;
 
-static void testVersionEightOnly() {
-    std::vector<uint8_t> v8(2 + 1 + 16 + 32, 0);
-    v8[0] = static_cast<uint8_t>(PROTOCOL_VERSION >> 8);
-    v8[1] = static_cast<uint8_t>(PROTOCOL_VERSION);
-    v8[2] = 1;
+static void testVersionNineOnly() {
+    std::vector<uint8_t> v9(2 + 1 + 1 + AUTH_SALT_SIZE + 16 + 32, 0);
+    v9[0] = static_cast<uint8_t>(PROTOCOL_VERSION >> 8);
+    v9[1] = static_cast<uint8_t>(PROTOCOL_VERSION);
+    v9[2] = 1;
+    v9[3] = AUTH_KDF_PROFILE;
     assert(validateServerSignalPayload(
-        MSG_SERVER_HELLO, v8.data(), v8.size()).isValid());
+        MSG_SERVER_HELLO, v9.data(), v9.size()).isValid());
 
-    std::vector<uint8_t> v7 = v8;
-    v7[1] = static_cast<uint8_t>(PROTOCOL_VERSION - 1);
+    std::vector<uint8_t> v8 = v9;
+    v8[1] = 8;
     const MessageValidationResult old =
         validateServerSignalPayload(
-            MSG_SERVER_HELLO, v7.data(), v7.size());
+            MSG_SERVER_HELLO, v8.data(), v8.size());
     assert(old.status == MessageValidationStatus::Malformed);
     assert(old.error == MessageValidationError::InvalidVersion);
 }
@@ -90,7 +91,7 @@ static void testProductionTcpSendLimit() {
 }
 
 int main() {
-    testVersionEightOnly();
+    testVersionNineOnly();
     testBatchExtractionAndUnknownMessage();
     testOversizedHeader();
     testSignalRelayFallbackPayload();

@@ -38,6 +38,12 @@ jobs:
         shell: bash
         run: ctest --test-dir build-tests/linux/ci --output-on-failure
 
+      - name: Test real server and CLI authentication on loopback
+        run: |
+          make -C server -j2
+          make -C client-cli/linux -j2
+          python3 tests/server/production_auth_smoke.py --server server/vlan-server --cli client-cli/linux/vlan-cli
+
   server-linux:
     name: Server Linux
     runs-on: ubuntu-24.04
@@ -52,6 +58,7 @@ jobs:
           docker run --rm \
             --volume "${GITHUB_WORKSPACE}:/workspace" \
             --workdir /workspace \
+            --env VLAN_BUILD_COMMIT=${{ github.sha }} \
             "${LINUX_BUILD_IMAGE}" \
             bash .github/scripts/build-linux-glibc231.sh server x86_64
 
@@ -77,6 +84,7 @@ jobs:
           docker run --rm \
             --volume "${GITHUB_WORKSPACE}:/workspace" \
             --workdir /workspace \
+            --env VLAN_BUILD_COMMIT=${{ github.sha }} \
             "${LINUX_BUILD_IMAGE}" \
             bash .github/scripts/build-linux-glibc231.sh cli x86_64
 
@@ -106,6 +114,7 @@ jobs:
             exit /b 1
           )
           call "%VSINSTALL%\VC\Auxiliary\Build\vcvars64.bat"
+          set VLAN_BUILD_COMMIT=${{ github.sha }}
           call build.bat
 
       - name: Upload CLI Windows artifact
@@ -115,3 +124,21 @@ jobs:
           name: vlan-cli-windows
           path: client-cli/windows/vlan-cli.exe
           if-no-files-found: error
+
+  tests-windows:
+    name: Protocol and production tests Windows
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Qt for isolated Windows tests
+        uses: jurplel/install-qt-action@v4
+        with:
+          version: '5.15.2'
+          arch: win64_msvc2019_64
+          cache: true
+      - name: Configure isolated tests
+        run: cmake -S tests -B build-tests/windows/ci -A x64
+      - name: Build isolated tests
+        run: cmake --build build-tests/windows/ci --config Release --parallel
+      - name: Run isolated tests
+        run: ctest --test-dir build-tests/windows/ci -C Release --output-on-failure

@@ -127,13 +127,31 @@ struct TcpConnection {
         return false;
     }
 
-    void queueSend(const void* data, size_t len) {
+    bool queueSend(const void* data, size_t len) {
+        if ((len != 0 && !data) || sendBuf.size() > MAX_TCP_SEND_BUF ||
+            len > MAX_TCP_SEND_BUF - sendBuf.size())
+            return false;
+        if (len == 0) return true;
         const uint8_t* p = static_cast<const uint8_t*>(data);
         sendBuf.insert(sendBuf.end(), p, p + len);
+        return true;
     }
 
     bool sendTcpMsg(uint8_t msgType, const ByteBuffer& body) {
         if (body.size() > MAX_TCP_MSG_PAYLOAD) return false;
+        const size_t frameSize = sizeof(TcpMsgHeader) + body.size();
+        if (sendBuf.size() > MAX_TCP_SEND_BUF ||
+            frameSize > MAX_TCP_SEND_BUF - sendBuf.size())
+            return false;
+        // Reserve the whole frame before appending its header. A rejected send
+        // cannot leave a truncated frame that corrupts the next message.
+        const size_t required = sendBuf.size() + frameSize;
+        if (required > sendBuf.capacity()) {
+            size_t capacity = sendBuf.capacity() * 2;
+            if (capacity < required) capacity = required;
+            if (capacity > MAX_TCP_SEND_BUF) capacity = MAX_TCP_SEND_BUF;
+            sendBuf.reserve(capacity);
+        }
         TcpMsgHeader hdr;
         hdr.msgType = msgType;
         hdr.length  = htons(static_cast<uint16_t>(body.size()));
@@ -144,11 +162,8 @@ struct TcpConnection {
     }
 
     bool sendTcpMsg(uint8_t msgType) {
-        TcpMsgHeader hdr;
-        hdr.msgType = msgType;
-        hdr.length  = 0;
-        queueSend(&hdr, sizeof(hdr));
-        return true;
+        const ByteBuffer body;
+        return sendTcpMsg(msgType, body);
     }
 
     int readData() {

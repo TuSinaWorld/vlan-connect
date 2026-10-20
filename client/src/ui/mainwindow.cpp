@@ -35,6 +35,25 @@ namespace VLan {
 
 namespace {
 
+struct StartupWindowSizes {
+    QSize minimum;
+    QSize preferred;
+};
+
+StartupWindowSizes startupWindowSizes(const QSize& available, const QSize& frame)
+{
+    const int maxW = qMax(1, available.width() - frame.width());
+    const int maxH = qMax(1, available.height() - frame.height());
+    const int minW = qMin(maxW, qBound(640, int(available.width() * 0.55), 900));
+    const int minH = qMin(maxH, qBound(480, int(available.height() * 0.55), 700));
+    StartupWindowSizes sizes;
+    sizes.minimum = QSize(minW, minH);
+    sizes.preferred = QSize(
+        qMin(maxW, qBound(minW, int(available.width() * 0.72), 1100)),
+        qMin(maxH, qBound(minH, int(available.height() * 0.70), 700)));
+    return sizes;
+}
+
 void repolish(QWidget* widget)
 {
     if (!widget) return;
@@ -202,6 +221,7 @@ MainWindow::MainWindow(QWidget* parent)
     : QMainWindow(parent),
       m_roomWidget(nullptr),
       m_quitRequested(false),
+      m_startupGeometryApplied(false),
       m_navBar(nullptr),
       m_mainStack(nullptr),
       m_pageTitleLabel(nullptr),
@@ -261,17 +281,35 @@ MainWindow::MainWindow(QWidget* parent)
     refreshDashboardState();
     updateTrayState();
 
-    QScreen* screen = QApplication::primaryScreen();
-    QRect avail = screen->availableGeometry();
-    int minW = qBound(640, (int)(avail.width() * 0.55), 900);
-    int minH = qBound(480, (int)(avail.height() * 0.55), 700);
-    setMinimumSize(minW, minH);
-    int defW = qBound(minW, (int)(avail.width() * 0.72), 1100);
-    int defH = qBound(minH, (int)(avail.height() * 0.70), 700);
-    resize(defW, defH);
+    applyStartupGeometry();
 }
 
 MainWindow::~MainWindow() {}
+
+void MainWindow::applyStartupGeometry()
+{
+    QScreen* screen = QApplication::primaryScreen();
+    const QRect available = screen ? screen->availableGeometry() : QRect(0, 0, 1280, 720);
+    const QSize frame(qMax(0, frameGeometry().width() - width()),
+                      qMax(0, frameGeometry().height() - height()));
+    const StartupWindowSizes sizes = startupWindowSizes(available.size(), frame);
+    setMinimumSize(sizes.minimum);
+    resize(sizes.preferred);
+    const QSize outer = size() + frame;
+    move(available.x() + (available.width() - outer.width()) / 2,
+         available.y() + (available.height() - outer.height()) / 2);
+}
+
+void MainWindow::showEvent(QShowEvent* event)
+{
+    QMainWindow::showEvent(event);
+    if (m_startupGeometryApplied)
+        return;
+    m_startupGeometryApplied = true;
+    // The native frame and layout metrics are available after the first show.
+    // Apply once only, so restoring from the tray preserves the user's size.
+    QTimer::singleShot(0, this, [this]() { applyStartupGeometry(); });
+}
 
 void MainWindow::setupUI() {
     setWindowTitle(UiStrings::text("app.windowTitle"));

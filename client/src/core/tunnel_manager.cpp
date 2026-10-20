@@ -445,6 +445,12 @@ void TunnelManager::sendUdpDatagram(const QByteArray& datagram,
     }
     std::vector<uint8_t> enc = m_udpCipher.encrypt(
         reinterpret_cast<const uint8_t*>(datagram.constData()), datagram.size());
+    if (enc.empty()) {
+        recordPacketDrop("udp-encrypt-failed-session-exhausted");
+        stopDataPlane();
+        emit securityError(QStringLiteral("UDP encryption session exhausted or unavailable; reconnecting for fresh keys"));
+        return;
+    }
     QByteArray pkt;
     pkt.resize(1 + SECURE_SESSION_ID_SIZE + static_cast<int>(enc.size()));
     pkt[0] = static_cast<char>(UDP_ENCRYPTED);

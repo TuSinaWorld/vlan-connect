@@ -12,7 +12,7 @@ CliTunnelManager::CliTunnelManager()
       m_roomMtu(ROOM_MTU_DEFAULT),
       m_dataPlaneState(DataPlaneState::Stopped),
       m_securityMode(DataPlaneSecurityMode::Unconfigured),
-      m_secureSessionId(0)
+      m_secureSessionId(0), m_lastDropLogMs(0), m_hasDropLog(false)
 {}
 
 CliTunnelManager::~CliTunnelManager() {
@@ -26,12 +26,18 @@ CliTunnelManager::~CliTunnelManager() {
 }
 
 bool CliTunnelManager::initUdpSocket() {
+    if (m_udpFd != SOCK_INVALID) return true;
     m_udpFd = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
     if (m_udpFd == SOCK_INVALID) {
         LOG_ERR("Failed to create UDP socket");
         return false;
     }
-    setNonBlocking(m_udpFd);
+    if (!setNonBlocking(m_udpFd)) {
+        LOG_ERR("Failed to configure nonblocking UDP socket (error=%d)", sock_error());
+        sock_close(m_udpFd);
+        m_udpFd = SOCK_INVALID;
+        return false;
+    }
 
     struct sockaddr_in bindAddr;
     memset(&bindAddr, 0, sizeof(bindAddr));
@@ -89,15 +95,24 @@ void CliTunnelManager::clearSecurityContext() {
     m_securityMode = DataPlaneSecurityMode::Unconfigured;
 }
 
-bool CliTunnelManager::startDataPlane() {
+bool CliTunnelManager::startDataPlane(bool requiresUdp) {
     if (m_dataPlaneState == DataPlaneState::Running)
         return true;
     if (!m_tun || !m_tun->isRunning() ||
-        m_securityMode == DataPlaneSecurityMode::Unconfigured) {
+        m_securityMode == DataPlaneSecurityMode::Unconfigured ||
+        !m_myPeerId || !m_myVirtualIP || !m_serverIP || !m_serverPort) {
         LOG_ERR("[tunnel] Cannot start unconfigured data plane");
         return false;
     }
+    if (requiresUdp && !initUdpSocket()) {
+        LOG_ERR("[tunnel] UDP is required by this room's transport policy");
+        return false;
+    }
     m_dataPlaneState = DataPlaneState::Running;
+    m_packetDrops.clear();
+    m_hasDropLog = false;
+    if (requiresUdp) sendUdpKeepalive();
+    LOG_INFO("[tunnel] Data plane ready (UDP required=%s)", requiresUdp ? "yes" : "no");
     return true;
 }
 
@@ -122,6 +137,13 @@ void CliTunnelManager::udpSend(const uint8_t* data, size_t len,
         if (m_secureSessionId == 0 || m_secureMaster.size() != SECURE_KEY_SIZE)
             return;
         std::vector<uint8_t> enc = m_udpCipher.encrypt(data, len);
+        if (enc.empty()) {
+            recordPacketDrop("udp-encrypt-failed-session-exhausted");
+            stopDataPlane();
+            if (onSecurityFailure)
+                onSecurityFailure("UDP encryption session exhausted or unavailable; reconnecting for fresh keys");
+            return;
+        }
         wrapped.resize(1 + SECURE_SESSION_ID_SIZE + enc.size());
         wrapped[0] = UDP_ENCRYPTED;
         writeU32BE(wrapped.data() + 1, m_secureSessionId);
@@ -131,8 +153,10 @@ void CliTunnelManager::udpSend(const uint8_t* data, size_t len,
         len = wrapped.size();
     }
     struct sockaddr_in addr = makeAddr(dstIP, dstPort);
-    sendto(m_udpFd, reinterpret_cast<const char*>(data), static_cast<int>(len), 0,
-           (struct sockaddr*)&addr, sizeof(addr));
+    const int sent = sendto(m_udpFd, reinterpret_cast<const char*>(data), static_cast<int>(len), 0,
+                            (struct sockaddr*)&addr, sizeof(addr));
+    if (sent != static_cast<int>(len))
+        recordPacketDrop("udp-send/" + std::to_string(sock_error()));
 }
 
 CliPeerConnection* CliTunnelManager::addPeer(uint32_t peerId, uint32_t virtualIP,
@@ -301,6 +325,7 @@ CliRawUdpTunnel* CliTunnelManager::createRawUdpTunnel(CliPeerConnection* peer,
 }
 
 void CliTunnelManager::onUdpReadable() {
+    if (m_udpFd == SOCK_INVALID) return;
     char buf[65536];
     struct sockaddr_in senderAddr;
     socklen_t addrLen = sizeof(senderAddr);
@@ -313,24 +338,34 @@ void CliTunnelManager::onUdpReadable() {
             continue;
         }
         if (ntohl(senderAddr.sin_addr.s_addr) != m_serverIP ||
-            ntohs(senderAddr.sin_port) != m_serverPort)
+            ntohs(senderAddr.sin_port) != m_serverPort) {
+            recordPacketDrop("udp-endpoint-mismatch");
             continue;
+        }
 
         uint8_t pktType = static_cast<uint8_t>(buf[0]);
         Buffer plain;
         if (m_securityMode == DataPlaneSecurityMode::Secure) {
-            if (pktType != UDP_ENCRYPTED)
+            if (pktType != UDP_ENCRYPTED) {
+                recordPacketDrop("udp-plaintext-rejected");
                 continue;
-            if (n < static_cast<int>(1 + SECURE_SESSION_ID_SIZE + SECURE_FRAME_OVERHEAD))
+            }
+            if (n < static_cast<int>(1 + SECURE_SESSION_ID_SIZE + SECURE_FRAME_OVERHEAD)) {
+                recordPacketDrop("udp-truncated");
                 continue;
+            }
             uint32_t sid = readU32BE(reinterpret_cast<const uint8_t*>(buf) + 1);
-            if (sid != m_secureSessionId)
+            if (sid != m_secureSessionId) {
+                recordPacketDrop("udp-session-mismatch");
                 continue;
+            }
             std::vector<uint8_t> decrypted;
             const uint8_t* frame = reinterpret_cast<const uint8_t*>(buf) + 1 + SECURE_SESSION_ID_SIZE;
             size_t frameLen = static_cast<size_t>(n - 1 - SECURE_SESSION_ID_SIZE);
-            if (!m_udpCipher.decrypt(frame, frameLen, &decrypted) || decrypted.empty())
+            if (!m_udpCipher.decrypt(frame, frameLen, &decrypted) || decrypted.empty()) {
+                recordPacketDrop("udp-decrypt-or-replay-rejected");
                 continue;
+            }
             plain.assign(decrypted.begin(), decrypted.end());
             if (plain.size() > sizeof(buf))
                 continue;
@@ -398,16 +433,19 @@ void CliTunnelManager::routeFromTun(const Buffer& ipPacket) {
         return;
     }
     if (!validateOutboundOverlayIpv4(ipPacket.data(), ipPacket.size(),
-                                     m_roomMtu, m_myVirtualIP).isValid())
+                                     m_roomMtu, m_myVirtualIP).isValid()) {
+        recordPacketDrop("tun-out-invalid");
         return;
+    }
     uint32_t dstIP = extractDstIP(ipPacket.data(), ipPacket.size());
 
     if (isBroadcast(dstIP) || dstIP == VNET_BROADCAST) {
         for (auto& kv : m_peerById)
-            kv.second->sendData(ipPacket);
+            if (kv.second->sendData(ipPacket) <= 0) recordPacketDrop("peer-send-unavailable", kv.first);
     } else {
         CliPeerConnection* peer = peerByVirtualIP(dstIP);
-        if (peer) peer->sendData(ipPacket);
+        if (!peer) recordPacketDrop("no-peer-route");
+        else if (peer->sendData(ipPacket) <= 0) recordPacketDrop("peer-send-unavailable", peer->peerId());
     }
 }
 
@@ -418,9 +456,11 @@ void CliTunnelManager::routeToTun(uint32_t peerId, const Buffer& ipPacket) {
     CliPeerConnection* peer = peerById(peerId);
     if (!peer || !validateInboundOverlayIpv4(
             ipPacket.data(), ipPacket.size(), m_roomMtu,
-            peer->virtualIP(), m_myVirtualIP).isValid())
+            peer->virtualIP(), m_myVirtualIP).isValid()) {
+        recordPacketDrop("tun-in-invalid", peerId);
         return;
-    if (m_tun) m_tun->writePacket(ipPacket);
+    }
+    if (!m_tun || !m_tun->writePacket(ipPacket)) recordPacketDrop("tun-write-failed", peerId);
 }
 
 void CliTunnelManager::onPeerDataReceived(uint32_t peerId, const Buffer& ipPacket) {
@@ -498,6 +538,21 @@ void CliTunnelManager::sendUdpKeepalive() {
     hdr.type = UDP_KEEPALIVE;
     udpSend(reinterpret_cast<const uint8_t*>(&hdr), sizeof(hdr),
             m_serverIP, m_serverPort);
+}
+
+void CliTunnelManager::recordPacketDrop(const std::string& reason, uint32_t peerId) {
+    ++m_packetDrops[reason];
+    const uint32_t now = currentTimeMs();
+    if (m_hasDropLog && now - m_lastDropLogMs < 5000) return;
+    m_hasDropLog = true;
+    m_lastDropLogMs = now;
+    std::string counts;
+    for (const auto& entry : m_packetDrops) {
+        if (!counts.empty()) counts += ", ";
+        counts += entry.first + "=" + std::to_string(entry.second);
+    }
+    LOG_ERR("[tunnel] Packet dropped: reason=%s peer=%u counts={%s}",
+            reason.c_str(), peerId, counts.c_str());
 }
 
 } // namespace VLan

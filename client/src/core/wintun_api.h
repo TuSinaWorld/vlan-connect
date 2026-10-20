@@ -2,7 +2,11 @@
 #define VLAN_WINTUN_API_H
 
 #include <QString>
+#include <winsock2.h>
+#include <ws2tcpip.h>
 #include <windows.h>
+#include <iphlpapi.h>
+#include <netioapi.h>
 
 typedef void* WINTUN_ADAPTER_HANDLE;
 typedef void* WINTUN_SESSION_HANDLE;
@@ -17,6 +21,7 @@ public:
     virtual void unload() = 0;
     virtual WINTUN_ADAPTER_HANDLE createAdapter(
         LPCWSTR name, LPCWSTR tunnelType, const GUID* requestedGuid) = 0;
+    virtual bool getAdapterLuid(WINTUN_ADAPTER_HANDLE, NET_LUID*) { return false; }
     virtual void closeAdapter(WINTUN_ADAPTER_HANDLE adapter) = 0;
     virtual WINTUN_SESSION_HANDLE startSession(
         WINTUN_ADAPTER_HANDLE adapter, DWORD capacity) = 0;
@@ -39,7 +44,7 @@ public:
           m_startSession(nullptr), m_endSession(nullptr),
           m_getReadWaitEvent(nullptr), m_receivePacket(nullptr),
           m_releaseReceivePacket(nullptr), m_allocateSendPacket(nullptr),
-          m_sendPacket(nullptr) {}
+          m_sendPacket(nullptr), m_getAdapterLuid(nullptr) {}
 
     ~RealWintunApi() override { unload(); }
 
@@ -69,11 +74,13 @@ public:
             GetProcAddress(m_dll, "WintunAllocateSendPacket"));
         m_sendPacket = reinterpret_cast<FnSendPacket>(
             GetProcAddress(m_dll, "WintunSendPacket"));
+        m_getAdapterLuid = reinterpret_cast<FnGetAdapterLuid>(
+            GetProcAddress(m_dll, "WintunGetAdapterLUID"));
 
         if (!m_create || !m_close || !m_startSession || !m_endSession ||
             !m_getReadWaitEvent || !m_receivePacket ||
             !m_releaseReceivePacket || !m_allocateSendPacket ||
-            !m_sendPacket) {
+            !m_sendPacket || !m_getAdapterLuid) {
             if (error) {
                 *error = QStringLiteral(
                     "wintun.dll: missing exports (wrong version?)");
@@ -98,6 +105,7 @@ public:
         m_releaseReceivePacket = nullptr;
         m_allocateSendPacket = nullptr;
         m_sendPacket = nullptr;
+        m_getAdapterLuid = nullptr;
     }
 
     WINTUN_ADAPTER_HANDLE createAdapter(
@@ -108,6 +116,12 @@ public:
 
     void closeAdapter(WINTUN_ADAPTER_HANDLE adapter) override {
         if (m_close) m_close(adapter);
+    }
+
+    bool getAdapterLuid(WINTUN_ADAPTER_HANDLE adapter, NET_LUID* luid) override {
+        if (!m_getAdapterLuid || !luid) return false;
+        m_getAdapterLuid(adapter, luid);
+        return true;
     }
 
     WINTUN_SESSION_HANDLE startSession(
@@ -165,6 +179,7 @@ private:
         (WINAPI *FnAllocateSendPacket)(WINTUN_SESSION_HANDLE, DWORD);
     typedef void
         (WINAPI *FnSendPacket)(WINTUN_SESSION_HANDLE, const BYTE*);
+    typedef void (WINAPI *FnGetAdapterLuid)(WINTUN_ADAPTER_HANDLE, NET_LUID*);
 
     HMODULE m_dll;
     FnCreateAdapter m_create;
@@ -176,6 +191,7 @@ private:
     FnReleaseReceivePacket m_releaseReceivePacket;
     FnAllocateSendPacket m_allocateSendPacket;
     FnSendPacket m_sendPacket;
+    FnGetAdapterLuid m_getAdapterLuid;
 };
 
 } // namespace VLan

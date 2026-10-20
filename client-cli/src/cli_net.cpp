@@ -15,13 +15,16 @@ namespace VLan {
 // ======================== CliSignalClient ========================
 
 CliSignalClient::CliSignalClient()
-    : m_myPeerId(0), m_pingSentTime(0), m_connectStartTime(0), m_hasPendingAuth(false),
+    : m_myPeerId(0), m_pingSentTime(0), m_connectStartTime(0), m_authStartedMs(0), m_authOperation(0), m_pendingCreateMtu(ROOM_MTU_DEFAULT), m_hasPendingAuth(false),
+      m_roomOperationPending(false), m_sendFailurePending(false),
       m_serverAuthRequired(false), m_secureReady(false),
       m_disconnectNotified(false), m_secureSessionId(0),
       m_roomListRevision(0), m_snapshotRevision(0),
       m_snapshotPageCount(0), m_snapshotNextPage(0)
 {
-    memset(m_pendingAuthHash, 0, CIPHER_KEY_SIZE);
+    memset(m_authSalt, 0, sizeof(m_authSalt));
+    memset(m_expectedServerProof, 0, sizeof(m_expectedServerProof));
+    memset(m_roomChallenge, 0, sizeof(m_roomChallenge));
     memset(m_clientNonce, 0, sizeof(m_clientNonce));
     memset(m_serverNonce, 0, sizeof(m_serverNonce));
     memset(m_clientPrivKey, 0, sizeof(m_clientPrivKey));
@@ -31,7 +34,25 @@ CliSignalClient::CliSignalClient()
 
 CliSignalClient::~CliSignalClient() { disconnect(); }
 
+void CliSignalClient::cancelRoomOperation() {
+    if (m_authOperation == 2 || m_authOperation == 3) {
+        m_authTask.cancel(); m_authOperation = 0;
+    }
+    m_roomOperationPending = false; m_hasPendingAuth = false;
+    if (!m_pendingRoomPassword.empty()) crypto_wipe(&m_pendingRoomPassword[0], m_pendingRoomPassword.size());
+    m_pendingRoomPassword.clear();
+    crypto_wipe(m_roomChallenge, sizeof(m_roomChallenge));
+    if (m_pendingCreate.size()) crypto_wipe(const_cast<uint8_t*>(m_pendingCreate.data()), m_pendingCreate.size());
+    m_pendingCreate.clear();
+}
+
 void CliSignalClient::resetSecureState() {
+    cancelRoomOperation();
+    m_authTask.cancel(); m_authOperation = 0;
+    m_roomOperationPending = false; m_sendFailurePending = false;
+    crypto_wipe(m_authSalt, sizeof(m_authSalt));
+    crypto_wipe(m_expectedServerProof, sizeof(m_expectedServerProof));
+    crypto_wipe(m_roomChallenge, sizeof(m_roomChallenge));
     m_serverAuthRequired = false;
     m_secureReady = false;
     m_secureSessionId = 0;
@@ -45,7 +66,8 @@ void CliSignalClient::resetSecureState() {
     crypto_wipe(m_clientPrivKey, sizeof(m_clientPrivKey));
     crypto_wipe(m_clientPubKey, sizeof(m_clientPubKey));
     crypto_wipe(m_serverPubKey, sizeof(m_serverPubKey));
-    crypto_wipe(m_pendingAuthHash, sizeof(m_pendingAuthHash));
+    if (!m_pendingRoomPassword.empty()) crypto_wipe(&m_pendingRoomPassword[0], m_pendingRoomPassword.size());
+    m_pendingRoomPassword.clear();
     m_hasPendingAuth = false;
     resetRoomListState();
 }
@@ -74,7 +96,9 @@ void CliSignalClient::disconnect() {
 }
 
 void CliSignalClient::setServerPassword(const std::string& password) {
+    if (m_authOperation == 1) { m_authTask.cancel(); m_authOperation = 0; }
     m_serverPassword = password;
+    if (!m_secureReady && !m_secureMaster.empty()) disconnect();
 }
 
 void CliSignalClient::continueServerAuth() {
@@ -101,13 +125,11 @@ void CliSignalClient::login(const std::string& name,
 }
 
 void CliSignalClient::createRoom(const std::string& roomName, uint8_t maxPlayers,
-                                 RoomTrafficPolicy tcpPolicy,
-                                 RoomTrafficPolicy udpPolicy,
-                                 uint16_t mtu,
-                                 bool passwordProtected, const uint8_t* passwordHash) {
-    ByteBuffer bb;
-    bb.writeString(roomName);
-    bb.writeU8(maxPlayers);
+                                 RoomTrafficPolicy tcpPolicy, RoomTrafficPolicy udpPolicy,
+                                 uint16_t mtu, bool passwordProtected, const std::string& password) {
+    if (m_roomOperationPending || m_authOperation != 0 || !m_secureReady) return;
+    m_roomOperationPending = true;
+    ByteBuffer bb; bb.writeString(roomName); bb.writeU8(maxPlayers);
     bb.writeU8(static_cast<uint8_t>(tcpPolicy.transportMode));
     bb.writeU8(static_cast<uint8_t>(tcpPolicy.fecMode));
     bb.writeU8(static_cast<uint8_t>(tcpPolicy.kcpProfile));
@@ -115,27 +137,25 @@ void CliSignalClient::createRoom(const std::string& roomName, uint8_t maxPlayers
     bb.writeU8(static_cast<uint8_t>(udpPolicy.fecMode));
     bb.writeU8(static_cast<uint8_t>(udpPolicy.kcpProfile));
     bb.writeU8(passwordProtected ? 1 : 0);
-    if (passwordProtected && passwordHash)
-        bb.writeBytes(passwordHash, 32);
-    bb.writeU16(normalizeRoomMtu(mtu));
-    sendMsg(MSG_CREATE_ROOM, bb);
+    if (!passwordProtected) { bb.writeU16(normalizeRoomMtu(mtu)); sendMsg(MSG_CREATE_ROOM, bb); return; }
+    if (!secureRandomBytes(m_authSalt, sizeof(m_authSalt))) {
+        m_roomOperationPending = false; if (onServerError) onServerError("secure random generation failed"); return;
+    }
+    m_pendingCreate = bb; m_pendingCreateMtu = normalizeRoomMtu(mtu); m_authOperation = 2;
+    m_authTask.start(reinterpret_cast<const uint8_t*>(password.data()), password.size(), m_authSalt);
 }
 
-void CliSignalClient::joinRoom(uint32_t roomId, const uint8_t* authHash) {
-    crypto_wipe(m_pendingAuthHash, sizeof(m_pendingAuthHash));
-    if (authHash) {
-        memcpy(m_pendingAuthHash, authHash, CIPHER_KEY_SIZE);
-        m_hasPendingAuth = true;
-    } else {
-        m_hasPendingAuth = false;
-    }
-    ByteBuffer bb;
-    bb.writeU32(roomId);
-    sendMsg(MSG_JOIN_ROOM, bb);
+void CliSignalClient::joinRoom(uint32_t roomId, const std::string& password) {
+    if (m_roomOperationPending || m_authOperation != 0 || !m_secureReady || roomId == 0) return;
+    m_roomOperationPending = true;
+    if (!m_pendingRoomPassword.empty()) crypto_wipe(&m_pendingRoomPassword[0], m_pendingRoomPassword.size());
+    m_pendingRoomPassword = password; m_hasPendingAuth = true;
+    ByteBuffer bb; bb.writeU32(roomId); sendMsg(MSG_JOIN_ROOM, bb);
 }
 
 void CliSignalClient::resumeRoom(uint32_t roomId, uint32_t peerId, const uint8_t* resumeToken) {
-    if (!resumeToken) return;
+    if (m_roomOperationPending || !m_secureReady || !resumeToken) return;
+    m_roomOperationPending = true;
     ByteBuffer bb;
     bb.writeU32(roomId);
     bb.writeU32(peerId);
@@ -143,8 +163,11 @@ void CliSignalClient::resumeRoom(uint32_t roomId, uint32_t peerId, const uint8_t
     sendMsg(MSG_RESUME_ROOM, bb);
 }
 
-void CliSignalClient::leaveRoom() { sendMsg(MSG_LEAVE_ROOM); }
-void CliSignalClient::logout() { sendMsg(MSG_LOGOUT); }
+void CliSignalClient::leaveRoom() {
+    if (m_roomOperationPending) { cancelRoomOperation(); m_sendFailurePending = true; return; }
+    sendMsg(MSG_LEAVE_ROOM);
+}
+void CliSignalClient::logout() { cancelRoomOperation(); sendMsg(MSG_LOGOUT); }
 void CliSignalClient::listRooms() { sendMsg(MSG_LIST_ROOMS); }
 
 void CliSignalClient::requestRelay(uint32_t targetPeerId) {
@@ -189,46 +212,52 @@ void CliSignalClient::sendClientHello() {
     bb.writeU16(PROTOCOL_VERSION);
     bb.writeBytes(m_clientNonce, 16);
     bb.writeBytes(m_clientPubKey, 32);
-    m_conn.sendTcpMsg(MSG_CLIENT_HELLO, bb);
+    if (!m_conn.sendTcpMsg(MSG_CLIENT_HELLO, bb)) m_sendFailurePending = true;
+}
+
+void CliSignalClient::failAuthentication(AuthErrorCode code, const std::string& message) {
+    if (onFatalAuthError) onFatalAuthError(static_cast<uint16_t>(code), message);
+    if (onServerError) onServerError(message);
+    m_conn.reset(); resetSecureState(); notifyDisconnectedOnce();
 }
 
 void CliSignalClient::sendServerAuth() {
-    if (m_serverPassword.empty()) {
-        if (onServerPasswordRequired) onServerPasswordRequired();
-        return;
+    if (m_authOperation != 0 || m_secureReady || !m_secureMaster.empty()) return;
+    if (m_serverPassword.empty()) { if (onServerPasswordRequired) onServerPasswordRequired(); return; }
+    m_authOperation = 1;
+    m_authTask.start(reinterpret_cast<const uint8_t*>(m_serverPassword.data()), m_serverPassword.size(), m_authSalt);
+}
+
+void CliSignalClient::pollAuthTask() {
+    AuthKdfTask::Result result;
+    if (!m_authTask.poll(result)) return;
+    const int operation = m_authOperation; m_authOperation = 0;
+    if (!operation || !m_conn.connected) return;
+    LOG_INFO("[auth] KDF operation=%d elapsedMs=%llu success=%u", operation,
+        static_cast<unsigned long long>(result.elapsedMs), result.success ? 1 : 0);
+    if (!result.success) { failAuthentication(AuthErrorCode::KdfFailed, "authentication KDF failed"); return; }
+    if (operation == 2) {
+        m_pendingCreate.writeBytes(m_authSalt, AUTH_SALT_SIZE);
+        m_pendingCreate.writeBytes(result.hash, 32); m_pendingCreate.writeU16(m_pendingCreateMtu);
+        sendMsg(MSG_CREATE_ROOM, m_pendingCreate); m_pendingCreate = ByteBuffer(); return;
     }
-
-    uint8_t intermediate[CIPHER_KEY_SIZE];
-    uint8_t authHash[CIPHER_KEY_SIZE];
-    if (!computeIntermediate(
-            reinterpret_cast<const uint8_t*>(m_serverPassword.data()),
-            m_serverPassword.size(), intermediate)) {
-        if (onServerError) onServerError("authentication KDF failed");
-        m_conn.reset();
-        notifyDisconnectedOnce();
-        return;
+    if (operation == 3) {
+        uint8_t response[32]; computeChallengeResponse(result.hash, m_roomChallenge, response);
+        sendAuthResponse(response); crypto_wipe(response, sizeof(response));
+        crypto_wipe(m_roomChallenge, sizeof(m_roomChallenge)); return;
     }
-    authHashFromIntermediate(intermediate, authHash);
-
-    uint8_t shared[32];
-    uint8_t master[32];
-    crypto_x25519(shared, m_clientPrivKey, m_serverPubKey);
-    deriveSecureMaster(master, shared, authHash, m_clientNonce, m_serverNonce,
-                       m_clientPubKey, m_serverPubKey);
-    uint8_t proof[32];
-    computeClientAuthProof(proof, master, authHash);
-
+    uint8_t shared[32], master[32], proof[32];
+    crypto_x25519(shared, m_clientPrivKey, m_serverPubKey); crypto_wipe(m_clientPrivKey, sizeof(m_clientPrivKey));
+    if (!validX25519Shared(shared)) { crypto_wipe(shared, sizeof(shared));
+        failAuthentication(AuthErrorCode::InvalidKey, "invalid X25519 server key"); return; }
+    deriveSecureMaster(master, shared, result.hash, m_clientNonce, m_serverNonce,
+                       m_clientPubKey, m_serverPubKey, m_authSalt);
+    computeClientAuthProof(proof, master, result.hash);
+    computeServerAuthProof(m_expectedServerProof, master, result.hash);
     m_secureMaster.assign(master, master + 32);
-
-    ByteBuffer bb;
-    bb.writeBytes(proof, 32);
-    m_conn.sendTcpMsg(MSG_SERVER_AUTH, bb);
-
-    crypto_wipe(intermediate, sizeof(intermediate));
-    crypto_wipe(authHash, sizeof(authHash));
-    crypto_wipe(shared, sizeof(shared));
-    crypto_wipe(master, sizeof(master));
-    crypto_wipe(proof, sizeof(proof));
+    ByteBuffer bb; bb.writeBytes(proof, sizeof(proof));
+    if (!m_conn.sendTcpMsg(MSG_SERVER_AUTH, bb)) m_sendFailurePending = true;
+    crypto_wipe(shared, sizeof(shared)); crypto_wipe(master, sizeof(master)); crypto_wipe(proof, sizeof(proof));
 }
 
 void CliSignalClient::sendMsg(uint8_t msgType, const ByteBuffer& body) {
@@ -240,11 +269,15 @@ void CliSignalClient::sendMsg(uint8_t msgType, const ByteBuffer& body) {
     if (body.size() > 0)
         plain.insert(plain.end(), body.data(), body.data() + body.size());
     std::vector<uint8_t> enc = m_secureCipher.encrypt(plain.data(), plain.size());
+    if (enc.empty()) {
+        if (onServerError) onServerError("secure counter exhausted; reconnect required");
+        m_conn.reset(); resetSecureState(); notifyDisconnectedOnce(); return;
+    }
     if (enc.size() > MAX_TCP_MSG_PAYLOAD) return;
     ByteBuffer wrapped;
     if (!enc.empty())
         wrapped.writeBytes(enc.data(), enc.size());
-    m_conn.sendTcpMsg(MSG_ENCRYPTED, wrapped);
+    if (!m_conn.sendTcpMsg(MSG_ENCRYPTED, wrapped)) m_sendFailurePending = true;
 }
 
 void CliSignalClient::sendMsg(uint8_t msgType) {
@@ -285,7 +318,8 @@ void CliSignalClient::onWritable() {
             m_conn.connecting = false;
             m_conn.connected = true;
             m_conn.lastRecvTime = currentTimeMs();
-            LOG_INFO("Signal TCP connected");
+            m_authStartedMs = currentTimeMs();
+            LOG_INFO("[auth] TCP connected elapsedMs=%u", m_authStartedMs - m_connectStartTime);
             sendClientHello();
         } else {
             LOG_ERR("Signal connect failed: error %d", err);
@@ -294,7 +328,9 @@ void CliSignalClient::onWritable() {
         }
         return;
     }
-    m_conn.flushSend();
+    if (!m_conn.flushSend()) {
+        m_conn.reset(); resetSecureState(); notifyDisconnectedOnce();
+    }
 }
 
 void CliSignalClient::onReadable() {
@@ -360,12 +396,21 @@ void CliSignalClient::failSignalFrame(uint8_t msgType, size_t len,
 }
 
 void CliSignalClient::checkTimeouts() {
+    if (m_sendFailurePending) {
+        m_conn.reset(); resetSecureState(); notifyDisconnectedOnce(); return;
+    }
+    pollAuthTask();
     if (!m_conn.connected && m_conn.connecting) {
         if (currentTimeMs() - m_connectStartTime > 8000) {
             LOG_ERR("Signal connect timeout");
             m_conn.reset();
             if (onConnectFailed) onConnectFailed("connect timeout");
         }
+        return;
+    }
+    if (m_conn.connected && !m_secureReady) {
+        if (currentTimeMs() - m_authStartedMs > static_cast<uint32_t>(SERVER_AUTH_TIMEOUT_SEC * 1000))
+            failAuthentication(AuthErrorCode::AuthTimeout, "server authentication timed out (120 seconds)");
         return;
     }
     if (m_conn.connected) {
@@ -382,15 +427,24 @@ void CliSignalClient::checkTimeouts() {
 bool CliSignalClient::processMessage(uint8_t msgType,
                                      const uint8_t* payload, size_t len) {
     try {
+        const bool allowedPlainHandshake = !m_secureReady &&
+            (msgType == MSG_ERROR ||
+             (msgType == MSG_SERVER_HELLO && !m_serverAuthRequired && m_authOperation == 0 && m_secureMaster.empty()) ||
+             (msgType == MSG_SERVER_AUTH_OK && m_serverAuthRequired && m_authOperation == 0 && m_secureMaster.size() == SECURE_KEY_SIZE));
+        if ((!m_secureReady && !allowedPlainHandshake) ||
+            (m_secureReady && msgType != MSG_ENCRYPTED)) {
+            failAuthentication(AuthErrorCode::InvalidServerProof, "unexpected signaling message before authentication / handshake order violation"); return false;
+        }
+
         MessageValidationResult validation =
             validateServerSignalPayload(msgType, payload, len);
         if (validation.status == MessageValidationStatus::Malformed) {
-            if (validation.error == MessageValidationError::InvalidVersion &&
-                onServerError)
-                onServerError("protocol version mismatch");
-            failSignalFrame(msgType, len,
-                            messageValidationErrorName(validation.error),
-                            validation.offset);
+            if (!m_secureReady || validation.error == MessageValidationError::InvalidVersion) {
+                const AuthErrorCode code = validation.error == MessageValidationError::InvalidVersion || msgType == MSG_ERROR
+                    ? AuthErrorCode::VersionMismatch : AuthErrorCode::InvalidServerProof;
+                failAuthentication(code, "invalid pre-auth protocol response; this client requires protocol v9; upgrade GUI/CLI and server together"); return false;
+            }
+            failSignalFrame(msgType, len, messageValidationErrorName(validation.error), validation.offset);
             return false;
         }
         if (validation.status == MessageValidationStatus::UnknownType) {
@@ -408,6 +462,9 @@ bool CliSignalClient::processMessage(uint8_t msgType,
                 return false;
             }
             msgType = plain[0];
+            if (msgType == MSG_SERVER_HELLO || msgType == MSG_SERVER_AUTH_OK || msgType == MSG_ENCRYPTED) {
+                failAuthentication(AuthErrorCode::InvalidServerProof, "unexpected signaling message before authentication / handshake order violation"); return false;
+            }
             payload = plain.size() > 1 ? plain.data() + 1 : nullptr;
             len = plain.size() > 1 ? plain.size() - 1 : 0;
             validation = validateServerSignalPayload(msgType, payload, len);
@@ -436,6 +493,7 @@ bool CliSignalClient::processMessage(uint8_t msgType,
             const uint16_t serverVersion = bb.readU16();
             const bool authRequired = bb.readU8() != 0;
             if (serverVersion != PROTOCOL_VERSION) {
+                if (onFatalAuthError) onFatalAuthError(static_cast<uint16_t>(AuthErrorCode::VersionMismatch), "protocol version mismatch; upgrade GUI/CLI and server together");
                 if (onServerError) onServerError("protocol version mismatch");
                 failSignalFrame(msgType, len, "invalid-version", 0);
                 return false;
@@ -448,6 +506,11 @@ bool CliSignalClient::processMessage(uint8_t msgType,
                 notifyDisconnectedOnce();
                 return false;
             }
+            const uint8_t profile = bb.readU8();
+            if (profile != AUTH_KDF_PROFILE) {
+                failAuthentication(AuthErrorCode::UnsupportedKdf, "unsupported authentication KDF profile"); return false;
+            }
+            bb.readBytes(m_authSalt, AUTH_SALT_SIZE);
             bb.readBytes(m_serverNonce, 16);
             bb.readBytes(m_serverPubKey, 32);
             if (m_serverPassword.empty()) {
@@ -467,35 +530,19 @@ bool CliSignalClient::processMessage(uint8_t msgType,
             const uint32_t sessionId = bb.readU32();
             uint8_t serverProof[SECURE_KEY_SIZE];
             bb.readBytes(serverProof, sizeof(serverProof));
-            uint8_t intermediate[CIPHER_KEY_SIZE];
-            uint8_t authHash[CIPHER_KEY_SIZE];
-            uint8_t expected[SECURE_KEY_SIZE];
-            if (!computeIntermediate(
-                    reinterpret_cast<const uint8_t*>(m_serverPassword.data()),
-                    m_serverPassword.size(), intermediate)) {
-                crypto_wipe(intermediate, sizeof(intermediate));
-                if (onServerError) onServerError("authentication KDF failed");
-                m_conn.reset();
-                notifyDisconnectedOnce();
-                return false;
-            }
-            authHashFromIntermediate(intermediate, authHash);
-            computeServerAuthProof(expected, m_secureMaster.data(), authHash);
-            const bool proofValid =
-                crypto_verify32(expected, serverProof) == 0;
-            crypto_wipe(intermediate, sizeof(intermediate));
-            crypto_wipe(authHash, sizeof(authHash));
-            crypto_wipe(expected, sizeof(expected));
+            const bool proofValid = crypto_verify32(m_expectedServerProof, serverProof) == 0 &&
+                sessionId == deriveSessionId(m_secureMaster.data());
+            crypto_wipe(m_expectedServerProof, sizeof(m_expectedServerProof));
             crypto_wipe(serverProof, sizeof(serverProof));
 
             if (!proofValid) {
-                if (onServerError) onServerError("server auth proof failed");
-                failSignalFrame(msgType, len, "invalid-server-proof", 0);
+                failAuthentication(AuthErrorCode::InvalidServerProof, "server auth proof / session id failed");
                 return false;
             }
             m_secureSessionId = sessionId;
             m_secureCipher.init(m_secureMaster.data(), true, "signal");
             m_secureReady = true;
+            LOG_INFO("[auth] Server authenticated protocol=%u elapsedMs=%u", PROTOCOL_VERSION, currentTimeMs() - m_authStartedMs);
             if (onSecureSessionEstablished)
                 onSecureSessionEstablished(m_secureSessionId, m_secureMaster);
             if (!m_conn.connected) return false;
@@ -509,6 +556,7 @@ bool CliSignalClient::processMessage(uint8_t msgType,
             const uint16_t serverVersion = bb.readU16();
             const bool resumeAccepted = bb.readU8() != 0;
             if (serverVersion != PROTOCOL_VERSION) {
+                if (onFatalAuthError) onFatalAuthError(static_cast<uint16_t>(AuthErrorCode::VersionMismatch), "protocol version mismatch; upgrade GUI/CLI and server together");
                 if (onServerError) onServerError("protocol version mismatch");
                 failSignalFrame(msgType, len, "invalid-version", 4);
                 return false;
@@ -518,6 +566,7 @@ bool CliSignalClient::processMessage(uint8_t msgType,
             return true;
         }
         case MSG_ROOM_CREATED: {
+            m_roomOperationPending = false;
             const uint32_t roomId = bb.readU32();
             const uint32_t virtualIP = bb.readU32();
             const RoomTrafficPolicy tcpPolicy =
@@ -534,6 +583,7 @@ bool CliSignalClient::processMessage(uint8_t msgType,
             return true;
         }
         case MSG_JOIN_RESP: {
+            m_roomOperationPending = false;
             const uint32_t roomId = bb.readU32();
             const uint32_t virtualIP = bb.readU32();
             const RoomTrafficPolicy tcpPolicy =
@@ -555,7 +605,8 @@ bool CliSignalClient::processMessage(uint8_t msgType,
             }
             Buffer leaseToken(RECONNECT_TOKEN_SIZE);
             bb.readBytes(leaseToken.data(), leaseToken.size());
-            crypto_wipe(m_pendingAuthHash, sizeof(m_pendingAuthHash));
+            if (!m_pendingRoomPassword.empty()) crypto_wipe(&m_pendingRoomPassword[0], m_pendingRoomPassword.size());
+    m_pendingRoomPassword.clear();
             m_hasPendingAuth = false;
             if (onJoinResponse)
                 onJoinResponse(roomId, virtualIP, tcpPolicy, udpPolicy, mtu,
@@ -688,28 +739,25 @@ bool CliSignalClient::processMessage(uint8_t msgType,
             }
             return true;
 
-        case MSG_AUTH_CHALLENGE:
-            if (m_hasPendingAuth) {
-                uint8_t challenge[CIPHER_CHALLENGE_SIZE];
-                uint8_t response[CIPHER_KEY_SIZE];
-                bb.readBytes(challenge, sizeof(challenge));
-                computeChallengeResponse(
-                    m_pendingAuthHash, challenge, response);
-                sendAuthResponse(response);
-                crypto_wipe(challenge, sizeof(challenge));
-                crypto_wipe(response, sizeof(response));
-                crypto_wipe(m_pendingAuthHash, sizeof(m_pendingAuthHash));
-                m_hasPendingAuth = false;
-            } else {
-                m_hasPendingAuth = false;
-                LOG_ERR("[signal] Unexpected auth challenge type=0x%02x len=%zu",
-                        msgType, len);
-            }
-            return true;
+        case MSG_AUTH_CHALLENGE: {
+            const uint8_t profile = bb.readU8();
+            if (profile != AUTH_KDF_PROFILE) { failAuthentication(AuthErrorCode::UnsupportedKdf, "unsupported room KDF profile"); return false; }
+            if (!m_hasPendingAuth) { failSignalFrame(msgType, len, "unexpected-room-challenge", 0); return false; }
+            m_hasPendingAuth = false; bb.readBytes(m_authSalt, AUTH_SALT_SIZE);
+            bb.readBytes(m_roomChallenge, sizeof(m_roomChallenge)); m_authOperation = 3;
+            m_authTask.start(reinterpret_cast<const uint8_t*>(m_pendingRoomPassword.data()), m_pendingRoomPassword.size(), m_authSalt);
+            if (!m_pendingRoomPassword.empty()) crypto_wipe(&m_pendingRoomPassword[0], m_pendingRoomPassword.size());
+            m_pendingRoomPassword.clear(); return true;
+        }
 
         case MSG_ERROR: {
+            cancelRoomOperation();
+            const uint16_t code = bb.readU16();
             const std::string message = bb.readString();
-            crypto_wipe(m_pendingAuthHash, sizeof(m_pendingAuthHash));
+            if (isFatalAuthError(code)) { failAuthentication(static_cast<AuthErrorCode>(code), message); return false; }
+            if (code == static_cast<uint16_t>(AuthErrorCode::RoomPassword) && onFatalAuthError) onFatalAuthError(code, message);
+            if (!m_pendingRoomPassword.empty()) crypto_wipe(&m_pendingRoomPassword[0], m_pendingRoomPassword.size());
+    m_pendingRoomPassword.clear();
             m_hasPendingAuth = false;
             if (onServerError) onServerError(message);
             return true;
@@ -730,7 +778,7 @@ bool CliSignalClient::processMessage(uint8_t msgType,
 
 CliDataChannel::CliDataChannel()
     : m_port(0), m_peerId(0), m_established(false),
-      m_needReconnect(false), m_reconnectTime(0),
+      m_needReconnect(false), m_sendFailurePending(false), m_reconnectTime(0),
       m_securityMode(DataPlaneSecurityMode::Unconfigured),
       m_secureSessionId(0)
 {}
@@ -756,13 +804,16 @@ bool CliDataChannel::connectTo(const std::string& ip, uint16_t port, uint32_t pe
 void CliDataChannel::disconnect() {
     m_conn.reset();
     m_established = false;
-    m_needReconnect = false;
+    m_needReconnect = false; m_sendFailurePending = false;
     m_peerId = 0;
     m_port = 0;
 }
 
 bool CliDataChannel::installSecureSession(uint32_t sessionId,
                                           const Buffer& master) {
+    if (m_secureSessionId == sessionId && master.size() == SECURE_KEY_SIZE &&
+        m_secureMaster.size() == SECURE_KEY_SIZE &&
+        crypto_verify32(master.data(), m_secureMaster.data()) == 0) return true;
     if (m_conn.fd != SOCK_INVALID) {
         LOG_ERR("[datachannel] Cannot change security mode while connected");
         return false;
@@ -831,12 +882,15 @@ void CliDataChannel::onWritable() {
             ByteBuffer inner;
             inner.writeU32(m_peerId);
             std::vector<uint8_t> enc = m_cipher.encrypt(inner.data(), inner.size());
+            if (enc.empty()) { m_conn.reset(); clearSecurityContext();
+                if (onSecurityFailure) onSecurityFailure("data channel secure counter exhausted; new authentication required");
+                return; }
             uint8_t sid[SECURE_SESSION_ID_SIZE];
             writeU32BE(sid, m_secureSessionId);
             bb.writeBytes(sid, SECURE_SESSION_ID_SIZE);
             if (!enc.empty())
                 bb.writeBytes(enc.data(), enc.size());
-            m_conn.sendTcpMsg(MSG_DATA_CHANNEL_INIT, bb);
+            if (!m_conn.sendTcpMsg(MSG_DATA_CHANNEL_INIT, bb)) m_sendFailurePending = true;
             LOG_DBG("[datachannel] TCP connected, sent INIT for peer %u", m_peerId);
         } else {
             LOG_ERR("[datachannel] connect failed: error %d", err);
@@ -845,7 +899,10 @@ void CliDataChannel::onWritable() {
         }
         return;
     }
-    m_conn.flushSend();
+    if (!m_conn.flushSend()) {
+        m_conn.reset(); m_established = false; scheduleReconnect();
+        if (onDisconnectedCb) onDisconnectedCb();
+    }
 }
 
 void CliDataChannel::onReadable() {
@@ -999,14 +1056,17 @@ void CliDataChannel::sendMsg(uint8_t msgType, const ByteBuffer& body) {
         if (body.size() > 0)
             plain.insert(plain.end(), body.data(), body.data() + body.size());
         std::vector<uint8_t> enc = m_cipher.encrypt(plain.data(), plain.size());
+        if (enc.empty()) { m_conn.reset(); clearSecurityContext();
+            if (onSecurityFailure) onSecurityFailure("data channel secure counter exhausted; new authentication required");
+            return; }
         if (enc.size() > MAX_TCP_MSG_PAYLOAD) return;
         ByteBuffer wrapped;
         if (!enc.empty())
             wrapped.writeBytes(enc.data(), enc.size());
-        m_conn.sendTcpMsg(MSG_ENCRYPTED, wrapped);
+        if (!m_conn.sendTcpMsg(MSG_ENCRYPTED, wrapped)) m_sendFailurePending = true;
         return;
     }
-    m_conn.sendTcpMsg(msgType, body);
+    if (!m_conn.sendTcpMsg(msgType, body)) m_sendFailurePending = true;
 }
 
 void CliDataChannel::sendMsg(uint8_t msgType) {
@@ -1015,6 +1075,12 @@ void CliDataChannel::sendMsg(uint8_t msgType) {
 }
 
 void CliDataChannel::checkTimeouts() {
+    if (m_sendFailurePending) {
+        m_sendFailurePending = false; m_conn.reset(); m_established = false;
+        scheduleReconnect();
+        if (onDisconnectedCb) onDisconnectedCb();
+        return;
+    }
     if (m_needReconnect && currentTimeMs() >= m_reconnectTime) {
         m_needReconnect = false;
         if (m_peerId != 0 && m_conn.fd == SOCK_INVALID) {

@@ -57,6 +57,9 @@ latest_tag="$(printf '%s\n' "$tag_lines" | select_latest_tag_from_lines)"
 assert_equal "v0.10.0" "$latest_tag" "latest stable tag selection"
 assert_success "version comparison" version_is_greater v0.10.0 v0.9.9
 assert_failure "equal version is not greater" version_is_greater v0.10.0 v0.10.0
+release_tags=$'a\trefs/tags/v0.3.0\nb\trefs/tags/v0.3.1\nc\trefs/tags/v0.4.0-rc1'
+assert_equal "v0.3.1" "$(printf '%s\n' "$release_tags" | select_latest_tag_from_lines)" \
+    "protocol v9 release is selected over v0.3.0"
 
 assert_equal "apt" "$(classify_distro ubuntu '')" "Ubuntu family"
 assert_equal "apt" "$(classify_distro linuxmint 'ubuntu debian')" "Debian ID_LIKE"
@@ -72,7 +75,10 @@ tmp_dir="$(mktemp -d)"
 trap 'rm -rf -- "$tmp_dir"' EXIT
 
 archive_root="$tmp_dir/vlan-connect-v1.2.3"
-install -d "$archive_root/server"
+install -d "$archive_root/server" "$archive_root/common"
+printf '#define VLAN_RELEASE_VERSION "1.2.3"\n' > "$archive_root/common/version.h"
+printf 'static const uint16_t PROTOCOL_VERSION = 9;\n' > "$archive_root/common/protocol.h"
+printf '%040d\n' 1 > "$archive_root/SOURCE-COMMIT.txt"
 printf 'all:\n' > "$archive_root/server/Makefile"
 printf '[Unit]\n' > "$archive_root/server/vlan-server.service"
 printf '# Deploy\n' > "$archive_root/server/DEPLOY.md"
@@ -127,12 +133,26 @@ assert_equal "vlan-connect-v1.2.3" "$SOURCE_ARCHIVE_ROOT" \
 make_calls="$tmp_dir/make-calls"
 make() {
     printf '%s\n' "$*" >> "$make_calls"
-    printf '#!/bin/sh\nexit 0\n' > "$SOURCE_DIR/server/vlan-server"
+    printf '#!/bin/sh\nprintf "VLan Server 1.2.3 protocol=9 build=%040d\\n"\n' 1 > "$SOURCE_DIR/server/vlan-server"
     chmod 0755 "$SOURCE_DIR/server/vlan-server"
 }
 assert_success "local archive build extracts cached source" build_release
-grep -Fqx -- "-C $SOURCE_DIR/server" "$make_calls" ||
+grep -Fqx -- "-C $SOURCE_DIR/server BUILD_COMMIT=$(printf '%040d' 1)" "$make_calls" ||
     fail "local archive build must invoke the server Makefile"
+assert_equal "9" "$TARGET_PROTOCOL" "source protocol metadata"
+protocol_warning="$(show_protocol_warning 2>&1)"
+[[ "$protocol_warning" == *"protocol v8 clients cannot connect to protocol v9"* ]] ||
+    fail "protocol v9 update must warn before deployment"
+summary="$(show_summary)"
+[[ "$summary" == *"v8 clients are incompatible; update all GUI/CLI clients to v9"* ]] ||
+    fail "protocol v9 summary must repeat client upgrade warning"
+assert_failure "source version mismatch is rejected" \
+    bash -c 'source "$1"; SOURCE_DIR="$2"; TARGET_VERSION=v1.2.4; verify_source_metadata' \
+    _ "$INSTALLER" "$SOURCE_DIR"
+printf '#!/bin/sh\necho "VLan Server 1.2.3 protocol=8 build=unknown"\n' > "$SOURCE_DIR/server/vlan-server"
+assert_failure "binary protocol mismatch is rejected before deployment" \
+    bash -c 'source "$1"; SOURCE_DIR="$2"; TARGET_VERSION=v1.2.3; verify_source_metadata; verify_binary_version "$SOURCE_DIR/server/vlan-server"' \
+    _ "$INSTALLER" "$SOURCE_DIR"
 unset -f make
 rm -rf -- "$WORK_DIR"
 WORK_DIR=""

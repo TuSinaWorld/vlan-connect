@@ -39,8 +39,9 @@ public:
         memset(m_nonce, 9, sizeof(m_nonce));
         crypto_x25519_public_key(m_public, m_private);
         const char password[] = "policy-test-password";
-        assert(hashPassword(reinterpret_cast<const uint8_t*>(password),
-                            sizeof(password) - 1, m_authHash));
+        assert(secureRandomBytes(m_salt, sizeof(m_salt)));
+        assert(hashPasswordSalted(reinterpret_cast<const uint8_t*>(password),
+                            sizeof(password) - 1, m_salt, m_authHash));
         assert(m_server.listen(QHostAddress::LocalHost, 0));
         QObject::connect(&m_server, &QTcpServer::newConnection, &m_server, [this]() {
             m_socket = m_server.nextPendingConnection();
@@ -83,11 +84,13 @@ private:
             assert(hello.atEnd());
             crypto_x25519(shared, m_private, clientPublic);
             deriveSecureMaster(m_master, shared, m_authHash, clientNonce, m_nonce,
-                               clientPublic, m_public);
+                               clientPublic, m_public, m_salt);
             m_cipher.init(m_master, false, "signal");
             ByteBuffer reply;
             reply.writeU16(PROTOCOL_VERSION);
             reply.writeU8(1);
+            reply.writeU8(AUTH_KDF_PROFILE);
+            reply.writeBytes(m_salt, sizeof(m_salt));
             reply.writeBytes(m_nonce, sizeof(m_nonce));
             reply.writeBytes(m_public, sizeof(m_public));
             send(MSG_SERVER_HELLO, reply, false);
@@ -171,6 +174,7 @@ private:
     QTcpSocket* m_socket;
     RoomTrafficPolicy m_tcp, m_udp;
     std::vector<uint8_t> m_stream;
+    uint8_t m_salt[16];
     uint8_t m_private[32], m_public[32], m_nonce[16], m_authHash[32], m_master[32];
     SecureFrameCipher m_cipher;
 };
@@ -232,9 +236,80 @@ void testGuiPolicyCallbacks(TransportMode mode) {
     client.disconnect();
 }
 
+void testGuiPreAuthBusinessRejected(uint8_t type, bool legacy = false) {
+    QTcpServer server; assert(server.listen(QHostAddress::LocalHost, 0));
+    QObject::connect(&server, &QTcpServer::newConnection, &server, [&]() {
+        QTcpSocket* socket = server.nextPendingConnection();
+        QObject::connect(socket, &QTcpSocket::readyRead, &server, [socket, type, legacy]() {
+            socket->readAll();
+            ByteBuffer body;
+            if (type == MSG_ERROR) {
+                if (!legacy) body.writeU16(static_cast<uint16_t>(AuthErrorCode::InvalidPassword));
+                body.writeString("Protocol version mismatch");
+            } else if (type == MSG_LOGIN_RESP) {
+                body.writeU32(1); body.writeU16(9); body.writeU8(0);
+            } else {
+                body.writeU32(1); body.writeU32(VNET_SUBNET | 2);
+                writePolicy(body, makeDefaultTcpPolicy()); writePolicy(body, makeDefaultUdpPolicy());
+                body.writeU8(0); body.writeU16(ROOM_MTU_DEFAULT);
+                if (type == MSG_JOIN_RESP) { body.writeU8(1); body.writeU32(1); body.writeU32(VNET_SUBNET | 2); body.writeString("Alice"); }
+                uint8_t token[RECONNECT_TOKEN_SIZE] = {1}; body.writeBytes(token, sizeof(token));
+            }
+            std::vector<uint8_t> bytes(body.data(), body.data() + body.size());
+            const std::vector<uint8_t> wire = makeTcpFrame(type, bytes);
+            socket->write(reinterpret_cast<const char*>(wire.data()), wire.size());
+        });
+    });
+    SignalClient client; bool fatal = false, error = false, closed = false;
+    QObject::connect(&client, &SignalClient::fatalAuthError, &client, [&](uint16_t, QString) { fatal = true; });
+    QObject::connect(&client, &SignalClient::serverError, &client, [&](QString) { assert(fatal); error = true; });
+    QObject::connect(&client, &SignalClient::disconnected, &client, [&]() { closed = true; });
+    QObject::connect(&client, &SignalClient::connected, &client, []() { assert(false && "unauthenticated connected callback"); });
+    QObject::connect(&client, &SignalClient::loginResponse, &client, [](uint32_t, bool) { assert(false && "unauthenticated login callback"); });
+    QObject::connect(&client, &SignalClient::roomCreated, &client, []() { assert(false && "unauthenticated room callback"); });
+    QObject::connect(&client, &SignalClient::joinResponse, &client, []() { assert(false && "unauthenticated join callback"); });
+    client.connectToServer(QStringLiteral("127.0.0.1"), server.serverPort());
+    QElapsedTimer timer; timer.start();
+    while (!closed && timer.elapsed() < 3000) { QCoreApplication::processEvents(); QThread::msleep(1); }
+    assert(fatal && error && closed && !client.secureEnabled());
+}
+
+void testGuiCancelActiveKdf() {
+    QTcpServer server; assert(server.listen(QHostAddress::LocalHost, 0));
+    int authFrames = 0; QTcpSocket* peer = nullptr; std::vector<uint8_t> stream;
+    QObject::connect(&server, &QTcpServer::newConnection, &server, [&]() {
+        peer = server.nextPendingConnection();
+        QObject::connect(peer, &QTcpSocket::readyRead, &server, [&]() {
+            const QByteArray data = peer->readAll(); stream.insert(stream.end(), data.begin(), data.end());
+            uint8_t type; std::vector<uint8_t> payload;
+            while (popTcpFrame(&stream, &type, &payload)) {
+                if (type == MSG_SERVER_AUTH) { ++authFrames; continue; }
+                assert(type == MSG_CLIENT_HELLO);
+                uint8_t salt[16] = {3}, nonce[16] = {4}, priv[32] = {5}, pub[32]; crypto_x25519_public_key(pub, priv);
+                ByteBuffer reply; reply.writeU16(9); reply.writeU8(1); reply.writeU8(AUTH_KDF_PROFILE);
+                reply.writeBytes(salt,16); reply.writeBytes(nonce,16); reply.writeBytes(pub,32);
+                std::vector<uint8_t> body(reply.data(), reply.data()+reply.size()); const auto wire = makeTcpFrame(MSG_SERVER_HELLO,body);
+                peer->write(reinterpret_cast<const char*>(wire.data()),wire.size());
+            }
+        });
+    });
+    SignalClient client; client.setServerPassword(QStringLiteral("cancel-during-background-kdf"));
+    client.connectToServer(QStringLiteral("127.0.0.1"),server.serverPort());
+    QElapsedTimer timer; timer.start();
+    while (!client.authInProgress() && timer.elapsed() < 3000) { QCoreApplication::processEvents(); QThread::msleep(1); }
+    assert(client.authInProgress()); client.disconnect();
+    while (timer.elapsed() < 500) { QCoreApplication::processEvents(); QThread::msleep(1); }
+    assert(!client.authInProgress() && !client.secureEnabled() && authFrames == 0);
+}
+
 } // namespace
 
 void runGuiPolicyDecodeTests() {
+    testGuiPreAuthBusinessRejected(VLan::MSG_LOGIN_RESP);
+    testGuiPreAuthBusinessRejected(VLan::MSG_ROOM_CREATED);
+    testGuiPreAuthBusinessRejected(VLan::MSG_JOIN_RESP);
+    testGuiPreAuthBusinessRejected(VLan::MSG_ERROR, true);
+    testGuiCancelActiveKdf();
     testGuiPolicyCallbacks(VLan::MODE_RELAY_RAW_UDP);
     testGuiPolicyCallbacks(VLan::MODE_RELAY_KCP);
     testGuiPolicyCallbacks(VLan::MODE_RELAY_TCP);

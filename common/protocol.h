@@ -56,7 +56,9 @@ static const int TCP_RELAY_DEAD_MS      = 30000;              // peer-level time
 static const int TCP_RECV_TIMEOUT_MS    = 45000;              // client-side no-recv
 
 static const uint32_t PROTOCOL_MAGIC    = 0x564C414E; // "VLAN"
-static const uint16_t PROTOCOL_VERSION  = 8;
+static const uint16_t PROTOCOL_VERSION  = 9;
+static const uint8_t AUTH_KDF_PROFILE = 1;
+static const size_t AUTH_SALT_SIZE = 16;
 
 enum UdpPacketType : uint8_t {
     UDP_KCP_DATA      = 0x01,
@@ -65,6 +67,16 @@ enum UdpPacketType : uint8_t {
     UDP_RAW_RELAY_DATA    = 0x08,
     UDP_ENCRYPTED         = 0x09
 };
+
+enum class AuthErrorCode : uint16_t {
+    General = 0, VersionMismatch = 1, InvalidPassword = 2,
+    InvalidServerProof = 3, UnsupportedKdf = 4, InvalidKey = 5,
+    RateLimited = 6, AuthTimeout = 7, KdfFailed = 8, RoomPassword = 9
+};
+inline bool isFatalAuthError(uint16_t code) {
+    return code >= static_cast<uint16_t>(AuthErrorCode::VersionMismatch) &&
+           code <= static_cast<uint16_t>(AuthErrorCode::KdfFailed);
+}
 
 enum TcpMsgType : uint8_t {
     MSG_LOGIN          = 0x01,

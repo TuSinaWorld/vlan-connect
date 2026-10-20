@@ -18,7 +18,7 @@ static std::vector<uint8_t> serverHelloPayload() {
     payload.push_back(static_cast<uint8_t>(
         PROTOCOL_VERSION & 0xff));
     payload.push_back(1);
-    payload.resize(2 + 1 + 16 + 32, 0);
+    payload.resize(2 + 1 + 1 + AUTH_SALT_SIZE + 16 + 32, 0);
     return payload;
 }
 

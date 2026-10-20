@@ -76,15 +76,20 @@ SignalServer::SignalServer()
     memset(m_serverAuthHash, 0, sizeof(m_serverAuthHash));
 }
 
-SignalServer::~SignalServer() { stop(); }
+SignalServer::~SignalServer() {
+    stop();
+    crypto_wipe(m_serverAuthHash, sizeof(m_serverAuthHash));
+    crypto_wipe(m_serverAuthSalt, sizeof(m_serverAuthSalt));
+}
 
 bool SignalServer::setAuthPassword(const std::string& password) {
     memset(m_serverAuthHash, 0, sizeof(m_serverAuthHash));
     m_authReady = false;
     if (password.size() < 8 || password.size() > 256)
         return false;
-    if (!hashPassword(reinterpret_cast<const uint8_t*>(password.data()),
-                      password.size(), m_serverAuthHash))
+    if (!secureRandomBytes(m_serverAuthSalt, sizeof(m_serverAuthSalt)) ||
+        !hashPasswordSalted(reinterpret_cast<const uint8_t*>(password.data()),
+                            password.size(), m_serverAuthSalt, m_serverAuthHash))
         return false;
     m_authReady = true;
     return true;
@@ -1268,12 +1273,21 @@ void SignalServer::onClientHello(ClientSession& c, const uint8_t* p, size_t len)
     if (clientVersion != PROTOCOL_VERSION) {
         LOG_INFO("[server] Client hello version %u != server version %u",
                  clientVersion, PROTOCOL_VERSION);
-        sendError(c.tcpFd, "Protocol version mismatch");
+        sendError(c.tcpFd, "Protocol mismatch: server v9; update GUI/CLI and server together.",
+                  AuthErrorCode::VersionMismatch);
         c.state = SessionState::Closing;
         c.helloDeadline = 0;
         return;
     }
 
+    // Bound unauthenticated work before random generation / X25519. This is
+    // per public IP with a burst large enough for a room behind one NAT.
+    if (!takeIpToken(c.remoteIpv4, &IpState::authFailures, 32.0, 1.0)) {
+        sendError(c.tcpFd, "Authentication rate limit exceeded", AuthErrorCode::RateLimited);
+        c.state = SessionState::Closing;
+        c.helloDeadline = 0;
+        return;
+    }
     bb.readBytes(c.clientNonce, 16);
     bb.readBytes(c.clientPubKey, 32);
     c.helloDeadline = 0;
@@ -1282,6 +1296,8 @@ void SignalServer::onClientHello(ClientSession& c, const uint8_t* p, size_t len)
     ByteBuffer resp;
     resp.writeU16(PROTOCOL_VERSION);
     resp.writeU8(1);
+    resp.writeU8(AUTH_KDF_PROFILE);
+    resp.writeBytes(m_serverAuthSalt, AUTH_SALT_SIZE);
 
     if (!secureRandomBytes(c.serverNonce, 16) ||
         !secureRandomBytes(c.serverPrivKey, 32)) {
@@ -1315,7 +1331,7 @@ void SignalServer::onServerAuth(ClientSession& c, const uint8_t* p, size_t len) 
         LOG_ERROR("[server] SERVER_AUTH rejected fd=%d len=%zu deadline=%ld now=%ld",
                   c.tcpFd, len, static_cast<long>(c.authDeadline),
                   static_cast<long>(time(nullptr)));
-        sendError(c.tcpFd, "Server authentication timeout");
+        sendError(c.tcpFd, "Server authentication timeout", AuthErrorCode::AuthTimeout);
         c.alive = false;
         return;
     }
@@ -1324,20 +1340,24 @@ void SignalServer::onServerAuth(ClientSession& c, const uint8_t* p, size_t len) 
     uint8_t master[32];
     uint8_t expected[32];
     crypto_x25519(shared, c.serverPrivKey, c.clientPubKey);
+    crypto_wipe(c.serverPrivKey, sizeof(c.serverPrivKey));
+    if (!validX25519Shared(shared)) {
+        crypto_wipe(shared, sizeof(shared));
+        sendError(c.tcpFd, "Invalid X25519 peer key", AuthErrorCode::InvalidKey);
+        c.state = SessionState::Closing;
+        return;
+    }
     deriveSecureMaster(master, shared, m_serverAuthHash,
                        c.clientNonce, c.serverNonce,
-                       c.clientPubKey, c.serverPubKey);
+                       c.clientPubKey, c.serverPubKey, m_serverAuthSalt);
     computeClientAuthProof(expected, master, m_serverAuthHash);
     if (crypto_verify32(expected, p) != 0) {
         LOG_ERROR("[server] SERVER_AUTH invalid password fd=%d len=%zu", c.tcpFd, len);
         crypto_wipe(shared, sizeof(shared));
         crypto_wipe(master, sizeof(master));
         crypto_wipe(expected, sizeof(expected));
-        const bool allowed = takeIpToken(
-            c.remoteIpv4, &IpState::authFailures, 5.0, 12.0);
-        if (allowed)
-            sendError(c.tcpFd, "Invalid server password");
-        c.alive = false;
+        sendError(c.tcpFd, "Invalid server password", AuthErrorCode::InvalidPassword);
+        c.state = SessionState::Closing;
         return;
     }
 
@@ -1438,7 +1458,8 @@ void SignalServer::onLogin(ClientSession& c, const uint8_t* p, size_t len) {
     if (clientVersion != PROTOCOL_VERSION) {
         LOG_INFO("[server] Client version %u != server version %u (peer name='%s')",
                  clientVersion, PROTOCOL_VERSION, name.c_str());
-        sendError(c.tcpFd, "Protocol version mismatch");
+        sendError(c.tcpFd, "Protocol mismatch: server v9; update GUI/CLI and server together.",
+                  AuthErrorCode::VersionMismatch);
         c.state = SessionState::Closing;
         return;
     }
@@ -1567,8 +1588,11 @@ void SignalServer::onCreateRoom(ClientSession& c, const uint8_t* p, size_t len) 
 
     uint8_t passwordProtected = bb.readU8();
     uint8_t pwdHash[32] = {};
-    if (passwordProtected)
+    uint8_t pwdSalt[AUTH_SALT_SIZE] = {};
+    if (passwordProtected) {
+        bb.readBytes(pwdSalt, AUTH_SALT_SIZE);
         bb.readBytes(pwdHash, 32);
+    }
 
     uint16_t roomMtu = bb.readU16();
     if (!isValidRoomMtuValue(roomMtu)) {
@@ -1583,7 +1607,8 @@ void SignalServer::onCreateRoom(ClientSession& c, const uint8_t* p, size_t len) 
     }
     Room* room = m_rooms.createRoom(roomName, c.peerId, maxPlayers,
                                     tcpPolicy, udpPolicy,
-                                    roomMtu, passwordProtected, pwdHash);
+                                    roomMtu, passwordProtected, pwdHash, pwdSalt);
+    crypto_wipe(pwdHash, sizeof(pwdHash));
     RoomLease* lease = room->addLease(c.peerId, c.name, leaseToken);
     if (!lease) {
         m_rooms.eraseRoom(room->id);
@@ -1631,6 +1656,10 @@ void SignalServer::onJoinRoom(ClientSession& c, const uint8_t* p, size_t len) {
     if (room->isFull()){ sendError(c.tcpFd, "Room is full");  return; }
 
     if (room->passwordProtected) {
+        if (!takeIpToken(c.remoteIpv4, &IpState::roomPasswordFailures, 32.0, 2.0)) {
+            sendError(c.tcpFd, "Room authentication rate limit exceeded", AuthErrorCode::RateLimited);
+            return;
+        }
         c.pendingJoinRoomId = roomId;
         c.state = SessionState::AwaitRoomPassword;
         if (!secureRandomBytes(c.authChallenge, sizeof(c.authChallenge))) {
@@ -1641,6 +1670,8 @@ void SignalServer::onJoinRoom(ClientSession& c, const uint8_t* p, size_t len) {
         }
 
         ByteBuffer challenge;
+        challenge.writeU8(AUTH_KDF_PROFILE);
+        challenge.writeBytes(room->passwordSalt, AUTH_SALT_SIZE);
         challenge.writeBytes(c.authChallenge, 32);
         sendClientMsg(c, MSG_AUTH_CHALLENGE, challenge);
         return;
@@ -1670,10 +1701,7 @@ void SignalServer::onAuthResponse(ClientSession& c, const uint8_t* p, size_t len
         crypto_wipe(c.authChallenge, sizeof(c.authChallenge));
         c.state = SessionState::LoggedIn;
         c.pendingJoinRoomId = 0;
-        if (!takeIpToken(c.remoteIpv4, &IpState::roomPasswordFailures,
-                         10.0, 6.0))
-            c.alive = false;
-        sendError(c.tcpFd, "\xe5\xaf\x86\xe7\xa0\x81\xe9\x94\x99\xe8\xaf\xaf");
+        sendError(c.tcpFd, "Invalid room password", AuthErrorCode::RoomPassword);
         return;
     }
 
@@ -1685,10 +1713,7 @@ void SignalServer::onAuthResponse(ClientSession& c, const uint8_t* p, size_t len
         crypto_wipe(c.authChallenge, sizeof(c.authChallenge));
         c.state = SessionState::LoggedIn;
         c.pendingJoinRoomId = 0;
-        if (!takeIpToken(c.remoteIpv4, &IpState::roomPasswordFailures,
-                         10.0, 6.0))
-            c.alive = false;
-        sendError(c.tcpFd, "\xe5\xaf\x86\xe7\xa0\x81\xe9\x94\x99\xe8\xaf\xaf");
+        sendError(c.tcpFd, "Invalid room password", AuthErrorCode::RoomPassword);
         return;
     }
     crypto_wipe(expected, 32);
@@ -2176,6 +2201,7 @@ void SignalServer::sendEncryptedUdp(int udpFd, ClientSession& dst,
     if (!dst.serverAuthOk || dst.secureSessionId == 0 || !dst.udpAddrKnown)
         return;
     std::vector<uint8_t> enc = dst.udpCipher.encrypt(plain.data(), plain.size());
+    if (enc.empty()) { dst.alive = false; return; }
     std::vector<uint8_t> pkt;
     pkt.resize(1 + SECURE_SESSION_ID_SIZE + enc.size());
     pkt[0] = UDP_ENCRYPTED;
@@ -2197,6 +2223,7 @@ ByteBuffer SignalServer::encryptForClient(ClientSession& c, uint8_t msgType,
     if (body.size() > 0)
         plain.insert(plain.end(), body.data(), body.data() + body.size());
     std::vector<uint8_t> enc = c.secureCipher.encrypt(plain.data(), plain.size());
+    if (enc.empty()) c.alive = false;
     ByteBuffer wrapped;
     if (!enc.empty())
         wrapped.writeBytes(enc.data(), enc.size());
@@ -2383,6 +2410,7 @@ void SignalServer::sendMsg(int fd, uint8_t msgType) {
 void SignalServer::sendClientMsg(ClientSession& c, uint8_t msgType, const ByteBuffer& body) {
     if (c.secureEnabled && c.serverAuthOk) {
         ByteBuffer wrapped = encryptForClient(c, msgType, body);
+        if (!c.alive || wrapped.size() == 0) return;
         sendMsg(c.tcpFd, MSG_ENCRYPTED, wrapped);
         return;
     }
@@ -2401,8 +2429,9 @@ void SignalServer::sendClientMsg(ClientSession& c, uint8_t msgType) {
     sendClientMsg(c, msgType, empty);
 }
 
-void SignalServer::sendError(int fd, const std::string& text) {
+void SignalServer::sendError(int fd, const std::string& text, AuthErrorCode code) {
     ByteBuffer body;
+    body.writeU16(static_cast<uint16_t>(code));
     body.writeString(text);
     auto it = m_clients.find(fd);
     if (it != m_clients.end())
@@ -2429,6 +2458,7 @@ bool SignalServer::sendDataMsg(ClientSession& c, uint8_t msgType,
     if (body.size() > 0)
         plain.insert(plain.end(), body.data(), body.data() + body.size());
     std::vector<uint8_t> enc = c.dataCipher.encrypt(plain.data(), plain.size());
+    if (enc.empty()) { c.alive = false; return false; }
     outBody.clear();
     if (!enc.empty())
         outBody.writeBytes(enc.data(), enc.size());

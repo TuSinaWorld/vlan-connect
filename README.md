@@ -2,6 +2,8 @@
 
 VLan 是一个虚拟局域网联机工具。它由 Linux 中继服务端、Windows 图形客户端、命令行客户端和虚拟网卡组成，用于让不同网络中的玩家像在同一个局域网内一样通信。
 
+当前源码软件版本为 **v0.3.1，协议 v9**。服务端、GUI 与 CLI 必须一起升级；v8 客户端不能连接 v9 服务端。发布资产及校验和齐全后才会将 GitHub Release 从草稿发布，源码版本号不代表发布已经完成。更新及鉴权变更见 [v0.3.1 说明](docs/release-v0.3.1.md)。
+
 ## 快速入口
 
 - 服务端部署和 systemd 安装: [server/DEPLOY.md](server/DEPLOY.md)
@@ -40,7 +42,7 @@ sudo bash /tmp/install.sh --source-archive /tmp/vlan-connect-source-vX.Y.Z.tar.g
 - MTU 选项: `1280`、`1400`、`1420`，程序内部会扣除传输开销。
 - 房间密码只用于加入房间校验，不参与传输加密。
 - 服务端鉴权是强制要求。信令、TCP Relay data channel、UDP relay frame 和 TUN payload 只在完成鉴权并建立安全会话后传输；GUI/CLI 会拒绝未要求鉴权的服务端。
-- 服务端、GUI 和 CLI 仅支持协议 v8，必须作为同一版本批次发布。
+- 服务端、GUI 和 CLI 仅支持协议 v9，必须作为同一版本批次发布。`vlan-cli --version` 和 `vlan-server --version` 可在无密码、无管理员权限、无网络连接时查询软件版本、协议版本和构建提交。
 
 ## 目录结构
 
@@ -94,6 +96,7 @@ nmake
 ```
 
 运行 GUI 客户端时需要管理员权限，因为程序需要创建和配置虚拟网卡。
+Windows 下双击 `VLanClient.exe` 会请求 UAC 提升权限；同意系统提示后启动，无需再手动选择“以管理员身份运行”。窗口仅在启动时按主屏可用工作区及 DPI 缩放适配，后续手动调整窗口或从托盘恢复不会重置尺寸。
 
 GUI 客户端会在本机用户配置中保存语言、默认服务器地址、默认端口、默认昵称和详细日志开关。服务端鉴权密码和房间密码不会持久化保存。
 
