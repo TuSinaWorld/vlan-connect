@@ -232,12 +232,14 @@ struct Room {
     uint16_t              mtu;
     uint8_t               passwordProtected;
     uint8_t               passwordHash[32];
+    uint8_t               passwordSalt[AUTH_SALT_SIZE];
     time_t                emptyTimestamp;
 
     Room() : id(0), hostPeerId(0), maxPlayers(MAX_PLAYERS),
              tcpPolicy(makeDefaultTcpPolicy()), udpPolicy(makeDefaultUdpPolicy()),
              mtu(ROOM_MTU_DEFAULT), passwordProtected(0), emptyTimestamp(0) {
         memset(passwordHash, 0, sizeof(passwordHash));
+        memset(passwordSalt, 0, sizeof(passwordSalt));
     }
 
     bool hasVirtualIP(uint32_t ip) const {
@@ -364,7 +366,8 @@ public:
                      const RoomTrafficPolicy& udpPolicy,
                      uint16_t mtu = ROOM_MTU_DEFAULT,
                      uint8_t passwordProtected = 0,
-                     const uint8_t* pwdHash = nullptr) {
+                     const uint8_t* pwdHash = nullptr,
+                     const uint8_t* pwdSalt = nullptr) {
         uint32_t rid = allocateRoomId();
         Room& r = m_rooms[rid];
         r = Room();
@@ -378,6 +381,7 @@ public:
         r.passwordProtected = passwordProtected;
         if (passwordProtected && pwdHash) {
             memcpy(r.passwordHash, pwdHash, 32);
+            if (pwdSalt) memcpy(r.passwordSalt, pwdSalt, AUTH_SALT_SIZE);
         }
         r.emptyTimestamp = 0;
         return &r;

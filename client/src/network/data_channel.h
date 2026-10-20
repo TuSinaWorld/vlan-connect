@@ -30,6 +30,7 @@ public:
 signals:
     void connected();
     void disconnected();
+    void securityError(QString reason);
     void relayDataReceived(uint32_t srcPeerId, TrafficClass cls, QByteArray data);
 
 private slots:
@@ -45,6 +46,7 @@ private:
     void sendMsg(uint8_t msgType);
     bool processMessage(uint8_t msgType, const uint8_t* payload, size_t len);
     void scheduleReconnect();
+    void requestNewSecuritySession();
     void handleMalformedFrame(uint8_t msgType, size_t len,
                               const char* error, size_t offset);
 

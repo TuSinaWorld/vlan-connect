@@ -263,7 +263,9 @@ CliApp::CliApp()
       m_lastPingTime(0), m_lastKcpUpdateTime(0),
       m_lastUdpKeepaliveTime(0), m_lastTcpRelayCheckTime(0),
       m_lastLatencyCheckTime(0), m_lastDataChannelPingTime(0),
-      m_wantReconnect(false), m_reconnectAttempts(0),
+      m_wantReconnect(false), m_authRetryBlocked(false),
+      m_securityReconnectPending(false), m_securityReconnectSessionId(0),
+      m_reconnectAttempts(0),
       m_nextReconnectTime(0), m_wasInRoom(false),
       m_pendingResumeRoom(false), m_manualDisconnecting(false),
       m_logoutPending(false), m_exitAfterDisconnect(false),
@@ -291,7 +293,10 @@ void CliApp::setServer(const std::string& host, uint16_t port) {
     clearResumeLease();
 }
 
-void CliApp::setServerPassword(const std::string& password) { m_serverPassword = password; }
+void CliApp::setServerPassword(const std::string& password) {
+    m_authRetryBlocked = false;
+    m_serverPassword = password;
+}
 void CliApp::setPlayerName(const std::string& name) { m_playerName = name; }
 void CliApp::setVerbose(bool v) { CliLog::instance().setVerbose(v); }
 
@@ -414,6 +419,14 @@ void CliApp::setupCallbacks() {
         if (!installed)
             LOG_ERR("Failed to install secure data-plane session");
     };
+    m_signal.onFatalAuthError = [this](uint16_t code, const std::string& msg) {
+        m_authRetryBlocked = true;
+        m_wantReconnect = false;
+        m_pendingResumeRoom = false;
+        m_wasInRoom = false;
+        clearResumeLease();
+        LOG_ERR("Automatic reconnect stopped: code=%u reason=%s", code, msg.c_str());
+    };
     m_signal.onServerError   = [this](const std::string& msg) {
         fprintf(stdout, "* Server error: %s\n> ", msg.c_str());
         fflush(stdout);
@@ -441,6 +454,13 @@ void CliApp::setupCallbacks() {
     m_dataChannel.onRelayData      = [this](uint32_t src, TrafficClass cls, Buffer data) {
         handleTcpRelayReceived(src, cls, data);
     };
+    const auto securityFailure = [this](const std::string& message) {
+        LOG_ERR("%s; requesting a new authenticated session", message.c_str());
+        m_securityReconnectPending = true;
+        m_securityReconnectSessionId = m_signal.secureSessionId();
+    };
+    m_dataChannel.onSecurityFailure = securityFailure;
+    m_tunnel.onSecurityFailure = securityFailure;
 
     m_tunnel.onTunnelDead = [this](uint32_t pid, TrafficClass cls) { onTransportDead(pid, cls); };
 }
@@ -482,12 +502,6 @@ int CliApp::run(const volatile sig_atomic_t* stopRequested) {
     if (!isValidPlayerName(m_playerName)) {
         fprintf(stderr, "Invalid player name: use %d-%d ASCII letters or digits.\n",
                 MIN_PLAYER_NAME_LEN, MAX_PLAYER_NAME_LEN);
-        stopStdinReader();
-        sock_cleanup();
-        return 1;
-    }
-
-    if (!m_tunnel.initUdpSocket()) {
         stopStdinReader();
         sock_cleanup();
         return 1;
@@ -664,7 +678,7 @@ void CliApp::eventLoop() {
 
         if (sigFd != SOCK_INVALID) {
             FD_SET(sigFd, &readfds);
-            if (!m_signal.isConnected())
+            if (m_signal.wantsWrite())
                 FD_SET(sigFd, &writefds);
 #ifndef _WIN32
             if (sigFd > maxfd) maxfd = sigFd;
@@ -672,7 +686,7 @@ void CliApp::eventLoop() {
         }
         if (dcFd != SOCK_INVALID) {
             FD_SET(dcFd, &readfds);
-            if (!m_dataChannel.isConnected())
+            if (m_dataChannel.wantsWrite())
                 FD_SET(dcFd, &writefds);
 #ifndef _WIN32
             if (dcFd > maxfd) maxfd = dcFd;
@@ -689,7 +703,15 @@ void CliApp::eventLoop() {
         tv.tv_sec  = 0;
         tv.tv_usec = 5000; // 5ms for KCP granularity
 
-        int ready = select(static_cast<int>(maxfd + 1), &readfds, &writefds, nullptr, &tv);
+        int ready = 0;
+#ifdef _WIN32
+        // Winsock rejects empty descriptor sets. A disconnected TCP-only client
+        // still needs to wait for commands without spinning at full CPU.
+        if (readfds.fd_count == 0 && writefds.fd_count == 0)
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        else
+#endif
+            ready = select(static_cast<int>(maxfd + 1), &readfds, &writefds, nullptr, &tv);
 
         if (ready > 0) {
             if (sigFd != SOCK_INVALID && FD_ISSET(sigFd, &writefds))
@@ -768,15 +790,45 @@ void CliApp::eventLoop() {
 
         if (m_currentRoomId != 0 && now - m_lastLatencyCheckTime >= 3000) {
             m_lastLatencyCheckTime = now;
-            for (CliPeerConnection* peer : m_tunnel.allPeers())
+            for (CliPeerConnection* peer : m_tunnel.allPeers()) {
                 peer->sendLatencyPing();
+                for (int cls = TRAFFIC_TCP; cls <= TRAFFIC_UDP; ++cls) {
+                    const TrafficClass trafficClass = static_cast<TrafficClass>(cls);
+                    RelayProbeWatchdog& watchdog =
+                        m_probeWatchdogs[transportKey(peer->peerId(), trafficClass)];
+                    const bool fresh = peer->latencyMs(trafficClass) >= 0;
+                    const bool recovered = watchdog.outageReported() && fresh;
+                    const bool timedOut = watchdog.observe(now, fresh);
+                    if (recovered)
+                        LOG_INFO("Peer probe recovered: peer=%u class=%s transport=%s rtt=%dms",
+                                 peer->peerId(), trafficClass == TRAFFIC_TCP ? "TCP" : "UDP",
+                                 transportName(peer->transport(trafficClass)),
+                                 peer->latencyMs(trafficClass));
+                    if (timedOut)
+                        LOG_ERR("No peer probe reply: peer=%u class=%s transport=%s server=%s:%u dataChannel=%s; check relay reachability, firewall and routes",
+                                peer->peerId(), trafficClass == TRAFFIC_TCP ? "TCP" : "UDP",
+                                transportName(peer->transport(trafficClass)),
+                                m_resolvedIP.c_str(), m_port,
+                                m_dataChannel.isConnected() ? "connected" : "unavailable");
+                }
+            }
         }
 
         if (m_logoutPending && now >= m_logoutDeadline) {
             finishGracefulDisconnect();
         }
 
-        if (m_wantReconnect && m_signal.fd() == SOCK_INVALID
+        if (m_securityReconnectPending) {
+            m_securityReconnectPending = false;
+            // Peer iteration and KCP callbacks have unwound before destruction.
+            if (!m_manualDisconnecting && m_signal.fd() != SOCK_INVALID &&
+                m_securityReconnectSessionId == m_signal.secureSessionId()) {
+                m_signal.disconnect();
+                onSignalDisconnected();
+            }
+        }
+
+        if (!m_authRetryBlocked && m_wantReconnect && m_signal.fd() == SOCK_INVALID
             && now >= m_nextReconnectTime) {
             if (m_reconnectAttempts >= MAX_RECONNECT_ATTEMPTS) {
                 m_wantReconnect = false;
@@ -968,6 +1020,8 @@ void CliApp::printPeers() {
 }
 
 void CliApp::doConnect() {
+    m_authRetryBlocked = false;
+    m_securityReconnectPending = false;
     if (m_signal.isConnected()) {
         fprintf(stdout, "* Already connected\n> ");
         fflush(stdout);
@@ -1024,6 +1078,11 @@ void CliApp::doDisconnect() {
 }
 
 void CliApp::doCreateRoom(const std::string& args) {
+    if (m_signal.roomOperationPending()) {
+        fprintf(stdout, "* A room request is already pending; wait for its result\n> ");
+        fflush(stdout);
+        return;
+    }
     if (!m_signal.isConnected() || m_signal.myPeerId() == 0) {
         fprintf(stdout, "* Not logged in\n> ");
         fflush(stdout);
@@ -1116,30 +1175,14 @@ void CliApp::doCreateRoom(const std::string& args) {
     }
 
     bool passwordProtected = !password.empty();
-    uint8_t hashBuf[CIPHER_KEY_SIZE];
-    const uint8_t* pwdHash = nullptr;
-    if (passwordProtected) {
-        if (!isValidRoomPassword(password)) {
-            fprintf(stdout, "* Password must be %d-%d ASCII letters or digits\n> ",
-                    MIN_ROOM_PASSWORD_LEN, MAX_ROOM_PASSWORD_LEN);
-            fflush(stdout);
-            return;
-        }
-        uint8_t intermediate[CIPHER_KEY_SIZE];
-        if (!computeIntermediate(
-                reinterpret_cast<const uint8_t*>(password.data()),
-                password.size(), intermediate)) {
-            fprintf(stdout, "* Room password KDF failed\n> ");
-            fflush(stdout);
-            return;
-        }
-        authHashFromIntermediate(intermediate, hashBuf);
-        crypto_wipe(intermediate, sizeof(intermediate));
-        pwdHash = hashBuf;
-        m_roomPassword = password;
-    } else {
-        m_roomPassword.clear();
+    if (passwordProtected && !isValidRoomPassword(password)) {
+        fprintf(stdout, "* Password must be %d-%d ASCII letters or digits\n> ",
+                MIN_ROOM_PASSWORD_LEN, MAX_ROOM_PASSWORD_LEN);
+        fflush(stdout);
+        return;
     }
+    m_authRetryBlocked = false;
+    m_roomPassword = password;
 
     m_savedRoomName = roomName;
     m_savedMaxPlayers = static_cast<uint8_t>(maxPlayers);
@@ -1161,10 +1204,14 @@ void CliApp::doCreateRoom(const std::string& args) {
 
     m_signal.createRoom(roomName, static_cast<uint8_t>(maxPlayers),
                         m_savedTcpPolicy, m_savedUdpPolicy,
-                        roomMtu, passwordProtected, pwdHash);
-    if (pwdHash) crypto_wipe(hashBuf, sizeof(hashBuf));
+                        roomMtu, passwordProtected, password);
 }
 void CliApp::doJoinRoom(const std::string& args) {
+    if (m_signal.roomOperationPending()) {
+        fprintf(stdout, "* A room request is already pending; wait for its result\n> ");
+        fflush(stdout);
+        return;
+    }
     if (!m_signal.isConnected() || m_signal.myPeerId() == 0) {
         fprintf(stdout, "* Not logged in\n> ");
         fflush(stdout);
@@ -1205,36 +1252,32 @@ void CliApp::doJoinRoom(const std::string& args) {
         }
     }
 
-    const uint8_t* authHash = nullptr;
-    uint8_t hashBuf[CIPHER_KEY_SIZE];
-    if (!password.empty()) {
-        if (!isValidRoomPassword(password)) {
-            fprintf(stdout, "* Password must be %d-%d ASCII letters or digits\n> ",
-                    MIN_ROOM_PASSWORD_LEN, MAX_ROOM_PASSWORD_LEN);
-            fflush(stdout);
-            return;
-        }
-        uint8_t intermediate[CIPHER_KEY_SIZE];
-        if (!computeIntermediate(
-                reinterpret_cast<const uint8_t*>(password.data()),
-                password.size(), intermediate)) {
-            fprintf(stdout, "* Room password KDF failed\n> ");
-            fflush(stdout);
-            return;
-        }
-        authHashFromIntermediate(intermediate, hashBuf);
-        crypto_wipe(intermediate, sizeof(intermediate));
-        authHash = hashBuf;
-        m_roomPassword = password;
+    if (!password.empty() && !isValidRoomPassword(password)) {
+        fprintf(stdout, "* Password must be %d-%d ASCII letters or digits\n> ",
+                MIN_ROOM_PASSWORD_LEN, MAX_ROOM_PASSWORD_LEN);
+        fflush(stdout);
+        return;
     }
+    m_authRetryBlocked = false;
+    m_roomPassword = password;
 
     fprintf(stdout, "* Joining room %u ...\n", roomId);
     fflush(stdout);
-    m_signal.joinRoom(roomId, authHash);
-    if (authHash) crypto_wipe(hashBuf, sizeof(hashBuf));
+    m_signal.joinRoom(roomId, password);
 }
 
 void CliApp::doLeaveRoom() {
+    if (m_signal.roomOperationPending()) {
+        m_wantReconnect = false;
+        m_manualDisconnecting = true;
+        m_pendingResumeRoom = false;
+        clearResumeLease();
+        resetRoomRuntimeState(true);
+        m_signal.leaveRoom();
+        fprintf(stdout, "* Pending room request cancelled; reconnect before choosing another room\n> ");
+        fflush(stdout);
+        return;
+    }
     if (m_currentRoomId == 0) {
         fprintf(stdout, "* Not in a room\n> ");
         fflush(stdout);
@@ -1253,6 +1296,7 @@ void CliApp::doLeaveRoom() {
 // ───────── Signal callbacks ─────────
 
 void CliApp::beginGracefulDisconnect(bool exitAfterDisconnect) {
+    m_securityReconnectPending = false;
     m_wantReconnect = false;
     m_pendingResumeRoom = false;
     clearResumeLease();
@@ -1311,7 +1355,7 @@ void CliApp::onSignalConnected() {
 
 void CliApp::onSignalDisconnected() {
     bool wasInRoom = m_roomReady;
-    bool manualDisconnect = m_manualDisconnecting;
+    bool manualDisconnect = m_manualDisconnecting || m_authRetryBlocked;
 
     if (manualDisconnect) {
         m_wasInRoom = false;
@@ -1561,6 +1605,8 @@ void CliApp::onPeerLeft(uint32_t peerId) {
     CliPeerConnection* peer = m_tunnel.peerById(peerId);
     std::string name = peer ? peer->name() : ("Peer" + std::to_string(peerId));
     clearPendingRebuild(peerId);
+    m_probeWatchdogs.erase(transportKey(peerId, TRAFFIC_TCP));
+    m_probeWatchdogs.erase(transportKey(peerId, TRAFFIC_UDP));
     m_tunnel.removePeer(peerId);
     fprintf(stdout, "* Player %s left\n> ", name.c_str());
     fflush(stdout);
@@ -1589,6 +1635,11 @@ void CliApp::onTransportDead(uint32_t peerId, TrafficClass cls) {
 
 CliApp::TunSetupResult CliApp::setupTun() {
     if (m_tun) return TunSetupResult(true);
+    uint32_t serverIP = 0;
+    if (inet_pton(AF_INET, m_resolvedIP.c_str(), &serverIP) == 1 &&
+        (ntohl(serverIP) & VNET_MASK) == VNET_SUBNET)
+        return TunSetupResult(false, TunSetupStage::Address,
+                              "Server address conflicts with the virtual network subnet");
     m_tun = new CliTunAdapter();
     if (!m_tun->initialize()) {
         delete m_tun; m_tun = nullptr;
@@ -1597,17 +1648,30 @@ CliApp::TunSetupResult CliApp::setupTun() {
     }
     int mtu = static_cast<int>(normalizeRoomMtu(m_roomMtu));
     if (!m_tun->configureIP(m_myVirtualIP, VNET_MASK, mtu)) {
+        const std::string error = m_tun->configurationError();
         delete m_tun; m_tun = nullptr;
         return TunSetupResult(false, TunSetupStage::Address,
-                              "TUN address configuration failed");
+                              error.empty() ? "TUN address configuration failed" : error);
     }
     if (!m_tun->startSession()) {
         delete m_tun; m_tun = nullptr;
         return TunSetupResult(false, TunSetupStage::Session,
                               "TUN session start failed");
     }
+#ifdef _WIN32
+    std::string routeError;
+    if (!m_tun->checkRoute(0xFFFFFFFFu, &routeError) ||
+        !m_tun->checkRoute(VNET_BROADCAST, &routeError)) {
+        m_tun->shutdown();
+        delete m_tun;
+        m_tun = nullptr;
+        return TunSetupResult(false, TunSetupStage::Address, routeError);
+    }
+#endif
     m_tunnel.setTunAdapter(m_tun);
-    if (!m_tunnel.startDataPlane()) {
+    const bool requiresUdp = m_tcpPolicy.transportMode != MODE_RELAY_TCP ||
+                             m_udpPolicy.transportMode != MODE_RELAY_TCP;
+    if (!m_tunnel.startDataPlane(requiresUdp)) {
         m_tunnel.setTunAdapter(nullptr);
         m_tun->shutdown();
         delete m_tun;
@@ -1625,6 +1689,7 @@ CliApp::TunSetupResult CliApp::setupTun() {
 void CliApp::teardownTun() {
     m_tunnel.stopDataPlane();
     m_pendingRebuild.clear();
+    m_probeWatchdogs.clear();
     m_dataChannel.disconnect();
     m_tunnel.removeAllPeers();
     if (m_tun) {
@@ -1763,29 +1828,15 @@ void CliApp::handleReconnectRoomList(const std::vector<CliRoomListItem>& rooms) 
         }
     }
 
-    uint8_t hashBuf[CIPHER_KEY_SIZE];
-    const uint8_t* hash = nullptr;
-    if (m_savedRoomPasswordProtected && !m_roomPassword.empty()) {
-        uint8_t intermediate[CIPHER_KEY_SIZE];
-        if (!computeIntermediate(
-                reinterpret_cast<const uint8_t*>(m_roomPassword.data()),
-                m_roomPassword.size(), intermediate)) {
-            fprintf(stdout, "* Room password KDF failed; reconnect stopped\n> ");
-            fflush(stdout);
-            m_wantReconnect = false;
-            return;
-        }
-        authHashFromIntermediate(intermediate, hashBuf);
-        crypto_wipe(intermediate, sizeof(intermediate));
-        hash = hashBuf;
-    }
+    const std::string password = m_savedRoomPasswordProtected
+        ? m_roomPassword : std::string();
 
     if (matches.size() == 1) {
         uint32_t foundRoomId = matches.front();
         fprintf(stdout, "* Found room \"%s\" (ID=%u), rejoining...\n",
                 m_savedRoomName.c_str(), foundRoomId);
         fflush(stdout);
-        m_signal.joinRoom(foundRoomId, hash);
+        m_signal.joinRoom(foundRoomId, password);
     } else if (matches.size() > 1) {
         fprintf(stdout, "* Multiple matching rooms found. Type 'list' and choose manually.\n> ");
         fflush(stdout);
@@ -1795,9 +1846,8 @@ void CliApp::handleReconnectRoomList(const std::vector<CliRoomListItem>& rooms) 
         fflush(stdout);
         m_signal.createRoom(m_savedRoomName, m_savedMaxPlayers,
                             m_savedTcpPolicy, m_savedUdpPolicy,
-                            m_savedRoomMtu, m_savedRoomPasswordProtected, hash);
+                            m_savedRoomMtu, m_savedRoomPasswordProtected, password);
     }
-    if (hash) crypto_wipe(hashBuf, sizeof(hashBuf));
 }
 
 void CliApp::handleTcpRelayReceived(uint32_t srcPeerId, TrafficClass cls, Buffer data) {

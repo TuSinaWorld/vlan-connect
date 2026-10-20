@@ -11,6 +11,7 @@
 #include "payload_cipher.h"
 #include "secure_frame.h"
 #include "byte_buffer.h"
+#include "auth_kdf_task.h"
 
 namespace VLan {
 
@@ -32,6 +33,8 @@ public:
     bool isConnected() const;
     bool isConnecting() const;
     bool secureEnabled() const { return m_secureReady; }
+    bool authInProgress() const { return m_authOperation != 0; }
+    bool roomOperationPending() const { return m_roomOperationPending; }
     uint32_t secureSessionId() const { return m_secureSessionId; }
     const QByteArray& secureMaster() const { return m_secureMaster; }
     QHostAddress peerAddress() const { return m_socket->peerAddress(); }
@@ -49,9 +52,9 @@ public:
                     RoomTrafficPolicy udpPolicy = makeDefaultUdpPolicy(),
                     uint16_t mtu = ROOM_MTU_DEFAULT,
                     bool passwordProtected = false,
-                    const QByteArray& passwordHash = QByteArray());
+                    const QString& password = QString());
     void joinRoom(uint32_t roomId,
-                  const QByteArray& authHash = QByteArray());
+                  const QString& password = QString());
     void resumeRoom(uint32_t roomId, uint32_t peerId,
                     const QByteArray& resumeToken);
     void leaveRoom();
@@ -94,6 +97,7 @@ signals:
     void serverPasswordRequired();
     void secureSessionEstablished(uint32_t sessionId, QByteArray master);
     void serverError(QString message);
+    void fatalAuthError(uint16_t code, QString message);
     void serverRttUpdated(int rttMs);
 
 private slots:
@@ -112,6 +116,9 @@ private:
     bool processMessage(uint8_t msgType, const uint8_t* payload, size_t len);
     void sendClientHello();
     void sendServerAuth();
+    void pollAuthTask();
+    void cancelRoomOperation();
+    void failAuthentication(AuthErrorCode code, const QString& message);
     void resetSecureState();
     void handleStreamCorruption();
     void handleMalformedFrame(uint8_t msgType, size_t len,
@@ -130,8 +137,19 @@ private:
     quint16     m_serverPort;
     int         m_connectTimeoutMs;
     uint32_t    m_lastRecvTime;
+    uint32_t    m_connectStartedMs;
+    uint32_t    m_authStartedMs;
     uint32_t    m_pingSentTime;
-    QByteArray  m_pendingAuthHash;
+    QByteArray  m_pendingRoomPassword;
+    bool        m_joinPending;
+    bool        m_roomOperationPending;
+    AuthKdfTask m_authTask;
+    int         m_authOperation; // 1 server handshake, 2 create, 3 join
+    ByteBuffer  m_pendingCreate;
+    uint16_t    m_pendingCreateMtu;
+    uint8_t     m_authSalt[AUTH_SALT_SIZE];
+    uint8_t     m_expectedServerProof[32];
+    uint8_t     m_roomChallenge[32];
     QString     m_serverPassword;
     bool        m_serverAuthRequired;
     bool        m_secureReady;

@@ -103,6 +103,7 @@ private slots:
     void onHostResolved(const QHostInfo& hostInfo);
     void onSignalConnectFailed(QString reason);
     void onTunRuntimeError(QString message);
+    void onSecurityFailure(QString message);
 
 private slots:
     void onTcpRelayHealthCheck();
@@ -206,6 +207,7 @@ private:
 
     static const int MAX_RECONNECT_ATTEMPTS = 5;
     bool          m_wantReconnect;
+    bool          m_authRetryBlocked;
     int           m_reconnectAttempts;
     bool          m_wasInRoom;
     bool          m_pendingResumeRoom;

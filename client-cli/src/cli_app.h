@@ -5,10 +5,12 @@
 #include "cli_net.h"
 #include "cli_tunnel.h"
 #include "cli_tun.h"
+#include "relay_probe_watchdog.h"
 #include <atomic>
 #include <thread>
 #include <string>
 #include <set>
+#include <map>
 #include <memory>
 #include <csignal>
 
@@ -175,6 +177,9 @@ private:
     static const int MAX_RECONNECT_ATTEMPTS = 5;
 
     bool          m_wantReconnect;
+    bool          m_authRetryBlocked;
+    bool          m_securityReconnectPending;
+    uint32_t      m_securityReconnectSessionId;
     int           m_reconnectAttempts;
     uint32_t      m_nextReconnectTime;
     bool          m_wasInRoom;
@@ -201,6 +206,7 @@ private:
 
     std::vector<CliRoomListItem> m_cachedRoomList;
     std::set<uint64_t> m_pendingRebuild;
+    std::map<uint64_t, RelayProbeWatchdog> m_probeWatchdogs;
 };
 
 } // namespace VLan

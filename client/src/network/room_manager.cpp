@@ -17,24 +17,6 @@ namespace VLan {
 
 namespace {
 
-bool roomPasswordHash(const QString& password, QByteArray* hashOut) {
-    if (!hashOut) return false;
-    if (password.isEmpty()) {
-        hashOut->clear();
-        return true;
-    }
-    QByteArray intermediate;
-    if (!PayloadCipher::computeIntermediate(password, &intermediate)) {
-        hashOut->fill('\0', CIPHER_KEY_SIZE);
-        return false;
-    }
-    QByteArray hash = PayloadCipher::hashFromIntermediate(intermediate);
-    crypto_wipe(reinterpret_cast<uint8_t*>(intermediate.data()),
-                static_cast<size_t>(intermediate.size()));
-    *hashOut = hash;
-    return true;
-}
-
 const char* trafficClassName(TrafficClass cls) {
     return cls == TRAFFIC_TCP ? "TCP" : "UDP";
 }
@@ -70,7 +52,8 @@ RoomManager::RoomManager(QObject* parent)
       m_udpPolicy(makeDefaultUdpPolicy()),
       m_roomMtu(ROOM_MTU_DEFAULT),
       m_roomPasswordProtected(false),
-      m_wantReconnect(false), m_reconnectAttempts(0), m_wasInRoom(false),
+      m_wantReconnect(false), m_authRetryBlocked(false),
+      m_reconnectAttempts(0), m_wasInRoom(false),
       m_pendingResumeRoom(false), m_manualDisconnecting(false),
       m_logoutPending(false), m_hasResumeLease(false),
       m_reconnectScheduled(false), m_roomReady(false),
@@ -104,6 +87,19 @@ RoomManager::RoomManager(QObject* parent)
             this, &RoomManager::serverPasswordRequired);
     connect(m_signal, &SignalClient::secureSessionEstablished,
             this, &RoomManager::onSecureSessionEstablished);
+    connect(m_signal, &SignalClient::fatalAuthError, this,
+            [this](uint16_t code, const QString& message) {
+        m_authRetryBlocked = true;
+        m_wantReconnect = false;
+        m_pendingResumeRoom = false;
+        m_wasInRoom = false;
+        m_reconnectScheduled = false;
+        ++m_connectionGeneration;
+        clearResumeLease();
+        LogManager::instance().logError(
+            QString("[auth] Automatic reconnect stopped: code=%1 reason=%2")
+            .arg(code).arg(message));
+    });
     connect(m_signal, &SignalClient::serverError, this, [this](const QString& msg) {
         if (m_connectionPhase == ConnectionPhase::Connecting &&
             m_signal->myPeerId() == 0) {
@@ -151,6 +147,8 @@ RoomManager::RoomManager(QObject* parent)
 
     connect(m_tunnel, &TunnelManager::transportDead,
             this, &RoomManager::onTransportDead);
+    connect(m_tunnel, &TunnelManager::securityError,
+            this, &RoomManager::onSecurityFailure);
 
     m_latencyTimer = new QTimer(this);
     connect(m_latencyTimer, &QTimer::timeout, this, &RoomManager::onLatencyUpdate);
@@ -183,6 +181,7 @@ void RoomManager::setServerAddress(const QString& host, quint16 port) {
 }
 
 void RoomManager::setServerPassword(const QString& password) {
+    m_authRetryBlocked = false;
     m_serverPassword = password;
     if (m_signal)
         m_signal->setServerPassword(password);
@@ -194,6 +193,7 @@ void RoomManager::continueServerAuth() {
 }
 
 void RoomManager::connectAndLogin(const QString& playerName) {
+    m_authRetryBlocked = false;
     QString previousName = m_playerName;
     m_playerName = playerName;
     if (!m_wantReconnect) {
@@ -410,6 +410,11 @@ void RoomManager::createRoom(const QString& roomName, uint8_t maxPlayers,
                              uint16_t mtu,
                              bool passwordProtected,
                              const QString& password) {
+    if (!m_signal->secureEnabled() || m_signal->myPeerId() == 0 ||
+        m_currentRoomId != 0 || m_signal->roomOperationPending()) {
+        emit errorOccurred(QStringLiteral("Room operation requires an authenticated login and no pending room request."));
+        return;
+    }
     uint16_t normalizedMtu = normalizeRoomMtu(mtu);
     m_savedRoomName = roomName;
     m_savedMaxPlayers = maxPlayers;
@@ -429,19 +434,18 @@ void RoomManager::createRoom(const QString& roomName, uint8_t maxPlayers,
     m_roomPasswordProtected = passwordProtected;
     m_roomPassword = m_savedRoomPassword;
 
-    QByteArray pwdHash;
-    if (passwordProtected && !roomPasswordHash(password, &pwdHash)) {
-        emit errorOccurred(QStringLiteral("Room password KDF failed."));
-        return;
-    }
+    m_authRetryBlocked = false;
     m_signal->createRoom(roomName, maxPlayers, m_tcpPolicy, m_udpPolicy,
-                         normalizedMtu, passwordProtected, pwdHash);
-    if (!pwdHash.isEmpty())
-        crypto_wipe(reinterpret_cast<uint8_t*>(pwdHash.data()),
-                    static_cast<size_t>(pwdHash.size()));
+                         normalizedMtu, passwordProtected,
+                         passwordProtected ? password : QString());
 }
 
 void RoomManager::joinRoom(uint32_t roomId, const QString& password) {
+    if (!m_signal->secureEnabled() || m_signal->myPeerId() == 0 ||
+        m_currentRoomId != 0 || m_signal->roomOperationPending()) {
+        emit errorOccurred(QStringLiteral("Room operation requires an authenticated login and no pending room request."));
+        return;
+    }
     for (int i = 0; i < m_cachedRoomList.size(); ++i) {
         if (m_cachedRoomList[i].roomId == roomId) {
             const RoomListItem& item = m_cachedRoomList[i];
@@ -460,22 +464,20 @@ void RoomManager::joinRoom(uint32_t roomId, const QString& password) {
     }
     m_roomPassword = password;
     m_savedRoomPassword = password;
-    QByteArray authHash;
-    if (!roomPasswordHash(password, &authHash)) {
-        emit errorOccurred(QStringLiteral("Room password KDF failed."));
-        return;
-    }
-    m_signal->joinRoom(roomId, authHash);
-    if (!authHash.isEmpty())
-        crypto_wipe(reinterpret_cast<uint8_t*>(authHash.data()),
-                    static_cast<size_t>(authHash.size()));
+    m_authRetryBlocked = false;
+    m_signal->joinRoom(roomId, password);
 }
 
 void RoomManager::leaveRoom() {
     const bool wasReady = m_roomReady;
+    const bool cancelledPending = m_signal->roomOperationPending();
+    if (cancelledPending) {
+        m_wantReconnect = false;
+        m_manualDisconnecting = true;
+    }
     if (m_tunnel)
         m_tunnel->stopDataPlane();
-    if (m_currentRoomId != 0)
+    if (m_currentRoomId != 0 || cancelledPending)
         m_signal->leaveRoom();
     teardownTun();
     m_pendingResumeRoom = false;
@@ -516,7 +518,7 @@ void RoomManager::onSignalDisconnected() {
         return;
     m_connectionPhase = ConnectionPhase::Idle;
     bool wasInRoom = m_roomReady;
-    bool manualDisconnect = m_manualDisconnecting;
+    bool manualDisconnect = m_manualDisconnecting || m_authRetryBlocked;
 
     if (manualDisconnect) {
         m_wasInRoom = false;
@@ -574,7 +576,7 @@ void RoomManager::onSignalDisconnected() {
 }
 
 void RoomManager::scheduleReconnectAttempt() {
-    if (m_reconnectScheduled || !m_wantReconnect) return;
+    if (m_authRetryBlocked || m_reconnectScheduled || !m_wantReconnect) return;
     if (m_reconnectAttempts >= MAX_RECONNECT_ATTEMPTS) {
         m_wantReconnect = false;
         m_pendingResumeRoom = false;
@@ -691,6 +693,8 @@ void RoomManager::onLoginResponse(uint32_t peerId, bool resumeAccepted) {
                 this, &RoomManager::onDataChannelDisconnected);
         connect(m_dataChannel, &DataChannel::relayDataReceived,
                 this, &RoomManager::onDataChannelRelayReceived);
+        connect(m_dataChannel, &DataChannel::securityError,
+                this, &RoomManager::onSecurityFailure);
     }
     securityReady = m_dataChannel->installSecureSession(
         m_signal->secureSessionId(), m_signal->secureMaster()) && securityReady;
@@ -1047,6 +1051,19 @@ RoomManager::TunSetupResult RoomManager::setupTun() {
     return TunSetupResult(true);
 }
 
+void RoomManager::onSecurityFailure(QString message) {
+    LogManager::instance().logError(QString("[security] %1; requesting a new authenticated session").arg(message));
+    // Defer teardown until any active peer/KCP send callback has unwound.
+    const quint64 generation = m_connectionGeneration;
+    const uint32_t sessionId = m_signal->secureSessionId();
+    QTimer::singleShot(0, this, [this, generation, sessionId]() {
+        if (generation == m_connectionGeneration && !m_manualDisconnecting &&
+            m_signal && m_signal->isConnected() &&
+            sessionId == m_signal->secureSessionId())
+            m_signal->disconnect();
+    });
+}
+
 void RoomManager::teardownTun() {
     m_tearingDownTun = true;
     if (m_tunnel)
@@ -1168,7 +1185,18 @@ void RoomManager::onLatencyUpdate() {
             TransportKey key;
             key.peerId = peer->peerId();
             key.cls = trafficClass;
-            if (!m_probeWatchdogs[key].observe(now, peer->latencyMs(trafficClass) >= 0))
+            RelayProbeWatchdog& watchdog = m_probeWatchdogs[key];
+            const bool fresh = peer->latencyMs(trafficClass) >= 0;
+            const bool recovered = watchdog.outageReported() && fresh;
+            const bool timedOut = watchdog.observe(now, fresh);
+            if (recovered) {
+                LogManager::instance().logNormal(
+                    QString("[room] Peer probe recovered: peer=%1 class=%2 transport=%3 rtt=%4ms")
+                    .arg(peer->peerId()).arg(trafficClassName(trafficClass))
+                    .arg(transportName(peer->transport(trafficClass)))
+                    .arg(peer->latencyMs(trafficClass)));
+            }
+            if (!timedOut)
                 continue;
             const bool usesUdp = peer->transport(trafficClass) == TRANSPORT_RELAY_KCP ||
                                  peer->transport(trafficClass) == TRANSPORT_RELAY_RAW_UDP;

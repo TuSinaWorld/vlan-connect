@@ -76,6 +76,7 @@ public:
 signals:
     void peerDataReceived(uint32_t peerId, QByteArray data);
     void transportDead(uint32_t peerId, VLan::TrafficClass cls);
+    void securityError(QString message);
 
 private slots:
     void onTunPacketReceived(QByteArray packet);

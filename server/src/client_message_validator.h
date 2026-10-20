@@ -78,8 +78,10 @@ inline bool validateClientSignalPayload(
             const uint8_t passwordProtected = bb.readU8();
             if (passwordProtected > 1) return false;
             if (passwordProtected) {
-                uint8_t passwordHash[32];
+                uint8_t passwordSalt[AUTH_SALT_SIZE], passwordHash[32];
+                bb.readBytes(passwordSalt, sizeof(passwordSalt));
                 bb.readBytes(passwordHash, sizeof(passwordHash));
+                crypto_wipe(passwordHash, sizeof(passwordHash));
             }
             const uint16_t mtu = bb.readU16();
             return isValidRoomMtuValue(mtu) && bb.atEnd();

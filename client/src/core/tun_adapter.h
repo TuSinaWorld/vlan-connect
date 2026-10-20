@@ -1,4 +1,4 @@
-﻿#ifndef VLAN_TUN_ADAPTER_H
+#ifndef VLAN_TUN_ADAPTER_H
 #define VLAN_TUN_ADAPTER_H
 
 #include <QThread>
@@ -7,6 +7,7 @@
 #include <QMutex>
 #include <atomic>
 #include "wintun_api.h"
+#include "windows_network_config.h"
 
 namespace VLan {
 
@@ -55,8 +56,7 @@ private:
     HANDLE               m_readEvent;
     std::atomic<bool>    m_running;
     std::atomic<bool>    m_acceptIo;
-    bool                 m_firewallRuleActive;
-    bool                 m_broadcastRouteActive;
+    WindowsNetworkState  m_networkState;
     QMutex               m_writeMutex;
 
     uint32_t m_ip;

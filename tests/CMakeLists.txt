@@ -13,8 +13,9 @@ if(NOT VLAN_BUILD_ROOT_OFFSET EQUAL 0)
         "Configure isolated tests below ${VLAN_TEST_BUILD_ROOT}")
 endif()
 
-project(vlan_protocol_v8_tests C CXX)
+project(vlan_protocol_v9_tests C CXX)
 enable_testing()
+find_package(Threads REQUIRED)
 
 set(CMAKE_CXX_STANDARD 11)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -40,7 +41,7 @@ function(vlan_test_output target)
             "${base}/${config}")
     endforeach()
     if(MSVC)
-        target_compile_options(${target} PRIVATE /UNDEBUG)
+        target_compile_options(${target} PRIVATE /UNDEBUG /utf-8 /EHsc)
     else()
         target_compile_options(${target} PRIVATE -UNDEBUG)
     endif()
@@ -56,12 +57,13 @@ set(VLAN_COMMON_INCLUDES
 set(VLAN_MONOCYPHER
     "${VLAN_ROOT}/3rdparty/monocypher/monocypher.c")
 
-add_executable(protocol_v8_tests
+add_executable(protocol_v9_tests
     common/protocol_v8_tests.cpp
     ${VLAN_MONOCYPHER})
-target_include_directories(protocol_v8_tests PRIVATE
+target_include_directories(protocol_v9_tests PRIVATE
     ${VLAN_COMMON_INCLUDES})
-vlan_test_output(protocol_v8_tests)
+target_link_libraries(protocol_v9_tests PRIVATE Threads::Threads)
+vlan_test_output(protocol_v9_tests)
 
 add_executable(server_auth_file_tests
     server/auth_file_tests.cpp)
@@ -93,7 +95,7 @@ if(Qt5Core_FOUND AND Qt5Network_FOUND)
         ${VLAN_MONOCYPHER})
     set_target_properties(gui_signal_tests PROPERTIES AUTOMOC ON)
     target_compile_definitions(gui_signal_tests PRIVATE VLAN_GUI_POLICY_TESTS)
-    target_link_libraries(gui_signal_tests PRIVATE Qt5::Core Qt5::Network)
+    target_link_libraries(gui_signal_tests PRIVATE Qt5::Core Qt5::Network Threads::Threads)
     if(WIN32)
         target_link_libraries(gui_signal_tests PRIVATE ws2_32 bcrypt)
     endif()
@@ -110,6 +112,42 @@ if(WIN32)
     target_link_libraries(cli_signal_tests PRIVATE ws2_32)
 endif()
 vlan_test_output(cli_signal_tests)
+
+add_executable(auth_v9_integration_tests
+    cli/auth_v9_integration_tests.cpp
+    "${VLAN_ROOT}/client-cli/src/cli_net.cpp"
+    ${VLAN_MONOCYPHER})
+target_include_directories(auth_v9_integration_tests PRIVATE
+    ${VLAN_COMMON_INCLUDES}
+    "${VLAN_ROOT}/client-cli/src")
+target_link_libraries(auth_v9_integration_tests PRIVATE Threads::Threads)
+if(WIN32)
+    target_link_libraries(auth_v9_integration_tests PRIVATE ws2_32 bcrypt)
+endif()
+vlan_test_output(auth_v9_integration_tests)
+
+add_executable(windows_network_config_tests common/windows_network_config_tests.cpp)
+target_include_directories(windows_network_config_tests PRIVATE ${VLAN_COMMON_INCLUDES})
+if(WIN32)
+    target_link_libraries(windows_network_config_tests PRIVATE ws2_32 iphlpapi ole32 oleaut32)
+endif()
+vlan_test_output(windows_network_config_tests)
+
+add_executable(cli_log_tests cli/cli_log_tests.cpp)
+target_include_directories(cli_log_tests PRIVATE ${VLAN_COMMON_INCLUDES} "${VLAN_ROOT}/client-cli/src")
+target_link_libraries(cli_log_tests PRIVATE Threads::Threads)
+if(WIN32)
+    target_link_libraries(cli_log_tests PRIVATE ws2_32)
+endif()
+vlan_test_output(cli_log_tests)
+
+add_executable(tcp_backpressure_tests cli/tcp_backpressure_tests.cpp)
+target_include_directories(tcp_backpressure_tests PRIVATE
+    ${VLAN_COMMON_INCLUDES} "${VLAN_ROOT}/client-cli/src")
+if(WIN32)
+    target_link_libraries(tcp_backpressure_tests PRIVATE ws2_32)
+endif()
+vlan_test_output(tcp_backpressure_tests)
 
 add_executable(data_channel_tests
     common/data_channel_tests.cpp
@@ -140,7 +178,7 @@ if(WIN32)
     target_compile_definitions(wintun_lifecycle_tests PRIVATE
         WIN32_LEAN_AND_MEAN NOMINMAX)
     target_link_libraries(wintun_lifecycle_tests PRIVATE
-        Qt5::Core iphlpapi ws2_32)
+        Qt5::Core iphlpapi ws2_32 ole32 oleaut32)
 else()
     find_program(BASH_EXECUTABLE bash)
     if(NOT BASH_EXECUTABLE)
@@ -186,11 +224,15 @@ else()
 endif()
 vlan_test_output(wintun_lifecycle_tests)
 
-add_test(NAME protocol_v8_tests COMMAND protocol_v8_tests)
+add_test(NAME protocol_v9_tests COMMAND protocol_v9_tests)
 add_test(NAME server_auth_file_tests COMMAND server_auth_file_tests)
 add_test(NAME server_session_tests COMMAND server_session_tests)
 add_test(NAME gui_signal_tests COMMAND gui_signal_tests)
 add_test(NAME cli_signal_tests COMMAND cli_signal_tests)
+add_test(NAME auth_v9_integration_tests COMMAND auth_v9_integration_tests)
+add_test(NAME windows_network_config_tests COMMAND windows_network_config_tests)
+add_test(NAME cli_log_tests COMMAND cli_log_tests)
+add_test(NAME tcp_backpressure_tests COMMAND tcp_backpressure_tests)
 add_test(NAME data_channel_tests COMMAND data_channel_tests)
 add_test(NAME data_plane_tests COMMAND data_plane_tests)
 add_test(NAME wintun_lifecycle_tests COMMAND wintun_lifecycle_tests)

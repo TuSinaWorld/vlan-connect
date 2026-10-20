@@ -24,6 +24,8 @@ DEFAULT_LOG_MAX_MB=10
 
 ACTION="auto"
 TARGET_VERSION=""
+TARGET_PROTOCOL=""
+SOURCE_COMMIT="unknown"
 NON_INTERACTIVE=0
 RECONFIGURE=0
 SHOW_HELP=0
@@ -797,6 +799,14 @@ installation_is_healthy() {
     [[ "$(readlink -f -- "$BIN_PATH")" == "$RELEASES_DIR/$TARGET_VERSION/vlan-server" ]] || return 1
     systemctl is-active --quiet "$SERVICE_NAME" || return 1
     systemctl is-enabled --quiet "$SERVICE_NAME" || return 1
+    if version_is_greater "$TARGET_VERSION" v0.3.0; then
+        local description
+        description="$(timeout 5 "$BIN_PATH" --version 2>/dev/null)" || return 1
+        [[ "$description" == "VLan Server ${TARGET_VERSION#v} protocol="*" build="* ]] || return 1
+        if [[ "$TARGET_VERSION" == "v0.3.1" ]]; then
+            [[ "$description" == "VLan Server 0.3.1 protocol=9 build="* ]] || return 1
+        fi
+    fi
 }
 
 create_work_dir() {
@@ -826,9 +836,57 @@ build_release() {
        -f "$SOURCE_DIR/server/vlan-server.service" &&
        -f "$SOURCE_DIR/server/DEPLOY.md" ]] ||
         die "tag $TARGET_VERSION does not contain the required server deployment files"
+    verify_source_metadata
+    show_protocol_warning
     log "Building VLan server from source"
-    make -C "$SOURCE_DIR/server"
+    make -C "$SOURCE_DIR/server" "BUILD_COMMIT=$SOURCE_COMMIT"
     [[ -x "$SOURCE_DIR/server/vlan-server" ]] || die "server build did not produce an executable"
+    verify_binary_version "$SOURCE_DIR/server/vlan-server"
+}
+
+verify_source_metadata() {
+    local source_version
+    if [[ ! -f "$SOURCE_DIR/common/version.h" ]]; then
+        # Older explicit tags remain available for rollback, with their old protocol.
+        if version_is_greater "$TARGET_VERSION" v0.3.0; then
+            die "release source is missing canonical version metadata"
+        fi
+        TARGET_PROTOCOL="8"
+        SOURCE_COMMIT="unknown"
+        warn "legacy release: version query is unavailable and protocol v8 clients are required"
+        return
+    fi
+    source_version="$(tr -d '\r' < "$SOURCE_DIR/common/version.h" | sed -nE 's/^#define VLAN_RELEASE_VERSION "([0-9]+\.[0-9]+\.[0-9]+)"$/\1/p')"
+    [[ "v$source_version" == "$TARGET_VERSION" ]] ||
+        die "source software version does not match selected tag $TARGET_VERSION"
+    TARGET_PROTOCOL="$(sed -nE 's/^[[:space:]]*static const uint16_t PROTOCOL_VERSION[[:space:]]*=[[:space:]]*([0-9]+);.*$/\1/p' "$SOURCE_DIR/common/protocol.h" | tr -d '\r')"
+    [[ "$TARGET_PROTOCOL" =~ ^[0-9]+$ ]] || die "source protocol version is missing or invalid"
+    SOURCE_COMMIT="unknown"
+    if [[ -f "$SOURCE_DIR/SOURCE-COMMIT.txt" ]]; then
+        IFS= read -r SOURCE_COMMIT < "$SOURCE_DIR/SOURCE-COMMIT.txt" || true
+        SOURCE_COMMIT="${SOURCE_COMMIT%$'\r'}"
+        [[ "$SOURCE_COMMIT" =~ ^[0-9a-fA-F]{40}$ ]] || die "invalid source commit metadata"
+    elif [[ -d "$SOURCE_DIR/.git" ]]; then
+        SOURCE_COMMIT="$(git -C "$SOURCE_DIR" rev-parse HEAD)"
+    fi
+}
+
+show_protocol_warning() {
+    warn "Target protocol v${TARGET_PROTOCOL:-unknown}: upgrade all GUI and CLI clients together with the server."
+    if [[ "$TARGET_PROTOCOL" == "9" ]]; then
+        warn "BREAKING UPGRADE: protocol v8 clients cannot connect to protocol v9; update every GUI/CLI client before reconnecting."
+    fi
+}
+
+verify_binary_version() {
+    local binary="$1" output
+    # v0.3.0 and older did not support --version; never run those as a probe.
+    [[ -f "$SOURCE_DIR/common/version.h" ]] || return 0
+    output="$(timeout 5 "$binary" --version)" ||
+        die "built server --version check failed or timed out"
+    [[ "$output" == "VLan Server ${TARGET_VERSION#v} protocol=$TARGET_PROTOCOL build=$SOURCE_COMMIT" ]] ||
+        die "built server version/protocol/commit does not match selected source"
+    log "Verified binary: $output"
 }
 
 execute_release_update() {
@@ -1030,6 +1088,10 @@ show_summary() {
     log "VLan server $TARGET_VERSION is installed and running"
     printf '\nConfiguration:\n'
     printf '  Version:       %s\n' "$TARGET_VERSION"
+    printf '  Protocol:      v%s (all GUI/CLI clients must match)\n' "${TARGET_PROTOCOL:-unknown}"
+    if [[ "$TARGET_PROTOCOL" == "9" ]]; then
+        printf '  Upgrade:       v8 clients are incompatible; update all GUI/CLI clients to v9.\n'
+    fi
     printf '  TCP/UDP port:  %s\n' "$PORT"
     printf '  Binary:        %s\n' "$BIN_PATH"
     printf '  Environment:   %s\n' "$ENV_PATH"
@@ -1093,6 +1155,11 @@ main() {
     log "Selected release: $TARGET_VERSION"
     if (( CONFIG_OVERRIDE == 0 && RECONFIGURE == 0 )) && installation_is_healthy; then
         log "The latest selected version is already installed and healthy; no update is required"
+        local installed_description
+        installed_description="$(timeout 5 "$BIN_PATH" --version 2>/dev/null)" || true
+        if [[ "$installed_description" =~ ^VLan\ Server\ ${TARGET_VERSION#v}\ protocol=([0-9]+)\ build= ]]; then
+            TARGET_PROTOCOL="${BASH_REMATCH[1]}"
+        fi
         show_summary
         return 0
     fi

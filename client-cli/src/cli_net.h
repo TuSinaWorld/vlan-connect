@@ -2,6 +2,7 @@
 #define VLAN_CLI_NET_H
 
 #include "cli_common.h"
+#include "auth_kdf_task.h"
 #include <functional>
 #include <map>
 #include <vector>
@@ -31,7 +32,10 @@ public:
     void disconnect();
     bool isConnected() const { return m_conn.connected; }
     socket_t fd() const { return m_conn.fd; }
+    bool wantsWrite() const { return m_conn.connecting || !m_conn.sendBuf.empty(); }
     bool secureEnabled() const { return m_secureReady; }
+    bool authInProgress() const { return m_authOperation != 0; }
+    bool roomOperationPending() const { return m_roomOperationPending; }
     uint32_t secureSessionId() const { return m_secureSessionId; }
     const Buffer& secureMaster() const { return m_secureMaster; }
     void setServerPassword(const std::string& password);
@@ -46,8 +50,8 @@ public:
                     RoomTrafficPolicy tcpPolicy,
                     RoomTrafficPolicy udpPolicy,
                     uint16_t mtu,
-                    bool passwordProtected, const uint8_t* passwordHash);
-    void joinRoom(uint32_t roomId, const uint8_t* authHash);
+                    bool passwordProtected, const std::string& password);
+    void joinRoom(uint32_t roomId, const std::string& password);
     void resumeRoom(uint32_t roomId, uint32_t peerId, const uint8_t* resumeToken);
     void leaveRoom();
     void logout();
@@ -88,6 +92,7 @@ public:
     std::function<void()> onServerPasswordRequired;
     std::function<void(uint32_t sessionId, const Buffer& master)> onSecureSessionEstablished;
     std::function<void(const std::string&)> onServerError;
+    std::function<void(uint16_t, const std::string&)> onFatalAuthError;
     std::function<void(int rttMs)> onServerRtt;
     std::function<void(const uint8_t* challenge)> onAuthChallenge;
 
@@ -99,6 +104,9 @@ private:
     bool processMessage(uint8_t msgType, const uint8_t* payload, size_t len);
     void sendClientHello();
     void sendServerAuth();
+    void pollAuthTask();
+    void cancelRoomOperation();
+    void failAuthentication(AuthErrorCode code, const std::string& message);
     void resetSecureState();
     void failSignalFrame(uint8_t msgType, size_t len,
                          const char* error, size_t offset);
@@ -111,8 +119,18 @@ private:
     uint32_t      m_myPeerId;
     uint32_t      m_pingSentTime;
     uint32_t      m_connectStartTime;
-    uint8_t       m_pendingAuthHash[CIPHER_KEY_SIZE];
+    uint32_t      m_authStartedMs;
+    std::string   m_pendingRoomPassword;
+    AuthKdfTask   m_authTask;
+    int           m_authOperation;
+    ByteBuffer    m_pendingCreate;
+    uint16_t      m_pendingCreateMtu;
+    uint8_t       m_authSalt[AUTH_SALT_SIZE];
+    uint8_t       m_expectedServerProof[32];
+    uint8_t       m_roomChallenge[32];
     bool          m_hasPendingAuth;
+    bool          m_roomOperationPending;
+    bool          m_sendFailurePending;
     std::string   m_serverPassword;
     bool          m_serverAuthRequired;
     bool          m_secureReady;
@@ -144,6 +162,7 @@ public:
     void disconnect();
     bool isConnected() const { return m_established; }
     socket_t fd() const { return m_conn.fd; }
+    bool wantsWrite() const { return m_conn.connecting || !m_conn.sendBuf.empty(); }
     bool installSecureSession(uint32_t sessionId, const Buffer& master);
     void clearSecurityContext();
     DataPlaneSecurityMode securityMode() const { return m_securityMode; }
@@ -158,6 +177,7 @@ public:
 
     std::function<void()> onConnectedCb;
     std::function<void()> onDisconnectedCb;
+    std::function<void(const std::string&)> onSecurityFailure;
     std::function<void(uint32_t srcPeerId, TrafficClass cls, Buffer data)> onRelayData;
 
 private:
@@ -174,6 +194,7 @@ private:
     uint32_t      m_peerId;
     bool          m_established;
     bool          m_needReconnect;
+    bool          m_sendFailurePending;
     uint32_t      m_reconnectTime;
     DataPlaneSecurityMode m_securityMode;
     uint32_t      m_secureSessionId;

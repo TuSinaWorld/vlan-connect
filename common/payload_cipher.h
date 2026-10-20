@@ -1,6 +1,7 @@
 #ifndef VLAN_PAYLOAD_CIPHER_H
 #define VLAN_PAYLOAD_CIPHER_H
 
+#include "protocol.h"
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
@@ -19,10 +20,11 @@ namespace VLan {
 static const int CIPHER_KEY_SIZE        = 32;
 static const int CIPHER_CHALLENGE_SIZE  = 32;
 
-static const uint32_t ARGON2_NB_BLOCKS = 4096;  // 4 MB work area
-static const uint32_t ARGON2_NB_PASSES = 3;
+static const uint32_t ARGON2_NB_BLOCKS = 19456;  // v9 profile 1: 19 MiB
+static const uint32_t ARGON2_NB_PASSES = 2;
 static const uint32_t ARGON2_NB_LANES  = 1;
 
+// Legacy deterministic helpers are for test vectors only. Production v9 uses random salts.
 static const uint8_t ARGON2_AUTH_SALT[16] = {
     'V','L','a','n','-','a','u','t','h','-','s','a','l','t','v','1'
 };
@@ -34,9 +36,10 @@ inline bool computeIntermediateWithAllocator(
     const uint8_t* password, size_t pwdLen,
     uint8_t out[CIPHER_KEY_SIZE],
     PayloadCipherAllocator allocator,
-    PayloadCipherDeallocator deallocator)
+    PayloadCipherDeallocator deallocator,
+    const uint8_t* salt = ARGON2_AUTH_SALT, uint8_t profile = AUTH_KDF_PROFILE)
 {
-    if (!out || !allocator || !deallocator ||
+    if (!out || !allocator || !deallocator || !salt || profile != AUTH_KDF_PROFILE ||
         (pwdLen > 0 && !password) || pwdLen > UINT32_MAX) {
         if (out) memset(out, 0, CIPHER_KEY_SIZE);
         return false;
@@ -50,9 +53,10 @@ inline bool computeIntermediateWithAllocator(
         CRYPTO_ARGON2_ID, ARGON2_NB_BLOCKS, ARGON2_NB_PASSES, ARGON2_NB_LANES
     };
     crypto_argon2_inputs inp = {
-        password, ARGON2_AUTH_SALT, static_cast<uint32_t>(pwdLen), 16
+        password, salt, static_cast<uint32_t>(pwdLen), 16
     };
     crypto_argon2(out, CIPHER_KEY_SIZE, work, cfg, inp, crypto_argon2_no_extras);
+    crypto_wipe(work, static_cast<size_t>(ARGON2_NB_BLOCKS) * 1024);
     deallocator(work);
     return true;
 }
@@ -84,6 +88,22 @@ inline bool hashPassword(const uint8_t* password, size_t pwdLen,
     }
     authHashFromIntermediate(intermediate, hash);
     crypto_wipe(intermediate, CIPHER_KEY_SIZE);
+    return true;
+}
+
+inline bool hashPasswordSalted(const uint8_t* password, size_t pwdLen,
+                               const uint8_t salt[AUTH_SALT_SIZE],
+                               uint8_t hash[CIPHER_KEY_SIZE],
+                               uint8_t profile = AUTH_KDF_PROFILE) {
+    if (!hash) return false;
+    uint8_t intermediate[CIPHER_KEY_SIZE] = {};
+    if (!computeIntermediateWithAllocator(password, pwdLen, intermediate,
+                                          &malloc, &free, salt, profile)) {
+        if (hash) crypto_wipe(hash, CIPHER_KEY_SIZE);
+        return false;
+    }
+    authHashFromIntermediate(intermediate, hash);
+    crypto_wipe(intermediate, sizeof(intermediate));
     return true;
 }
 

@@ -2,6 +2,8 @@
 
 本文说明如何把 VLan 服务端安装到 Linux 服务器，并用 systemd 管理服务。
 
+v0.3.1 使用 **协议 v9**，与 v8 不兼容。服务端、Windows GUI 和所有 CLI 必须同步升级。升级前通知房间成员保存当前会话，升级后重新连接；安装器保留密码和端口不会使旧协议恢复兼容。`vlan-server --version` 无需 `--auth-file` 即可打印软件版本、协议版本和构建提交并退出。
+
 ## 相关文档
 
 - 项目入口和客户端说明: [../README.md](../README.md)
@@ -61,7 +63,7 @@ curl -fsSL https://raw.githubusercontent.com/TuSinaWorld/vlan-connect/main/serve
 
 # 安装指定正式 tag；显式指定旧 tag 时允许降级
 curl -fsSL https://raw.githubusercontent.com/TuSinaWorld/vlan-connect/main/server/install.sh \
-  | sudo bash -s -- update --version v0.3.0
+  | sudo bash -s -- update --version v0.3.1
 
 # 更新程序并重新进入配置流程
 curl -fsSL https://raw.githubusercontent.com/TuSinaWorld/vlan-connect/main/server/install.sh \
@@ -123,6 +125,8 @@ curl -fsSL https://raw.githubusercontent.com/TuSinaWorld/vlan-connect/main/serve
 ### 更新安全和自动回滚
 
 - 依赖安装、在线模式的 tag 查询、本地归档检查和编译全部在停止现有服务前完成。
+- v0.3.1 及更新的源码必须包含与选中 tag 一致的软件版本元数据。安装器读取协议版本，在部署前和成功摘要中提示所有 GUI/CLI 同步升级；v9 明确提示不接受 v8 客户端。
+- 新版二进制在切换服务前执行有 5 秒上限的 `--version` 校验，必须匹配源码的软件版本、协议版本和构建提交。正式源码归档带有 `SOURCE-COMMIT.txt`；在线源码使用克隆 tag 的提交。显式旧 tag 仍支持回滚，旧源码没有版本查询时会显示警告。
 - 二进制安装到 `/opt/vlan-server/releases/<tag>/`，通过 `/opt/vlan-server/current` 和 `/usr/local/bin/vlan-server` 软链接原子切换。
 - 更新前会临时快照当前二进制链接、systemd unit、环境文件、密码、文档和版本状态。
 - 新服务无法在 10 秒内进入 active 时，会恢复全部快照并重新启动旧版本。

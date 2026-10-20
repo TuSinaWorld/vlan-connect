@@ -1,6 +1,7 @@
 #include "signal_server.h"
 #include "server_logger.h"
 #include "auth_file.h"
+#include "version.h"
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -26,12 +27,19 @@ static void usage(const char* prog) {
         "  --max-pending-per-ip N      Maximum pending per IPv4 (1-8)\n"
         "  --max-send-buffer-mb N      Global send buffers MiB (1-64)\n"
         "  -v        Verbose/detail log\n"
+        "  --version Print release, protocol and build; then exit\n"
         "  -h        Show this help\n",
         prog,
         VLan::DEFAULT_PORT);
 }
 
 int main(int argc, char* argv[]) {
+    for (int i = 1; i < argc; ++i) {
+        if (strcmp(argv[i], "--version") == 0) {
+            printf("%s\n", VLan::releaseBuildDescription("VLan Server").c_str());
+            return 0;
+        }
+    }
     uint16_t port = VLan::DEFAULT_PORT;
     std::string logPath;
     std::string authPassword;
@@ -127,6 +135,7 @@ int main(int argc, char* argv[]) {
     VLan::ServerLogger::instance().init(
         logPath, logMaxMB * 1024 * 1024,
         verbose ? VLan::SRV_LOG_DETAIL : VLan::SRV_LOG_NORMAL);
+    LOG_INFO("%s", VLan::releaseBuildDescription("VLan Server").c_str());
 
     VLan::sock_init();
 

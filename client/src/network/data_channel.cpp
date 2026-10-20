@@ -71,6 +71,10 @@ bool DataChannel::isConnected() const {
 
 bool DataChannel::installSecureSession(uint32_t sessionId,
                                        const QByteArray& master) {
+    if (sessionId == m_secureSessionId && master.size() == SECURE_KEY_SIZE &&
+        m_secureMaster.size() == SECURE_KEY_SIZE &&
+        crypto_verify32(reinterpret_cast<const uint8_t*>(master.constData()),
+                        reinterpret_cast<const uint8_t*>(m_secureMaster.constData())) == 0) return true;
     if (m_socket->state() != QAbstractSocket::UnconnectedState) {
         LogManager::instance().logError(
             QStringLiteral("[datachannel] Cannot change security mode while connected"));
@@ -133,6 +137,7 @@ void DataChannel::onSocketConnected() {
     ByteBuffer inner;
     inner.writeU32(m_peerId);
     std::vector<uint8_t> enc = m_cipher.encrypt(inner.data(), inner.size());
+    if (enc.empty()) { requestNewSecuritySession(); return; }
     uint8_t sid[4];
     writeU32BE(sid, m_secureSessionId);
     bb.writeBytes(sid, 4);
@@ -341,6 +346,14 @@ void DataChannel::onKeepaliveTimer() {
     }
 }
 
+void DataChannel::requestNewSecuritySession() {
+    QPointer<DataChannel> guard(this);
+    disconnect();
+    if (guard.isNull()) return;
+    clearSecurityContext();
+    emit securityError(QStringLiteral("Data channel secure counter exhausted; a new authenticated session is required."));
+}
+
 void DataChannel::scheduleReconnect() {
     if (m_reconnectTimer->isActive()) return;
     LogManager::instance().logDetail(QString("[datachannel] Will reconnect in %1 ms").arg(RECONNECT_INTERVAL_MS));
@@ -368,6 +381,7 @@ void DataChannel::sendMsg(uint8_t msgType, const ByteBuffer& body) {
         if (body.size() > 0)
             plain.insert(plain.end(), body.data(), body.data() + body.size());
         std::vector<uint8_t> enc = m_cipher.encrypt(plain.data(), plain.size());
+        if (enc.empty()) { requestNewSecuritySession(); return; }
         if (enc.size() > MAX_TCP_MSG_PAYLOAD) return;
         TcpMsgHeader hdr;
         hdr.msgType = MSG_ENCRYPTED;

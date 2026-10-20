@@ -165,12 +165,19 @@ inline void deriveSecureMaster(uint8_t out[SECURE_KEY_SIZE],
                                const uint8_t clientNonce[16],
                                const uint8_t serverNonce[16],
                                const uint8_t clientPub[32],
-                               const uint8_t serverPub[32])
+                               const uint8_t serverPub[32],
+                               const uint8_t salt[AUTH_SALT_SIZE] = ARGON2_AUTH_SALT,
+                               uint8_t profile = AUTH_KDF_PROFILE)
 {
     crypto_blake2b_ctx ctx;
     crypto_blake2b_init(&ctx, SECURE_KEY_SIZE);
-    const char domain[] = "VLan-secure-master-v1";
+    const char domain[] = "VLan-secure-master-v9";
     crypto_blake2b_update(&ctx, reinterpret_cast<const uint8_t*>(domain), sizeof(domain) - 1);
+    const uint8_t version[] = {static_cast<uint8_t>(PROTOCOL_VERSION >> 8),
+                               static_cast<uint8_t>(PROTOCOL_VERSION)};
+    crypto_blake2b_update(&ctx, version, sizeof(version));
+    crypto_blake2b_update(&ctx, &profile, 1);
+    crypto_blake2b_update(&ctx, salt, AUTH_SALT_SIZE);
     crypto_blake2b_update(&ctx, sharedSecret, SECURE_KEY_SIZE);
     crypto_blake2b_update(&ctx, authHash, SECURE_KEY_SIZE);
     crypto_blake2b_update(&ctx, clientNonce, 16);
@@ -178,6 +185,11 @@ inline void deriveSecureMaster(uint8_t out[SECURE_KEY_SIZE],
     crypto_blake2b_update(&ctx, clientPub, 32);
     crypto_blake2b_update(&ctx, serverPub, 32);
     crypto_blake2b_final(&ctx, out);
+}
+
+inline bool validX25519Shared(const uint8_t shared[32]) {
+    const uint8_t zero[32] = {};
+    return crypto_verify32(shared, zero) != 0;
 }
 
 inline void computeClientAuthProof(uint8_t out[SECURE_KEY_SIZE],
@@ -204,7 +216,7 @@ inline void computeServerAuthProof(uint8_t out[SECURE_KEY_SIZE],
 class SecureFrameCipher {
 public:
     SecureFrameCipher()
-        : m_sendCounter(0), m_recvMaxCounter(0), m_recvStarted(false)
+        : m_sendCounter(0), m_recvMaxCounter(0), m_recvStarted(false), m_initialized(false)
     {
         std::memset(m_sendKey, 0, sizeof(m_sendKey));
         std::memset(m_recvKey, 0, sizeof(m_recvKey));
@@ -226,11 +238,11 @@ public:
         m_sendCounter = 0;
         m_recvMaxCounter = 0;
         m_recvStarted = false;
+        m_initialized = false;
     }
 
     void init(const uint8_t master[SECURE_KEY_SIZE], bool clientSide,
               const char* context = "signal") {
-        reset();
         uint8_t c2s[SECURE_KEY_SIZE], s2c[SECURE_KEY_SIZE];
         uint8_t c2sNonce[SECURE_KEY_SIZE], s2cNonce[SECURE_KEY_SIZE];
         std::string prefix = std::string("VLan-") + (context ? context : "signal");
@@ -242,6 +254,16 @@ public:
         deriveSecureKey(s2c, master, s2cKeyDomain.c_str());
         deriveSecureKey(c2sNonce, master, c2sNonceDomain.c_str());
         deriveSecureKey(s2cNonce, master, s2cNonceDomain.c_str());
+        const uint8_t* sendKey = clientSide ? c2s : s2c;
+        const uint8_t* recvKey = clientSide ? s2c : c2s;
+        if (m_initialized && crypto_verify32(m_sendKey, sendKey) == 0 &&
+            crypto_verify32(m_recvKey, recvKey) == 0) {
+            crypto_wipe(c2s, sizeof(c2s)); crypto_wipe(s2c, sizeof(s2c));
+            crypto_wipe(c2sNonce, sizeof(c2sNonce)); crypto_wipe(s2cNonce, sizeof(s2cNonce));
+            return; // Reinstalling a session never resets its counters or replay window.
+        }
+        reset();
+        m_initialized = true;
         if (clientSide) {
             std::memcpy(m_sendKey, c2s, SECURE_KEY_SIZE);
             std::memcpy(m_recvKey, s2c, SECURE_KEY_SIZE);
@@ -266,6 +288,8 @@ public:
     std::vector<uint8_t> encrypt(const uint8_t* plain, size_t plainLen,
                                  const uint8_t* ad = nullptr, size_t adLen = 0)
     {
+        // Reserve the final counter to fail closed before wraparound / nonce reuse.
+        if (!m_initialized || m_sendCounter == UINT64_MAX) return std::vector<uint8_t>();
         std::vector<uint8_t> out(SECURE_COUNTER_SIZE + plainLen + SECURE_MAC_SIZE);
         uint64_t ctr = m_sendCounter++;
         writeU64BE(out.data(), ctr);
@@ -281,7 +305,7 @@ public:
                  std::vector<uint8_t>* plain,
                  const uint8_t* ad = nullptr, size_t adLen = 0)
     {
-        if (frameLen < SECURE_FRAME_OVERHEAD) return false;
+        if (!m_initialized || !plain || !frame || frameLen < SECURE_FRAME_OVERHEAD) return false;
         uint64_t ctr = readU64BE(frame);
         if (!isCounterAllowed(ctr)) return false;
         size_t cipherLen = frameLen - SECURE_COUNTER_SIZE - SECURE_MAC_SIZE;
@@ -354,6 +378,7 @@ private:
     uint64_t m_sendCounter;
     uint64_t m_recvMaxCounter;
     bool     m_recvStarted;
+    bool     m_initialized;
     uint8_t  m_replayBitmap[REPLAY_WINDOW / 8];
 };
 

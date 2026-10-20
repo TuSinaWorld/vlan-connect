@@ -1,4 +1,4 @@
-﻿#ifndef _WIN32
+#ifndef _WIN32
 
 #include "cli_tun.h"
 #include "cli_log.h"
@@ -268,13 +268,18 @@ bool CliTunAdapter::initialize(const std::string& adapterName) {
 bool CliTunAdapter::configureIP(uint32_t ip, uint32_t mask, int mtu) {
     m_ip   = ip;
     m_mask = mask;
+    m_configurationError.clear();
 
-    if (m_tunFd < 0 || m_interfaceIndex <= 0 || !m_netlinkTransport)
+    if (m_tunFd < 0 || m_interfaceIndex <= 0 || !m_netlinkTransport) {
+        m_configurationError = "TUN interface is not initialized";
         return false;
+    }
     int errorCode = 0;
     LinuxTunConfiguration state;
     if (!configureLinuxTun(m_netlinkTransport, m_interfaceIndex,
                            ip, mask, mtu, &state, &errorCode)) {
+        m_configurationError = std::string("TUN rtnetlink configuration failed: ") +
+            strerror(errorCode ? errorCode : EIO);
         LOG_ERR("TUN rtnetlink configuration failed: %s",
                 strerror(errorCode ? errorCode : EIO));
         return false;
@@ -285,6 +290,26 @@ bool CliTunAdapter::configureIP(uint32_t ip, uint32_t mask, int mtu) {
              m_interfaceName.c_str(), ipToString(ip).c_str(),
              state.prefix, mtu);
     return true;
+}
+
+bool CliTunAdapter::checkRoute(uint32_t destination, std::string* error) const {
+    // A connected UDP socket performs source/route selection without sending a
+    // packet. The overlay must select the address assigned to this TUN.
+    int fd = socket(AF_INET, SOCK_DGRAM, 0);
+    struct sockaddr_in remote = makeAddr(destination, 9);
+    struct sockaddr_in local = {};
+    socklen_t size = sizeof(local);
+    bool ok = fd >= 0 && connect(fd, reinterpret_cast<struct sockaddr*>(&remote),
+        sizeof(remote)) == 0 && getsockname(fd, reinterpret_cast<struct sockaddr*>(&local),
+        &size) == 0 && ntohl(local.sin_addr.s_addr) == m_ip;
+    if (fd >= 0) close(fd);
+    if (error) *error = ok ? std::string() :
+        "Overlay route unavailable or conflicting; check competing VPN/subnet routes";
+    if (ok) LOG_INFO("[network] route-check destination=%s interface=%s result=success",
+                     ipToString(destination).c_str(), m_interfaceName.c_str());
+    else LOG_ERR("[network] route-check destination=%s result=failed",
+                  ipToString(destination).c_str());
+    return ok;
 }
 
 bool CliTunAdapter::startSession() {

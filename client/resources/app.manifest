@@ -3,7 +3,7 @@
   <assemblyIdentity
       type="win32"
       name="VLan.Client"
-      version="0.1.0.0"
+      version="0.3.1.0"
       processorArchitecture="*"/>
 
   <dependency>
@@ -17,6 +17,14 @@
           language="*"/>
     </dependentAssembly>
   </dependency>
+
+  <trustInfo xmlns="urn:schemas-microsoft-com:asm.v3">
+    <security>
+      <requestedPrivileges>
+        <requestedExecutionLevel level="requireAdministrator" uiAccess="false"/>
+      </requestedPrivileges>
+    </security>
+  </trustInfo>
 
   <application xmlns="urn:schemas-microsoft-com:asm.v3">
     <windowsSettings>

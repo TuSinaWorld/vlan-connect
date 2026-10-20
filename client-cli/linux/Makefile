@@ -20,6 +20,8 @@ CXXFLAGS = -std=c++11 -O2 -Wall -Wextra -pthread $(SIMD_FLAGS) \
            -I../../3rdparty/monocypher \
            -I../../3rdparty/cm256cc
 LDFLAGS  = -lpthread
+BUILD_COMMIT ?= $(shell git rev-parse --short=12 HEAD 2>/dev/null || printf unknown)
+CXXFLAGS += -DVLAN_BUILD_COMMIT=\"$(BUILD_COMMIT)\" -MMD -MP
 
 SHARED_SRC = ../src
 COMMON     = ../../common
@@ -46,6 +48,8 @@ TARGET  = vlan-cli
 
 all: $(TARGET)
 
+-include $(OBJECTS:.o=.d)
+
 $(TARGET): $(OBJECTS)
 	$(CXX) $(CXXFLAGS) -o $@ $^ $(LDFLAGS)
 
@@ -56,4 +60,4 @@ $(TARGET): $(OBJECTS)
 	$(CC) -std=c99 -O2 -Wall -I$(KCP_DIR) -I$(MONO_DIR) -c -o $@ $<
 
 clean:
-	rm -f $(TARGET) $(OBJECTS)
+	rm -f $(TARGET) $(OBJECTS) $(OBJECTS:.o=.d)

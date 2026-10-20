@@ -1,5 +1,6 @@
 #include "cli_app.h"
 #include "cli_log.h"
+#include "version.h"
 #include <cstdio>
 #include <cstring>
 #include <cstdlib>
@@ -37,6 +38,8 @@ static void usage(const char* prog) {
         "  -n NAME   Player name             (prompted if omitted)\n"
         "  --auth PASSWORD       Server auth password for this process\n"
         "  --auth-file PATH      Read server auth password from first line\n"
+        "  --log-file PATH       Rotating diagnostic log (stderr is retained)\n"
+        "  --version             Print release, protocol and build; then exit\n"
         "  -v        Verbose/debug log\n"
         "  -h        Show this help\n"
         "\n"
@@ -56,11 +59,19 @@ static void usage(const char* prog) {
 }
 
 int main(int argc, char* argv[]) {
+    // Version checks must work without credentials, elevation or network side effects.
+    for (int i = 1; i < argc; ++i) {
+        if (strcmp(argv[i], "--version") == 0) {
+            printf("%s\n", VLan::releaseBuildDescription("VLan CLI").c_str());
+            return 0;
+        }
+    }
     std::string serverHost = "127.0.0.1";
     uint16_t    serverPort = VLan::DEFAULT_PORT;
     std::string playerName;
     std::string serverPassword;
     bool        verbose = false;
+    std::string logFile;
 
     for (int i = 1; i < argc; ++i) {
         if (strcmp(argv[i], "-s") == 0 && i + 1 < argc) {
@@ -82,6 +93,12 @@ int main(int argc, char* argv[]) {
                 fprintf(stderr, "Error: failed to read auth password file\n");
                 return 1;
             }
+        } else if (strcmp(argv[i], "--log-file") == 0 && i + 1 < argc) {
+            logFile = argv[++i];
+            if (logFile.empty()) {
+                fprintf(stderr, "Error: --log-file requires a nonempty path\n");
+                return 1;
+            }
         } else if (strcmp(argv[i], "-v") == 0) {
             verbose = true;
         } else if (strcmp(argv[i], "-h") == 0 || strcmp(argv[i], "--help") == 0) {
@@ -94,6 +111,11 @@ int main(int argc, char* argv[]) {
         }
     }
 
+    if (!logFile.empty() && !VLan::CliLog::instance().setLogFile(logFile)) {
+        fprintf(stderr, "Error: cannot open log file '%s'\n", logFile.c_str());
+        return 1;
+    }
+    LOG_INFO("%s", VLan::releaseBuildDescription("VLan CLI").c_str());
     VLan::CliApp app;
 #ifdef _WIN32
     signal(SIGINT, signalHandler);

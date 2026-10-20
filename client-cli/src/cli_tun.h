@@ -1,4 +1,4 @@
-﻿#ifndef VLAN_CLI_TUN_H
+#ifndef VLAN_CLI_TUN_H
 #define VLAN_CLI_TUN_H
 
 #include "cli_common.h"
@@ -6,6 +6,9 @@
 #include <thread>
 #include <mutex>
 #include <functional>
+#ifdef _WIN32
+#include "windows_network_config.h"
+#endif
 
 namespace VLan {
 
@@ -49,6 +52,8 @@ public:
 
     bool initialize(const std::string& adapterName = "VLan");
     bool configureIP(uint32_t ip, uint32_t mask, int mtu = 0);
+    bool checkRoute(uint32_t destination, std::string* error) const;
+    std::string configurationError() const { return m_configurationError; }
     bool startSession();
     void shutdown();
 
@@ -76,6 +81,7 @@ private:
 
     uint32_t m_ip;
     uint32_t m_mask;
+    std::string m_configurationError;
 
 #ifdef _WIN32
     void* m_dll;
@@ -103,8 +109,7 @@ private:
     FnAllocateSendPacket   m_fnAllocateSendPacket;
     FnSendPacket           m_fnSendPacket;
 
-    bool m_firewallRuleActive;
-    bool m_broadcastRouteActive;
+    WindowsNetworkState m_networkState;
 #else
     int m_tunFd;
     std::string m_interfaceName;

@@ -1,4 +1,4 @@
-﻿#ifdef _WIN32
+#ifdef _WIN32
 
 #include "cli_tun.h"
 #include "cli_log.h"
@@ -15,8 +15,7 @@ CliTunAdapter::CliTunAdapter()
       m_fnStartSession(nullptr), m_fnEndSession(nullptr),
       m_fnGetReadWaitEvent(nullptr), m_fnReceivePacket(nullptr),
       m_fnReleaseReceivePacket(nullptr), m_fnAllocateSendPacket(nullptr),
-      m_fnSendPacket(nullptr),
-      m_firewallRuleActive(false), m_broadcastRouteActive(false)
+      m_fnSendPacket(nullptr)
 {}
 
 CliTunAdapter::~CliTunAdapter() {
@@ -52,10 +51,13 @@ bool CliTunAdapter::initialize(const std::string& adapterName) {
         return false;
     }
 
-    int wlen = MultiByteToWideChar(CP_UTF8, 0, adapterName.c_str(), -1, nullptr, 0);
-    std::wstring wname(wlen, L'\0');
-    MultiByteToWideChar(CP_UTF8, 0, adapterName.c_str(), -1, &wname[0], wlen);
-
+    std::wstring wname = windowsWide(adapterName);
+    if (wname.empty()) {
+        LOG_ERR("Invalid UTF-8 virtual adapter name");
+        FreeLibrary(dll);
+        m_dll = nullptr;
+        return false;
+    }
     m_adapter = m_fnCreate(wname.c_str(), L"VLan", nullptr);
     if (!m_adapter) {
         LOG_ERR("WintunCreateAdapter failed (need admin?)");
@@ -63,52 +65,45 @@ bool CliTunAdapter::initialize(const std::string& adapterName) {
         m_dll = nullptr;
         return false;
     }
+    typedef void (WINAPI *FnGetAdapterLuid)(void*, NET_LUID*);
+    FnGetAdapterLuid getLuid = reinterpret_cast<FnGetAdapterLuid>(
+        GetProcAddress(dll, "WintunGetAdapterLUID"));
+    NET_LUID luid = {};
+    wchar_t alias[IF_MAX_STRING_SIZE + 1] = {};
+    if (!getLuid) {
+        LOG_ERR("wintun.dll: WintunGetAdapterLUID is unavailable");
+        shutdown();
+        return false;
+    }
+    getLuid(m_adapter, &luid);
+    DWORD result = ConvertInterfaceLuidToAlias(&luid, alias, IF_MAX_STRING_SIZE + 1);
+    if (result != NO_ERROR) {
+        LOG_ERR("Cannot resolve virtual adapter alias (Windows %lu)", result);
+        shutdown();
+        return false;
+    }
+    m_networkState.alias = alias;
     return true;
 }
 
 bool CliTunAdapter::configureIP(uint32_t ip, uint32_t mask, int mtu) {
-    m_ip   = ip;
+    m_ip = ip;
     m_mask = mask;
+    SystemWindowsNetworkCommands commands;
+    const bool ok = configureWindowsNetwork(commands, m_networkState, ip, mask, mtu,
+        [](const std::string& message) { LOG_INFO("%s", message.c_str()); }, &m_configurationError);
+    if (!ok) LOG_ERR("Virtual adapter configuration failed: %s", m_configurationError.c_str());
+    return ok;
+}
 
-    std::string sIP   = ipToString(ip);
-    std::string sMask = ipToString(mask);
-
-    char cmd[512];
-    snprintf(cmd, sizeof(cmd),
-        "netsh interface ip set address name=\"VLan\" static %s %s",
-        sIP.c_str(), sMask.c_str());
-    LOG_INFO("Configuring IP: %s", cmd);
-    int ret = system(cmd);
-    if (ret != 0) {
-        LOG_ERR("Failed to configure IP on virtual adapter");
-        return false;
-    }
-
-    system("netsh interface ip set interface \"VLan\" metric=9999");
-
-    if (mtu > 0) {
-        snprintf(cmd, sizeof(cmd),
-            "netsh interface ipv4 set subinterface \"VLan\" mtu=%d store=active", mtu);
-        system(cmd);
-    }
-
-    system("netsh advfirewall firewall delete rule name=\"VLan Virtual LAN\" >nul 2>&1");
-    ret = system("netsh advfirewall firewall add rule "
-        "name=\"VLan Virtual LAN\" dir=in action=allow "
-        "remoteip=10.10.0.0/24 enable=yes");
-    if (ret == 0) {
-        m_firewallRuleActive = true;
-        LOG_INFO("Firewall rule added: allow inbound from 10.10.0.0/24");
-    }
-
-    system("netsh interface ipv4 delete route 255.255.255.255/32 \"VLan\" store=active >nul 2>&1");
-    snprintf(cmd, sizeof(cmd),
-        "netsh interface ipv4 add route 255.255.255.255/32 \"VLan\" %s metric=1 store=active",
-        sIP.c_str());
-    if (system(cmd) == 0)
-        m_broadcastRouteActive = true;
-
-    return true;
+bool CliTunAdapter::checkRoute(uint32_t destination, std::string* error) const {
+    std::string detail;
+    const bool ok = checkWindowsOverlayRoute(m_networkState.alias, m_ip, destination, &detail);
+    if (error) *error = detail;
+    if (ok) LOG_INFO("[network] route-check destination=%s alias=%s result=success",
+                    ipToString(destination).c_str(), windowsUtf8(m_networkState.alias).c_str());
+    else LOG_ERR("%s", detail.c_str());
+    return ok;
 }
 
 bool CliTunAdapter::startSession() {
@@ -139,6 +134,9 @@ void CliTunAdapter::shutdown() {
     if (m_readEvent) SetEvent((HANDLE)m_readEvent);
     if (m_readThread.joinable()) m_readThread.join();
 
+    SystemWindowsNetworkCommands commands;
+    rollbackWindowsNetwork(commands, m_networkState,
+        [](const std::string& message) { LOG_INFO("%s", message.c_str()); });
     {
         std::lock_guard<std::mutex> lock(m_writeMutex);
         if (m_session && m_fnEndSession) {
@@ -153,14 +151,7 @@ void CliTunAdapter::shutdown() {
         if (m_dll) { FreeLibrary((HMODULE)m_dll); m_dll = nullptr; }
     }
 
-    if (m_broadcastRouteActive) {
-        m_broadcastRouteActive = false;
-        system("netsh interface ipv4 delete route 255.255.255.255/32 \"VLan\" store=active >nul 2>&1");
-    }
-    if (m_firewallRuleActive) {
-        m_firewallRuleActive = false;
-        system("netsh advfirewall firewall delete rule name=\"VLan Virtual LAN\" >nul 2>&1");
-    }
+
 }
 
 void CliTunAdapter::readLoop() {

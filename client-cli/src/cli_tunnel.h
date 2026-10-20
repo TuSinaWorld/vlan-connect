@@ -47,7 +47,7 @@ public:
     void setRoomMtu(uint16_t mtu) { m_roomMtu = normalizeRoomMtu(mtu); }
     bool installSecureSession(uint32_t sessionId, const Buffer& master);
     void clearSecurityContext();
-    bool startDataPlane();
+    bool startDataPlane(bool requiresUdp = true);
     void stopDataPlane();
     DataPlaneState dataPlaneState() const { return m_dataPlaneState; }
     DataPlaneSecurityMode securityMode() const { return m_securityMode; }
@@ -56,9 +56,11 @@ public:
     void processTunPackets();
     void updateKcp();
     void sendUdpKeepalive();
+    void recordPacketDrop(const std::string& reason, uint32_t peerId = 0);
 
     PeerDataCallback      onPeerData;
     TunnelDeadCallback    onTunnelDead;
+    std::function<void(const std::string&)> onSecurityFailure;
 
 private:
     static uint64_t tunnelKey(uint32_t peerId, TrafficClass cls);
@@ -89,6 +91,9 @@ private:
     uint32_t m_secureSessionId;
     Buffer   m_secureMaster;
     SecureFrameCipher m_udpCipher;
+    std::map<std::string, uint64_t> m_packetDrops;
+    uint32_t m_lastDropLogMs;
+    bool m_hasDropLog;
 };
 
 } // namespace VLan

@@ -13,7 +13,8 @@ namespace VLan {
 
 SignalClient::SignalClient(QObject* parent)
     : QObject(parent), m_socket(nullptr), m_myPeerId(0), m_serverPort(0), m_connectTimeoutMs(8000),
-      m_lastRecvTime(0), m_pingSentTime(0),
+      m_lastRecvTime(0), m_connectStartedMs(0), m_authStartedMs(0), m_pingSentTime(0), m_joinPending(false), m_roomOperationPending(false), m_authOperation(0),
+      m_pendingCreateMtu(ROOM_MTU_DEFAULT),
       m_serverAuthRequired(false), m_secureReady(false),
       m_fatalDisconnectPending(false), m_secureSessionId(0),
       m_roomListRevision(0), m_snapshotRevision(0),
@@ -24,8 +25,14 @@ SignalClient::SignalClient(QObject* parent)
     memset(m_clientPrivKey, 0, sizeof(m_clientPrivKey));
     memset(m_clientPubKey, 0, sizeof(m_clientPubKey));
     memset(m_serverPubKey, 0, sizeof(m_serverPubKey));
+    memset(m_authSalt, 0, sizeof(m_authSalt));
+    memset(m_expectedServerProof, 0, sizeof(m_expectedServerProof));
+    memset(m_roomChallenge, 0, sizeof(m_roomChallenge));
     createSocket();
 
+    QTimer* authPoll = new QTimer(this);
+    connect(authPoll, &QTimer::timeout, this, &SignalClient::pollAuthTask);
+    authPoll->start(10);
     m_pingTimer = new QTimer(this);
     connect(m_pingTimer, &QTimer::timeout, this, &SignalClient::onPingTimer);
 
@@ -61,7 +68,27 @@ SignalClient::~SignalClient() {
     disconnect();
 }
 
+void SignalClient::cancelRoomOperation() {
+    if (m_authOperation == 2 || m_authOperation == 3) {
+        m_authTask.cancel(); m_authOperation = 0;
+    }
+    m_roomOperationPending = false; m_joinPending = false;
+    if (!m_pendingRoomPassword.isEmpty()) crypto_wipe(m_pendingRoomPassword.data(), m_pendingRoomPassword.size());
+    m_pendingRoomPassword.clear();
+    crypto_wipe(m_roomChallenge, sizeof(m_roomChallenge));
+    if (m_pendingCreate.size()) crypto_wipe(const_cast<uint8_t*>(m_pendingCreate.data()), m_pendingCreate.size());
+    m_pendingCreate.clear();
+}
+
 void SignalClient::resetSecureState() {
+    cancelRoomOperation();
+    m_authTask.cancel();
+    m_authOperation = 0;
+    m_joinPending = false;
+    m_roomOperationPending = false;
+    crypto_wipe(m_expectedServerProof, sizeof(m_expectedServerProof));
+    crypto_wipe(m_roomChallenge, sizeof(m_roomChallenge));
+    crypto_wipe(m_authSalt, sizeof(m_authSalt));
     m_secureReady = false;
     m_serverAuthRequired = false;
     m_secureSessionId = 0;
@@ -77,10 +104,10 @@ void SignalClient::resetSecureState() {
     crypto_wipe(m_clientPrivKey, sizeof(m_clientPrivKey));
     crypto_wipe(m_clientPubKey, sizeof(m_clientPubKey));
     crypto_wipe(m_serverPubKey, sizeof(m_serverPubKey));
-    if (!m_pendingAuthHash.isEmpty()) {
-        crypto_wipe(reinterpret_cast<uint8_t*>(m_pendingAuthHash.data()),
-                    static_cast<size_t>(m_pendingAuthHash.size()));
-        m_pendingAuthHash.clear();
+    if (!m_pendingRoomPassword.isEmpty()) {
+        crypto_wipe(reinterpret_cast<uint8_t*>(m_pendingRoomPassword.data()),
+                    static_cast<size_t>(m_pendingRoomPassword.size()));
+        m_pendingRoomPassword.clear();
     }
     resetRoomListState();
 }
@@ -111,12 +138,15 @@ void SignalClient::connectToServer(const QString& host, quint16 port,
     resetSecureState();
     m_fatalDisconnectPending = false;
     m_recvBuf.clear();
+    m_connectStartedMs = currentTimeMs();
     m_socket->connectToHost(host, port);
     m_connectTimer->start(timeoutMs);
 }
 
 void SignalClient::setServerPassword(const QString& password) {
+    if (m_authOperation == 1) { m_authTask.cancel(); m_authOperation = 0; }
     m_serverPassword = password;
+    if (!m_secureReady && !m_secureMaster.isEmpty()) disconnect();
 }
 
 void SignalClient::continueServerAuth() {
@@ -166,9 +196,10 @@ void SignalClient::login(const QString& name,
 
 void SignalClient::createRoom(const QString& roomName, uint8_t maxPlayers,
                               RoomTrafficPolicy tcpPolicy,
-                              RoomTrafficPolicy udpPolicy,
-                              uint16_t mtu,
-                              bool passwordProtected, const QByteArray& passwordHash) {
+                              RoomTrafficPolicy udpPolicy, uint16_t mtu,
+                              bool passwordProtected, const QString& password) {
+    if (m_roomOperationPending || m_authOperation != 0 || !m_secureReady) return;
+    m_roomOperationPending = true;
     ByteBuffer bb;
     bb.writeString(roomName.toStdString());
     bb.writeU8(maxPlayers);
@@ -179,27 +210,32 @@ void SignalClient::createRoom(const QString& roomName, uint8_t maxPlayers,
     bb.writeU8(static_cast<uint8_t>(udpPolicy.fecMode));
     bb.writeU8(static_cast<uint8_t>(udpPolicy.kcpProfile));
     bb.writeU8(passwordProtected ? 1 : 0);
-    if (passwordProtected && passwordHash.size() == 32) {
-        bb.writeBytes(passwordHash.constData(), 32);
+    if (!passwordProtected) {
+        bb.writeU16(normalizeRoomMtu(mtu)); sendMsg(MSG_CREATE_ROOM, bb); return;
     }
-    bb.writeU16(normalizeRoomMtu(mtu));
-    sendMsg(MSG_CREATE_ROOM, bb);
+    if (!secureRandomBytes(m_authSalt, sizeof(m_authSalt))) {
+        m_roomOperationPending = false; emit serverError(QStringLiteral("Secure random generation failed.")); return;
+    }
+    m_pendingCreate = bb;
+    m_pendingCreateMtu = normalizeRoomMtu(mtu);
+    QByteArray utf8 = password.toUtf8();
+    m_authOperation = 2;
+    m_authTask.start(reinterpret_cast<const uint8_t*>(utf8.constData()), utf8.size(), m_authSalt);
+    if (!utf8.isEmpty()) crypto_wipe(utf8.data(), utf8.size());
 }
 
-void SignalClient::joinRoom(uint32_t roomId, const QByteArray& authHash) {
-    if (!m_pendingAuthHash.isEmpty()) {
-        crypto_wipe(reinterpret_cast<uint8_t*>(m_pendingAuthHash.data()),
-                    static_cast<size_t>(m_pendingAuthHash.size()));
-    }
-    m_pendingAuthHash = authHash;
-    ByteBuffer bb;
-    bb.writeU32(roomId);
-    sendMsg(MSG_JOIN_ROOM, bb);
+void SignalClient::joinRoom(uint32_t roomId, const QString& password) {
+    if (m_roomOperationPending || m_authOperation != 0 || !m_secureReady || roomId == 0) return;
+    m_roomOperationPending = true;
+    if (!m_pendingRoomPassword.isEmpty()) crypto_wipe(m_pendingRoomPassword.data(), m_pendingRoomPassword.size());
+    m_pendingRoomPassword = password.toUtf8(); m_joinPending = true;
+    ByteBuffer bb; bb.writeU32(roomId); sendMsg(MSG_JOIN_ROOM, bb);
 }
 
 void SignalClient::resumeRoom(uint32_t roomId, uint32_t peerId,
                               const QByteArray& resumeToken) {
-    if (resumeToken.size() != RECONNECT_TOKEN_SIZE) return;
+    if (m_roomOperationPending || !m_secureReady || resumeToken.size() != RECONNECT_TOKEN_SIZE) return;
+    m_roomOperationPending = true;
     ByteBuffer bb;
     bb.writeU32(roomId);
     bb.writeU32(peerId);
@@ -208,10 +244,14 @@ void SignalClient::resumeRoom(uint32_t roomId, uint32_t peerId,
 }
 
 void SignalClient::leaveRoom() {
+    // Pending requests have no correlation ID: close the session so late
+    // challenge/response frames cannot complete a cancelled room operation.
+    if (m_roomOperationPending) { disconnect(); return; }
     sendMsg(MSG_LEAVE_ROOM);
 }
 
 void SignalClient::logout() {
+    cancelRoomOperation();
     sendMsg(MSG_LOGOUT);
 }
 
@@ -242,8 +282,9 @@ void SignalClient::onConnected() {
     m_connectTimer->stop();
     m_fatalDisconnectPending = false;
     m_socket->setSocketOption(QAbstractSocket::LowDelayOption, 1);
-    m_lastRecvTime = currentTimeMs();
-    m_recvTimeoutTimer->start(5000);
+    m_lastRecvTime = currentTimeMs(); m_authStartedMs = m_lastRecvTime;
+    LogManager::instance().logNormal(QString("[auth] TCP connected elapsedMs=%1").arg(m_authStartedMs - m_connectStartedMs));
+    m_recvTimeoutTimer->start(1000);
     sendClientHello();
 }
 
@@ -344,6 +385,11 @@ void SignalClient::onRecvTimeoutCheck() {
     if (!isConnected()) return;
     uint32_t now = currentTimeMs();
     uint32_t elapsed = now - m_lastRecvTime;
+    if (!m_secureReady) {
+        if (now - m_authStartedMs > static_cast<uint32_t>(SERVER_AUTH_TIMEOUT_SEC * 1000))
+            failAuthentication(AuthErrorCode::AuthTimeout, QStringLiteral("Server authentication timed out (120 seconds)."));
+        return;
+    }
     if (elapsed > static_cast<uint32_t>(TCP_RECV_TIMEOUT_MS)) {
         LogManager::instance().logError(QString("[signal] %1")
             .arg(UiStrings::text("error.connectionDead").arg(elapsed)));
@@ -380,45 +426,59 @@ void SignalClient::sendClientHello() {
     m_socket->write(reinterpret_cast<const char*>(bb.data()), bb.size());
 }
 
+void SignalClient::failAuthentication(AuthErrorCode code, const QString& message) {
+    QPointer<SignalClient> guard(this);
+    emit fatalAuthError(static_cast<uint16_t>(code), message);
+    if (guard.isNull()) return;
+    emit serverError(message);
+    if (guard.isNull()) return;
+    m_socket->abort();
+    if (guard.isNull()) return;
+    resetSecureState();
+}
+
 void SignalClient::sendServerAuth() {
-    if (m_serverPassword.isEmpty()) {
-        emit serverPasswordRequired();
-        return;
+    if (m_authOperation != 0 || m_secureReady || !m_secureMaster.isEmpty()) return;
+    if (m_serverPassword.isEmpty()) { emit serverPasswordRequired(); return; }
+    QByteArray password = m_serverPassword.toUtf8(); m_authOperation = 1;
+    m_authTask.start(reinterpret_cast<const uint8_t*>(password.constData()), password.size(), m_authSalt);
+    crypto_wipe(password.data(), password.size());
+}
+
+void SignalClient::pollAuthTask() {
+    AuthKdfTask::Result result;
+    if (!m_authTask.poll(result)) return;
+    const int operation = m_authOperation; m_authOperation = 0;
+    if (operation == 0 || !isConnected()) return;
+    LogManager::instance().logNormal(QString("[auth] KDF operation=%1 elapsedMs=%2 success=%3")
+        .arg(operation).arg(static_cast<qulonglong>(result.elapsedMs)).arg(result.success));
+    if (!result.success) { failAuthentication(AuthErrorCode::KdfFailed, QStringLiteral("Authentication KDF failed.")); return; }
+    if (operation == 2) {
+        m_pendingCreate.writeBytes(m_authSalt, AUTH_SALT_SIZE);
+        m_pendingCreate.writeBytes(result.hash, 32); m_pendingCreate.writeU16(m_pendingCreateMtu);
+        sendMsg(MSG_CREATE_ROOM, m_pendingCreate); m_pendingCreate = ByteBuffer(); return;
     }
-
-    QByteArray inter;
-    if (!PayloadCipher::computeIntermediate(m_serverPassword, &inter)) {
-        emit serverError(QStringLiteral("Authentication KDF failed."));
-        m_socket->abort();
-        return;
+    if (operation == 3) {
+        uint8_t response[32]; computeChallengeResponse(result.hash, m_roomChallenge, response);
+        ByteBuffer body; body.writeBytes(response, sizeof(response)); sendMsg(MSG_AUTH_RESPONSE, body);
+        crypto_wipe(response, sizeof(response)); crypto_wipe(m_roomChallenge, sizeof(m_roomChallenge)); return;
     }
-    QByteArray authHash = PayloadCipher::hashFromIntermediate(inter);
-    uint8_t shared[32];
-    uint8_t master[32];
-    crypto_x25519(shared, m_clientPrivKey, m_serverPubKey);
-    deriveSecureMaster(master, shared,
-                       reinterpret_cast<const uint8_t*>(authHash.constData()),
-                       m_clientNonce, m_serverNonce,
-                       m_clientPubKey, m_serverPubKey);
-    uint8_t proof[32];
-    computeClientAuthProof(proof, master,
-                           reinterpret_cast<const uint8_t*>(authHash.constData()));
-
-    m_secureMaster = QByteArray(reinterpret_cast<const char*>(master), 32);
-
-    ByteBuffer body;
-    body.writeBytes(proof, 32);
-    TcpMsgHeader hdr;
-    hdr.msgType = MSG_SERVER_AUTH;
-    hdr.length  = htons(static_cast<uint16_t>(body.size()));
+    uint8_t shared[32], master[32], proof[32];
+    crypto_x25519(shared, m_clientPrivKey, m_serverPubKey); crypto_wipe(m_clientPrivKey, sizeof(m_clientPrivKey));
+    if (!validX25519Shared(shared)) {
+        crypto_wipe(shared, sizeof(shared));
+        failAuthentication(AuthErrorCode::InvalidKey, QStringLiteral("Invalid X25519 server key.")); return;
+    }
+    deriveSecureMaster(master, shared, result.hash, m_clientNonce, m_serverNonce,
+                       m_clientPubKey, m_serverPubKey, m_authSalt);
+    computeClientAuthProof(proof, master, result.hash);
+    computeServerAuthProof(m_expectedServerProof, master, result.hash);
+    m_secureMaster = QByteArray(reinterpret_cast<const char*>(master), sizeof(master));
+    ByteBuffer body; body.writeBytes(proof, sizeof(proof));
+    TcpMsgHeader hdr; hdr.msgType = MSG_SERVER_AUTH; hdr.length = htons(static_cast<uint16_t>(body.size()));
     m_socket->write(reinterpret_cast<const char*>(&hdr), sizeof(hdr));
     m_socket->write(reinterpret_cast<const char*>(body.data()), body.size());
-
-    crypto_wipe(reinterpret_cast<uint8_t*>(inter.data()), inter.size());
-    crypto_wipe(reinterpret_cast<uint8_t*>(authHash.data()), authHash.size());
-    crypto_wipe(shared, sizeof(shared));
-    crypto_wipe(master, sizeof(master));
-    crypto_wipe(proof, sizeof(proof));
+    crypto_wipe(shared, sizeof(shared)); crypto_wipe(master, sizeof(master)); crypto_wipe(proof, sizeof(proof));
 }
 
 void SignalClient::sendMsg(uint8_t msgType, const ByteBuffer& body) {
@@ -442,6 +502,12 @@ void SignalClient::sendMsg(uint8_t msgType, const ByteBuffer& body) {
     if (body.size() > 0)
         plain.insert(plain.end(), body.data(), body.data() + body.size());
     std::vector<uint8_t> enc = m_secureCipher.encrypt(plain.data(), plain.size());
+    if (enc.empty()) {
+        QPointer<SignalClient> guard(this);
+        emit serverError(QStringLiteral("Secure counter exhausted; reconnect required."));
+        if (guard.isNull()) return;
+        m_socket->abort(); resetSecureState(); return;
+    }
     if (enc.size() > MAX_TCP_MSG_PAYLOAD) {
         LogManager::instance().logError(
             QStringLiteral("[signal] Encrypted payload exceeds protocol limit"));
@@ -487,29 +553,24 @@ bool SignalClient::processMessage(uint8_t msgType,
                                   const uint8_t* payload, size_t len)
 {
     try {
+        const bool allowedPlainHandshake = !m_secureReady &&
+            (msgType == MSG_ERROR ||
+             (msgType == MSG_SERVER_HELLO && !m_serverAuthRequired && m_authOperation == 0 && m_secureMaster.isEmpty()) ||
+             (msgType == MSG_SERVER_AUTH_OK && m_serverAuthRequired && m_authOperation == 0 && m_secureMaster.size() == SECURE_KEY_SIZE));
+        if ((!m_secureReady && !allowedPlainHandshake) ||
+            (m_secureReady && msgType != MSG_ENCRYPTED)) {
+            failAuthentication(AuthErrorCode::InvalidServerProof, QStringLiteral("Unexpected signaling message before authentication / handshake order violation.")); return false;
+        }
+
         MessageValidationResult validation =
             validateServerSignalPayload(msgType, payload, len);
         if (validation.status == MessageValidationStatus::Malformed) {
-            if (validation.error == MessageValidationError::InvalidVersion) {
-                uint16_t receivedVersion = 0;
-                if (msgType == MSG_SERVER_HELLO && len >= 2) {
-                    receivedVersion = static_cast<uint16_t>(
-                        (static_cast<uint16_t>(payload[0]) << 8) |
-                         static_cast<uint16_t>(payload[1]));
-                } else if (msgType == MSG_LOGIN_RESP && len >= 6) {
-                    receivedVersion = static_cast<uint16_t>(
-                        (static_cast<uint16_t>(payload[4]) << 8) |
-                         static_cast<uint16_t>(payload[5]));
-                }
-                QPointer<SignalClient> guard(this);
-                emit serverError(UiStrings::text("error.protocolMismatch")
-                                 .arg(PROTOCOL_VERSION)
-                                 .arg(receivedVersion));
-                if (guard.isNull()) return false;
+            if (!m_secureReady || validation.error == MessageValidationError::InvalidVersion) {
+                const AuthErrorCode code = validation.error == MessageValidationError::InvalidVersion || msgType == MSG_ERROR
+                    ? AuthErrorCode::VersionMismatch : AuthErrorCode::InvalidServerProof;
+                failAuthentication(code, QStringLiteral("Invalid pre-auth protocol response; this client requires protocol v9. Upgrade GUI/CLI and server together.")); return false;
             }
-            handleMalformedFrame(msgType, len,
-                                 messageValidationErrorName(validation.error),
-                                 validation.offset);
+            handleMalformedFrame(msgType, len, messageValidationErrorName(validation.error), validation.offset);
             return false;
         }
         if (validation.status == MessageValidationStatus::UnknownType) {
@@ -529,6 +590,9 @@ bool SignalClient::processMessage(uint8_t msgType,
                 return false;
             }
             msgType = plain[0];
+            if (msgType == MSG_SERVER_HELLO || msgType == MSG_SERVER_AUTH_OK || msgType == MSG_ENCRYPTED) {
+                failAuthentication(AuthErrorCode::InvalidServerProof, QStringLiteral("Unexpected signaling message before authentication / handshake order violation.")); return false;
+            }
             payload = plain.size() > 1 ? plain.data() + 1 : nullptr;
             len = plain.size() > 1 ? plain.size() - 1 : 0;
             validation = validateServerSignalPayload(msgType, payload, len);
@@ -594,6 +658,11 @@ bool SignalClient::processMessage(uint8_t msgType,
                 m_socket->abort();
                 return false;
             }
+            const uint8_t profile = bb.readU8();
+            if (profile != AUTH_KDF_PROFILE) {
+                failAuthentication(AuthErrorCode::UnsupportedKdf, QStringLiteral("Unsupported authentication KDF profile.")); return false;
+            }
+            bb.readBytes(m_authSalt, AUTH_SALT_SIZE);
             bb.readBytes(m_serverNonce, 16);
             bb.readBytes(m_serverPubKey, 32);
             if (m_serverPassword.isEmpty())
@@ -616,27 +685,16 @@ bool SignalClient::processMessage(uint8_t msgType,
             QByteArray serverProof(32, '\0');
             bb.readBytes(serverProof.data(), 32);
 
-            QByteArray inter;
-            if (!PayloadCipher::computeIntermediate(m_serverPassword, &inter)) {
-                emit serverError(QStringLiteral("Authentication KDF failed."));
-                m_socket->abort();
-                return false;
-            }
-            QByteArray authHash = PayloadCipher::hashFromIntermediate(inter);
-            uint8_t expected[32];
-            computeServerAuthProof(
-                expected,
-                reinterpret_cast<const uint8_t*>(m_secureMaster.constData()),
-                reinterpret_cast<const uint8_t*>(authHash.constData()));
-            const bool proofValid =
-                crypto_verify32(expected,
-                    reinterpret_cast<const uint8_t*>(serverProof.constData())) == 0;
-            crypto_wipe(expected, sizeof(expected));
-            crypto_wipe(reinterpret_cast<uint8_t*>(inter.data()), inter.size());
-            crypto_wipe(reinterpret_cast<uint8_t*>(authHash.data()), authHash.size());
+            const bool proofValid = crypto_verify32(m_expectedServerProof,
+                reinterpret_cast<const uint8_t*>(serverProof.constData())) == 0 &&
+                sessionId == deriveSessionId(reinterpret_cast<const uint8_t*>(m_secureMaster.constData()));
+            crypto_wipe(m_expectedServerProof, sizeof(m_expectedServerProof));
+            crypto_wipe(serverProof.data(), serverProof.size());
 
             if (!proofValid) {
                 QPointer<SignalClient> guard(this);
+                emit fatalAuthError(static_cast<uint16_t>(AuthErrorCode::InvalidServerProof), UiStrings::text("error.serverProofFailed"));
+                if (guard.isNull()) return false;
                 emit serverError(UiStrings::text("error.serverProofFailed"));
                 if (guard.isNull()) return false;
                 handleMalformedFrame(msgType, len, "invalid-server-proof", 0);
@@ -648,6 +706,8 @@ bool SignalClient::processMessage(uint8_t msgType,
                 reinterpret_cast<const uint8_t*>(m_secureMaster.constData()),
                 true, "signal");
             m_secureReady = true;
+            LogManager::instance().logNormal(QString("[auth] Server authenticated protocol=%1 elapsedMs=%2")
+                .arg(PROTOCOL_VERSION).arg(currentTimeMs() - m_authStartedMs));
             m_pingTimer->start(KEEPALIVE_INTERVAL_MS);
             QPointer<SignalClient> guard(this);
             emit secureSessionEstablished(m_secureSessionId, m_secureMaster);
@@ -676,6 +736,7 @@ bool SignalClient::processMessage(uint8_t msgType,
             return true;
         }
         case MSG_ROOM_CREATED: {
+            m_roomOperationPending = false;
             const uint32_t roomId = bb.readU32();
             const uint32_t vip = bb.readU32();
             const RoomTrafficPolicy tcpPolicy =
@@ -691,6 +752,8 @@ bool SignalClient::processMessage(uint8_t msgType,
             return true;
         }
         case MSG_JOIN_RESP: {
+            m_roomOperationPending = false;
+            m_joinPending = false;
             const uint32_t roomId = bb.readU32();
             const uint32_t vip = bb.readU32();
             const RoomTrafficPolicy tcpPolicy =
@@ -711,10 +774,10 @@ bool SignalClient::processMessage(uint8_t msgType,
             }
             QByteArray leaseToken(RECONNECT_TOKEN_SIZE, '\0');
             bb.readBytes(leaseToken.data(), RECONNECT_TOKEN_SIZE);
-            if (!m_pendingAuthHash.isEmpty())
-                crypto_wipe(reinterpret_cast<uint8_t*>(m_pendingAuthHash.data()),
-                            static_cast<size_t>(m_pendingAuthHash.size()));
-            m_pendingAuthHash.clear();
+            if (!m_pendingRoomPassword.isEmpty())
+                crypto_wipe(reinterpret_cast<uint8_t*>(m_pendingRoomPassword.data()),
+                            static_cast<size_t>(m_pendingRoomPassword.size()));
+            m_pendingRoomPassword.clear();
             emit joinResponse(roomId, vip, tcpPolicy, udpPolicy, mtu,
                               passwordProtected, members, leaseToken);
             return true;
@@ -842,37 +905,32 @@ bool SignalClient::processMessage(uint8_t msgType,
             }
             return true;
 
-        case MSG_AUTH_CHALLENGE:
-            if (m_pendingAuthHash.size() == CIPHER_KEY_SIZE) {
-                QByteArray challenge(CIPHER_CHALLENGE_SIZE, '\0');
-                bb.readBytes(challenge.data(), CIPHER_CHALLENGE_SIZE);
-                QByteArray response = PayloadCipher::challengeResponse(
-                    m_pendingAuthHash, challenge);
-                ByteBuffer responseBody;
-                responseBody.writeBytes(response.constData(), response.size());
-                sendMsg(MSG_AUTH_RESPONSE, responseBody);
-                crypto_wipe(reinterpret_cast<uint8_t*>(challenge.data()),
-                            static_cast<size_t>(challenge.size()));
-                crypto_wipe(reinterpret_cast<uint8_t*>(response.data()),
-                            static_cast<size_t>(response.size()));
-                crypto_wipe(reinterpret_cast<uint8_t*>(m_pendingAuthHash.data()),
-                            static_cast<size_t>(m_pendingAuthHash.size()));
-                m_pendingAuthHash.clear();
-            } else {
-                m_pendingAuthHash.clear();
-                LogManager::instance().logError(
-                    QString("[signal] Unexpected auth challenge type=0x%1 len=%2")
-                        .arg(msgType, 2, 16, QLatin1Char('0'))
-                        .arg(static_cast<qulonglong>(len)));
+        case MSG_AUTH_CHALLENGE: {
+            const uint8_t profile = bb.readU8();
+            if (profile != AUTH_KDF_PROFILE) {
+                failAuthentication(AuthErrorCode::UnsupportedKdf, QStringLiteral("Unsupported room KDF profile.")); return false;
             }
-            return true;
+            if (!m_joinPending) { handleMalformedFrame(msgType, len, "unexpected-room-challenge", 0); return false; }
+            m_joinPending = false; bb.readBytes(m_authSalt, AUTH_SALT_SIZE);
+            bb.readBytes(m_roomChallenge, sizeof(m_roomChallenge)); m_authOperation = 3;
+            m_authTask.start(reinterpret_cast<const uint8_t*>(m_pendingRoomPassword.constData()), m_pendingRoomPassword.size(), m_authSalt);
+            if (!m_pendingRoomPassword.isEmpty()) crypto_wipe(m_pendingRoomPassword.data(), m_pendingRoomPassword.size());
+            m_pendingRoomPassword.clear(); return true;
+        }
 
         case MSG_ERROR: {
+            cancelRoomOperation();
+            const uint16_t code = bb.readU16();
             const QString message = QString::fromStdString(bb.readString());
-            if (!m_pendingAuthHash.isEmpty())
-                crypto_wipe(reinterpret_cast<uint8_t*>(m_pendingAuthHash.data()),
-                            static_cast<size_t>(m_pendingAuthHash.size()));
-            m_pendingAuthHash.clear();
+            if (isFatalAuthError(code)) { failAuthentication(static_cast<AuthErrorCode>(code), message); return false; }
+            if (code == static_cast<uint16_t>(AuthErrorCode::RoomPassword)) {
+                QPointer<SignalClient> guard(this); emit fatalAuthError(code, message);
+                if (guard.isNull()) return false;
+            }
+            if (!m_pendingRoomPassword.isEmpty())
+                crypto_wipe(reinterpret_cast<uint8_t*>(m_pendingRoomPassword.data()),
+                            static_cast<size_t>(m_pendingRoomPassword.size()));
+            m_pendingRoomPassword.clear();
             emit serverError(message);
             return true;
         }
