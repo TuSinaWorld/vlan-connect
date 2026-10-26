@@ -129,6 +129,7 @@ curl -fsSL https://raw.githubusercontent.com/TuSinaWorld/vlan-connect/main/serve
 - 新版二进制在切换服务前执行有 5 秒上限的 `--version` 校验，必须匹配源码的软件版本、协议版本和构建提交。正式源码归档带有 `SOURCE-COMMIT.txt`；在线源码使用克隆 tag 的提交。显式旧 tag 仍支持回滚，旧源码没有版本查询时会显示警告。
 - 二进制安装到 `/opt/vlan-server/releases/<tag>/`，通过 `/opt/vlan-server/current` 和 `/usr/local/bin/vlan-server` 软链接原子切换。
 - 更新前会临时快照当前二进制链接、systemd unit、环境文件、密码、文档和版本状态。
+- 首次安装未发现旧服务时只显示普通提示；无法读取 systemd 状态会明确报错并在切换服务前停止。
 - 新服务无法在 10 秒内进入 active 时，会恢复全部快照并重新启动旧版本。
 - 普通在线自动更新拒绝降级；显式 `--version` 或主动提供的本地旧版本源码包可以选择旧版本，并会显示警告。
 - 同一 tag 已安装、服务已启用且运行正常时不会重复编译；文件缺失或服务异常时会执行修复安装。

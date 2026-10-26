@@ -309,7 +309,13 @@ VERSION_FILE="$STATE_DIR/installed-version"
 TARGET_VERSION="v1.2.3"
 ROLLBACK_DIR="$tmp_dir/full-rollback-snapshot"
 service_events="$tmp_dir/systemctl-events"
-systemctl() { printf '%s\n' "$*" >> "$service_events"; return 0; }
+systemctl() {
+    printf '%s\n' "$*" >> "$service_events"
+    if [[ "$1" == "show" ]]; then
+        printf 'LoadState=loaded\nActiveState=active\nUnitFileState=enabled\n'
+    fi
+    return 0
+}
 install -d "$RELEASES_DIR/$TARGET_VERSION" "$(dirname "$BIN_PATH")" \
     "$(dirname "$SERVICE_UNIT")" "$(dirname "$DOC_PATH")" "$STATE_DIR"
 printf 'old-binary\n' > "$RELEASES_DIR/$TARGET_VERSION/vlan-server"
