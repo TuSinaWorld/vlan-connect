@@ -242,4 +242,7 @@ if(NOT WIN32)
     add_test(NAME server_install_script_tests
         COMMAND "${BASH_EXECUTABLE}"
             "${VLAN_ROOT}/tests/server/install_script_tests.sh")
+    add_test(NAME server_install_entrypoint_tests
+        COMMAND "${BASH_EXECUTABLE}"
+            "${VLAN_ROOT}/tests/server/install_entrypoint_tests.sh")
 endif()

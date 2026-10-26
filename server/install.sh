@@ -1168,7 +1168,8 @@ main() {
     show_summary
 }
 
-if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+# Bash has no BASH_SOURCE entry when reading a piped script from stdin.
+if [[ "${BASH_SOURCE[0]:-$0}" == "$0" ]]; then
     trap cleanup EXIT
     trap 'exit 130' INT TERM
     main "$@"
