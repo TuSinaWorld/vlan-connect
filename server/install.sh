@@ -923,7 +923,43 @@ restore_path() {
     fi
 }
 
+snapshot_service_state() {
+    local properties key value load_state="" active_state="" unit_file_state=""
+    local unit_file_state_seen=0
+    PREVIOUS_SERVICE_ENABLED=0
+    PREVIOUS_SERVICE_ACTIVE=0
+    # Unlike is-enabled, show reports a missing unit as structured state without
+    # printing an alarming error during a normal first installation.
+    properties="$(systemctl show --no-pager --all \
+        --property=LoadState --property=ActiveState --property=UnitFileState \
+        "$SERVICE_NAME")" || die "Cannot inspect the previous service state; deployment has not started"
+    while IFS='=' read -r key value; do
+        case "$key" in
+        LoadState) load_state="$value" ;;
+        ActiveState) active_state="$value" ;;
+        UnitFileState) unit_file_state="$value"; unit_file_state_seen=1 ;;
+        esac
+    done <<< "$properties"
+    [[ -n "$load_state" && -n "$active_state" && "$unit_file_state_seen" == 1 ]] ||
+        die "Incomplete systemd service state; deployment has not started"
+    case "$unit_file_state" in
+    enabled|enabled-runtime|alias|static|indirect|generated|transient)
+        PREVIOUS_SERVICE_ENABLED=1 ;;
+    disabled|linked|linked-runtime|masked|masked-runtime|bad|not-found|"") ;;
+    *) die "Unrecognized service enablement state '$unit_file_state'; deployment has not started" ;;
+    esac
+    case "$active_state" in
+    active|reloading|refreshing) PREVIOUS_SERVICE_ACTIVE=1 ;;
+    esac
+    if [[ "$load_state" == "not-found" && "$active_state" == "inactive" ]]; then
+        log "No previous VLan service found; a new service will be installed."
+    else
+        log "Existing VLan service: load=$load_state, state=$active_state, autostart=${unit_file_state:-not-enabled}; saving state for rollback."
+    fi
+}
+
 snapshot_deployment() {
+    snapshot_service_state
     install -d -m 0700 "$ROLLBACK_DIR"
     snapshot_path current "$CURRENT_LINK"
     snapshot_path binary "$BIN_PATH"
@@ -933,12 +969,6 @@ snapshot_deployment() {
     snapshot_path doc "$DOC_PATH"
     snapshot_path version "$VERSION_FILE"
     snapshot_path release "$RELEASES_DIR/$TARGET_VERSION"
-    if systemctl is-enabled --quiet "$SERVICE_NAME"; then
-        PREVIOUS_SERVICE_ENABLED=1
-    fi
-    if systemctl is-active --quiet "$SERVICE_NAME"; then
-        PREVIOUS_SERVICE_ACTIVE=1
-    fi
 }
 
 write_environment_file() {
