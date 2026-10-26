@@ -19,6 +19,7 @@ TunAdapter::TunAdapter(WintunApi* api, QObject* parent)
       m_apiLoaded(false),
       m_adapter(nullptr), m_session(nullptr),
       m_readEvent(nullptr), m_running(false), m_acceptIo(false),
+      m_adapterLuid(0),
       m_ip(0), m_mask(0)
 {}
 
@@ -75,6 +76,7 @@ bool TunAdapter::configureIP(uint32_t ip, uint32_t mask, int mtu) {
     m_networkState.alias = m_adapterName.toStdWString();
     NET_LUID luid = {};
     if (m_api && m_adapter && m_api->getAdapterLuid(m_adapter, &luid)) {
+        m_adapterLuid = luid.Value;
         wchar_t alias[IF_MAX_STRING_SIZE + 1] = {};
         const DWORD result = ConvertInterfaceLuidToAlias(&luid, alias, IF_MAX_STRING_SIZE + 1);
         if (result != NO_ERROR) {
@@ -110,6 +112,24 @@ bool TunAdapter::checkRoute(uint32_t destination, QString* error) const {
     return ok;
 }
 
+void TunAdapter::beginReadiness() {
+    WindowsReadinessConfig config;
+    config.luid = m_session && m_running.load() ? m_adapterLuid : 0;
+    config.alias = m_networkState.alias;
+    config.ip = m_ip; config.mask = m_mask;
+    m_readiness.begin(&m_readinessBackend, config, [](const std::string& message) {
+        LogManager::instance().logNormal(QString::fromUtf8(message.data(), static_cast<int>(message.size())));
+    });
+}
+
+WindowsReadinessResult TunAdapter::pollReadiness() {
+    return m_readiness.poll();
+}
+
+void TunAdapter::cancelReadiness() {
+    m_readiness.cancel();
+}
+
 bool TunAdapter::startSession() {
     QMutexLocker lock(&m_writeMutex);
     if (!m_api || !m_adapter || m_session || isRunning()) {
@@ -137,6 +157,7 @@ bool TunAdapter::startSession() {
 }
 
 void TunAdapter::shutdown() {
+    cancelReadiness();
     m_acceptIo = false;
     m_running = false;
     HANDLE readEvent = m_readEvent;

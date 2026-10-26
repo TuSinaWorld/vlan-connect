@@ -8,6 +8,7 @@
 #include <atomic>
 #include "wintun_api.h"
 #include "windows_network_config.h"
+#include "windows_network_readiness.h"
 
 namespace VLan {
 
@@ -30,6 +31,9 @@ public:
     bool initialize(const QString& adapterName = QStringLiteral("VLan"));
     bool configureIP(uint32_t ip, uint32_t mask, int mtu = 0);
     bool checkRoute(uint32_t destination, QString* error) const;
+    void beginReadiness();
+    WindowsReadinessResult pollReadiness();
+    void cancelReadiness();
     QString configurationError() const { return m_configurationError; }
     bool startSession();
     void shutdown();
@@ -57,6 +61,9 @@ private:
     std::atomic<bool>    m_running;
     std::atomic<bool>    m_acceptIo;
     WindowsNetworkState  m_networkState;
+    uint64_t             m_adapterLuid;
+    NativeWindowsReadinessBackend m_readinessBackend;
+    WindowsNetworkReadiness m_readiness;
     QMutex               m_writeMutex;
 
     uint32_t m_ip;

@@ -6,9 +6,11 @@
 #include <QHostAddress>
 #include <QHostInfo>
 #include <QMap>
+#include <QSet>
 #include <QTimer>
 #include "protocol.h"
 #include "relay_probe_watchdog.h"
+#include "windows_network_readiness.h"
 
 namespace VLan {
 
@@ -50,6 +52,7 @@ public:
     void refreshRoomList();
 
     bool inRoom() const { return m_roomReady; }
+    bool roomOperationPending() const { return m_roomOperationPending; }
     uint32_t currentRoomId() const { return m_currentRoomId; }
     uint32_t myVirtualIP()   const { return m_myVirtualIP; }
     uint32_t myPeerId()      const;
@@ -66,6 +69,7 @@ signals:
     void roomCreated(uint32_t roomId);
     void roomJoined(uint32_t roomId);
     void roomLeft();
+    void roomOperationPendingChanged(bool pending);
     void roomListUpdated(QList<VLan::RoomListItem> rooms);
     void peerConnected(uint32_t peerId, uint32_t virtualIP, QString name);
     void peerDisconnected(uint32_t peerId);
@@ -114,14 +118,13 @@ private slots:
     void onDataChannelDisconnected();
     void onDataChannelRelayReceived(uint32_t srcPeerId, VLan::TrafficClass cls, QByteArray data);
 
-private:
-    void resolveAndConnect();
-    void proceedWithConnection();
+protected:
     enum class TunSetupStage {
         None,
         Initialize,
         Address,
         Session,
+        Readiness,
         DataPlane
     };
     struct TunSetupResult {
@@ -133,7 +136,21 @@ private:
                        const QString& text = QString())
             : success(ok), stage(failedStage), error(text) {}
     };
-    TunSetupResult setupTun();
+    // Lifecycle seams keep readiness orchestration testable without a real NIC.
+    virtual TunSetupResult setupTun();
+    virtual WindowsReadinessResult pollTunReadiness();
+    virtual TunSetupResult startTunDataPlane();
+    virtual void cancelTunReadiness();
+
+private:
+    friend class RoomReadinessTests;
+    void resolveAndConnect();
+    void proceedWithConnection();
+    void beginRoomReadiness(bool created, const QList<PeerInfo>& members);
+    void pollRoomReadiness(quint64 generation, quint64 connectionGeneration);
+    void completeRoomReadiness();
+    void setRoomOperationPending(bool pending);
+    void bindTunAdapterSignals(TunAdapter* adapter);
     void teardownTun();
     void rollbackRoomAfterTunFailure(const TunSetupResult& result);
     void resetRoomRuntimeState(bool clearSavedRoom);
@@ -194,6 +211,14 @@ private:
     QTimer*       m_latencyTimer;
     QTimer*       m_trafficTimer;
     QTimer*       m_roomListTimer;
+    QTimer*       m_readinessTimer;
+    quint64       m_readinessGeneration;
+    bool          m_roomReadinessPending;
+    bool          m_roomOperationPending;
+    bool          m_pendingRoomCreated;
+    QString       m_pendingTunError;
+    QMap<uint32_t, PeerInfo> m_pendingMembers;
+    QSet<uint32_t> m_pendingRelayReady;
     quint64       m_lastUploadBytes;
     quint64       m_lastDownloadBytes;
 

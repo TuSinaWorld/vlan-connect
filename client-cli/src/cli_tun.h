@@ -6,6 +6,7 @@
 #include <thread>
 #include <mutex>
 #include <functional>
+#include "windows_network_readiness.h"
 #ifdef _WIN32
 #include "windows_network_config.h"
 #endif
@@ -53,6 +54,9 @@ public:
     bool initialize(const std::string& adapterName = "VLan");
     bool configureIP(uint32_t ip, uint32_t mask, int mtu = 0);
     bool checkRoute(uint32_t destination, std::string* error) const;
+    void beginReadiness();
+    WindowsReadinessResult pollReadiness();
+    void cancelReadiness();
     std::string configurationError() const { return m_configurationError; }
     bool startSession();
     void shutdown();
@@ -110,6 +114,9 @@ private:
     FnSendPacket           m_fnSendPacket;
 
     WindowsNetworkState m_networkState;
+    uint64_t m_adapterLuid;
+    NativeWindowsReadinessBackend m_readinessBackend;
+    WindowsNetworkReadiness m_readiness;
 #else
     int m_tunFd;
     std::string m_interfaceName;

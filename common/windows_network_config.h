@@ -31,9 +31,20 @@ struct WindowsCommandResult {
     unsigned long elapsedMs;
     bool timedOut;
     bool absent;
+    std::string outputEncoding;
+    unsigned int outputCodePage;
+    unsigned int oemCodePage;
+    unsigned int ansiCodePage;
+    unsigned int parentConsoleCodePage;
+    size_t outputCapturedBytes;
+    uint64_t outputObservedBytes;
+    bool outputTruncated;
     std::string output;
     WindowsCommandResult() : exitCode(0), systemError(0), elapsedMs(0),
-                             timedOut(false), absent(false) {}
+        timedOut(false), absent(false), outputEncoding("utf-8"),
+        outputCodePage(65001), oemCodePage(0), ansiCodePage(0),
+        parentConsoleCodePage(0), outputCapturedBytes(0),
+        outputObservedBytes(0), outputTruncated(false) {}
     bool ok() const { return !timedOut && !systemError && exitCode == 0; }
 };
 
@@ -99,8 +110,208 @@ inline std::wstring windowsWide(const std::string& value) {
 
 typedef std::function<void(const std::string&)> WindowsNetworkLogger;
 
+static const size_t WINDOWS_COMMAND_OUTPUT_LIMIT = 8192;
+static const size_t WINDOWS_COMMAND_OUTPUT_LOOKAHEAD = 4;
+
+inline void captureWindowsCommandOutput(const char* bytes, size_t length,
+    std::string* captured, uint64_t* observedBytes) {
+    if (!captured || !observedBytes || (!bytes && length)) return;
+    *observedBytes += length;
+    const size_t limit = WINDOWS_COMMAND_OUTPUT_LIMIT + WINDOWS_COMMAND_OUTPUT_LOOKAHEAD;
+    if (captured->size() < limit && length)
+        captured->append(bytes, (std::min)(length, limit - captured->size()));
+}
+
+// Positive: a complete canonical UTF-8 sequence; zero: incomplete final
+// sequence; negative: invalid. Check available continuation bytes even when the
+// last sequence is incomplete, so truncation cannot conceal an invalid prefix.
+inline int windowsUtf8Sequence(const std::string& value, size_t offset) {
+    if (offset >= value.size()) return 0;
+    const unsigned char lead = static_cast<unsigned char>(value[offset]);
+    const int length = lead < 0x80 ? 1 : lead >= 0xc2 && lead <= 0xdf ? 2 :
+        lead >= 0xe0 && lead <= 0xef ? 3 : lead >= 0xf0 && lead <= 0xf4 ? 4 : -1;
+    if (length < 0) return -1;
+    for (int i = 1; i < length && offset + i < value.size(); ++i) {
+        const unsigned char next = static_cast<unsigned char>(value[offset + i]);
+        if (next < 0x80 || next > 0xbf) return -1;
+        if (i == 1 && ((lead == 0xe0 && next < 0xa0) ||
+            (lead == 0xed && next > 0x9f) || (lead == 0xf0 && next < 0x90) ||
+            (lead == 0xf4 && next > 0x8f))) return -1;
+    }
+    return value.size() - offset < static_cast<size_t>(length) ? 0 : length;
+}
+
+inline bool windowsValidateUtf8(const std::string& value, bool allowIncompleteTail,
+                                size_t* validBytes) {
+    size_t offset = 0;
+    while (offset < value.size()) {
+        const int length = windowsUtf8Sequence(value, offset);
+        if (length <= 0) {
+            if (validBytes) *validBytes = offset;
+            return length == 0 && allowIncompleteTail;
+        }
+        offset += static_cast<size_t>(length);
+    }
+    if (validBytes) *validBytes = offset;
+    return true;
+}
+
+inline size_t windowsUtf8BoundedLength(const std::string& value, size_t limit) {
+    size_t offset = 0;
+    while (offset < value.size() && offset < limit) {
+        const int length = windowsUtf8Sequence(value, offset);
+        if (length <= 0 || static_cast<size_t>(length) > limit - offset) break;
+        offset += static_cast<size_t>(length);
+    }
+    return offset;
+}
+
+inline std::string windowsEscapeOutput(const std::string& value, size_t limit,
+                                      bool* truncated) {
+    static const char hex[] = "0123456789abcdef";
+    std::string result;
+    size_t offset = 0;
+    for (; offset < value.size(); ++offset) {
+        const unsigned char byte = static_cast<unsigned char>(value[offset]);
+        const size_t needed = byte >= 32 && byte < 127 ? 1 : 4;
+        if (needed > limit - result.size()) break;
+        if (needed == 1) result += static_cast<char>(byte);
+        else {
+            result += "\\x"; result += hex[byte >> 4]; result += hex[byte & 15];
+        }
+    }
+    if (truncated) *truncated = offset < value.size();
+    return result;
+}
+
+inline void windowsAppendUtf8(std::string& output, uint32_t scalar) {
+    if (scalar < 0x80) output += static_cast<char>(scalar);
+    else if (scalar < 0x800) {
+        output += static_cast<char>(0xc0 | (scalar >> 6));
+        output += static_cast<char>(0x80 | (scalar & 63));
+    } else if (scalar < 0x10000) {
+        output += static_cast<char>(0xe0 | (scalar >> 12));
+        output += static_cast<char>(0x80 | ((scalar >> 6) & 63));
+        output += static_cast<char>(0x80 | (scalar & 63));
+    } else {
+        output += static_cast<char>(0xf0 | (scalar >> 18));
+        output += static_cast<char>(0x80 | ((scalar >> 12) & 63));
+        output += static_cast<char>(0x80 | ((scalar >> 6) & 63));
+        output += static_cast<char>(0x80 | (scalar & 63));
+    }
+}
+
+inline bool windowsDecodeUtf16(const std::string& bytes, bool bigEndian,
+                               bool allowIncompleteTail, std::string* output) {
+    output->clear();
+    size_t offset = 2; // caller has verified a UTF-16 BOM
+    while (offset + 1 < bytes.size()) {
+        const unsigned char a = static_cast<unsigned char>(bytes[offset]);
+        const unsigned char b = static_cast<unsigned char>(bytes[offset + 1]);
+        uint32_t scalar = bigEndian ? (a << 8) | b : a | (b << 8);
+        offset += 2;
+        if (scalar >= 0xd800 && scalar <= 0xdbff) {
+            if (offset + 1 >= bytes.size()) return allowIncompleteTail;
+            const unsigned char c = static_cast<unsigned char>(bytes[offset]);
+            const unsigned char d = static_cast<unsigned char>(bytes[offset + 1]);
+            const uint32_t low = bigEndian ? (c << 8) | d : c | (d << 8);
+            if (low < 0xdc00 || low > 0xdfff) return false;
+            scalar = 0x10000 + ((scalar - 0xd800) << 10) + low - 0xdc00;
+            offset += 2;
+        } else if (scalar >= 0xdc00 && scalar <= 0xdfff) return false;
+        windowsAppendUtf8(*output, scalar);
+    }
+    return offset == bytes.size() || allowIncompleteTail;
+}
+
+#ifdef _WIN32
+inline bool windowsDecodeCodePage(const std::string& bytes, unsigned int codePage,
+                                  bool allowIncompleteTail, std::string* output) {
+    if (!codePage || bytes.empty()) return false;
+    const size_t attempts = allowIncompleteTail ? (std::min)(size_t(3), bytes.size() - 1) : 0;
+    for (size_t trim = 0; trim <= attempts; ++trim) {
+        const int length = static_cast<int>(bytes.size() - trim);
+        const int count = MultiByteToWideChar(codePage, MB_ERR_INVALID_CHARS,
+            bytes.data(), length, nullptr, 0);
+        if (!count) continue;
+        std::wstring wide(count, L'\0');
+        if (!MultiByteToWideChar(codePage, MB_ERR_INVALID_CHARS, bytes.data(),
+                length, &wide[0], count)) return false;
+        *output = windowsUtf8(wide);
+        return true;
+    }
+    return false;
+}
+#endif
+
+// Encoding affects diagnostic text only. Never overwrite the process exit
+// status or Win32 error merely because its redirected text cannot be decoded.
+inline void decodeWindowsCommandOutput(const std::string& raw, uint64_t observedBytes,
+    WindowsCommandResult* result, unsigned int oemCodePage = 0,
+    unsigned int ansiCodePage = 0) {
+    if (!result) return;
+    const std::string bytes = raw.substr(0,
+        WINDOWS_COMMAND_OUTPUT_LIMIT + WINDOWS_COMMAND_OUTPUT_LOOKAHEAD);
+    result->outputCapturedBytes = bytes.size();
+    result->outputObservedBytes = observedBytes;
+    result->outputTruncated = result->outputTruncated || result->timedOut ||
+        observedBytes > WINDOWS_COMMAND_OUTPUT_LIMIT || raw.size() > bytes.size();
+    const bool incompleteTail = result->outputTruncated;
+#ifdef _WIN32
+    if (!oemCodePage) oemCodePage = GetOEMCP();
+    if (!ansiCodePage) ansiCodePage = GetACP();
+#endif
+    result->oemCodePage = oemCodePage;
+    result->ansiCodePage = ansiCodePage;
+    result->output.clear(); result->outputCodePage = 0;
+    result->outputEncoding = "none";
+    if (bytes.empty()) return;
+    const unsigned char first = static_cast<unsigned char>(bytes[0]);
+    const unsigned char second = bytes.size() > 1 ? static_cast<unsigned char>(bytes[1]) : 0;
+    const bool utf16le = first == 0xff && second == 0xfe;
+    const bool utf16be = first == 0xfe && second == 0xff;
+    if (utf16le || utf16be) {
+        if (windowsDecodeUtf16(bytes, utf16be, incompleteTail, &result->output)) {
+            result->outputEncoding = utf16be ? "utf-16be-bom" : "utf-16le-bom";
+            result->outputCodePage = utf16be ? 1201 : 1200;
+            return;
+        }
+    } else {
+        const bool bom = bytes.size() >= 3 && first == 0xef && second == 0xbb &&
+            static_cast<unsigned char>(bytes[2]) == 0xbf;
+        const std::string utf8 = bom ? bytes.substr(3) : bytes;
+        size_t validBytes = 0;
+        if (windowsValidateUtf8(utf8, incompleteTail, &validBytes)) {
+            result->output = utf8.substr(0, validBytes);
+            result->outputEncoding = bom ? "utf-8-bom" : "utf-8";
+            result->outputCodePage = 65001;
+            return;
+        }
+#ifdef _WIN32
+        // Legacy netsh contexts may still emit OEM/ANSI bytes. This fallback is
+        // explicit in the log; an arbitrary byte stream has no unique encoding.
+        if (!bom && windowsDecodeCodePage(bytes, oemCodePage, incompleteTail, &result->output)) {
+            result->outputEncoding = "oem"; result->outputCodePage = oemCodePage; return;
+        }
+        if (!bom && ansiCodePage != oemCodePage &&
+            windowsDecodeCodePage(bytes, ansiCodePage, incompleteTail, &result->output)) {
+            result->outputEncoding = "acp"; result->outputCodePage = ansiCodePage; return;
+        }
+#endif
+    }
+    bool escapedTruncated = false;
+    result->output = windowsEscapeOutput(bytes, WINDOWS_COMMAND_OUTPUT_LIMIT, &escapedTruncated);
+    result->outputTruncated = result->outputTruncated || escapedTruncated;
+    result->outputEncoding = "escaped-bytes"; result->outputCodePage = 0;
+}
+
 inline std::string windowsLogValue(std::string value) {
-    if (value.size() > 2048) value = value.substr(0, 2048) + " [truncated]";
+    size_t validBytes = 0;
+    bool truncated = value.size() > 2048;
+    if (!windowsValidateUtf8(value, false, &validBytes))
+        value = windowsEscapeOutput(value, 2048, &truncated);
+    else value.resize(windowsUtf8BoundedLength(value, 2048));
+    if (truncated) value += " [truncated]";
     for (size_t i = 0; i < value.size(); ++i) {
         if (value[i] == '\r' || value[i] == '\n' || value[i] == '\t') value[i] = ' ';
         else if (value[i] == '"') value[i] = '\'';
@@ -120,7 +331,13 @@ inline void logWindowsNetwork(const WindowsNetworkLogger& log,
         << attempt << " result=" << (result.absent ? "absent" :
             result.timedOut ? "timeout" : result.ok() ? "success" : "failed")
         << " exit=" << result.exitCode << " system_error=" << result.systemError
-        << " elapsed_ms=" << result.elapsedMs << " output=\""
+        << " elapsed_ms=" << result.elapsedMs
+        << " encoding=" << result.outputEncoding << " codepage=" << result.outputCodePage
+        << " oem_cp=" << result.oemCodePage << " acp=" << result.ansiCodePage
+        << " parent_console_cp=" << result.parentConsoleCodePage
+        << " captured_bytes=" << result.outputCapturedBytes
+        << " observed_bytes=" << result.outputObservedBytes
+        << " truncated=" << ((result.outputTruncated || result.output.size() > 2048) ? "yes" : "no") << " output=\""
         << windowsLogValue(result.output) << '"';
     log(out.str());
 }
@@ -260,6 +477,8 @@ public:
                                  unsigned long timeoutMs) override {
         WindowsCommandResult result;
         const ULONGLONG started = GetTickCount64();
+        result.parentConsoleCodePage = GetConsoleOutputCP();
+        std::string rawOutput;
         wchar_t systemPath[MAX_PATH] = {};
         if (!GetSystemDirectoryW(systemPath, MAX_PATH)) {
             result.systemError = GetLastError(); return result;
@@ -301,10 +520,21 @@ public:
                 while (drained++ < 16 && PeekNamedPipe(readPipe, nullptr, 0, nullptr, &available, nullptr) && available) {
                     char bytes[1024]; DWORD count = 0;
                     if (!ReadFile(readPipe, bytes, (std::min)(available, DWORD(sizeof(bytes))), &count, nullptr)) break;
-                    if (result.output.size() < 8192)
-                        result.output.append(bytes, (std::min)(size_t(count), 8192 - result.output.size()));
+                    if (!count) break;
+                    captureWindowsCommandOutput(bytes, count, &rawOutput, &result.outputObservedBytes);
                 }
-                if (finished) break;
+                if (finished) {
+                    // Continue draining a terminated child's buffered output.
+                    // A descendant can retain the handle, so this final drain
+                    // is bounded rather than waiting indefinitely for EOF.
+                    DWORD remaining = 0;
+                    if (PeekNamedPipe(readPipe, nullptr, 0, nullptr, &remaining, nullptr) && remaining) {
+                        if (GetTickCount64() - started < static_cast<ULONGLONG>(timeoutMs) + 1000)
+                            continue;
+                        result.outputTruncated = true;
+                    }
+                    break;
+                }
                 DWORD wait = WaitForSingleObject(process.hProcess, 20);
                 if (wait == WAIT_OBJECT_0) { finished = true; continue; }
                 if (wait == WAIT_FAILED) {
@@ -320,21 +550,15 @@ public:
                     finished = true;
                 }
             }
-            GetExitCodeProcess(process.hProcess, &result.exitCode);
+            if (!GetExitCodeProcess(process.hProcess, &result.exitCode) && !result.systemError)
+                result.systemError = GetLastError();
             CloseHandle(process.hThread); CloseHandle(process.hProcess);
         }
         CloseHandle(readPipe);
         result.elapsedMs = static_cast<DWORD>(GetTickCount64() - started);
-        // netsh emits OEM text when redirected. Keep diagnostics readable in
-        // UTF-8 Qt and CLI log files on non-English Windows installations.
-        if (!result.output.empty()) {
-            int count = MultiByteToWideChar(CP_OEMCP, 0, result.output.data(),
-                static_cast<int>(result.output.size()), nullptr, 0);
-            std::wstring wide(count, L'\0');
-            if (count) MultiByteToWideChar(CP_OEMCP, 0, result.output.data(),
-                static_cast<int>(result.output.size()), &wide[0], count);
-            result.output = windowsUtf8(wide);
-        }
+        // Redirected netsh output varies by context/Windows configuration.
+        // Preserve UTF-8 first; never reinterpret it unconditionally as OEM.
+        decodeWindowsCommandOutput(rawOutput, result.outputObservedBytes, &result);
         return result;
     }
 

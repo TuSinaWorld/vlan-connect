@@ -15,7 +15,7 @@ CliTunAdapter::CliTunAdapter()
       m_fnStartSession(nullptr), m_fnEndSession(nullptr),
       m_fnGetReadWaitEvent(nullptr), m_fnReceivePacket(nullptr),
       m_fnReleaseReceivePacket(nullptr), m_fnAllocateSendPacket(nullptr),
-      m_fnSendPacket(nullptr)
+      m_fnSendPacket(nullptr), m_adapterLuid(0)
 {}
 
 CliTunAdapter::~CliTunAdapter() {
@@ -76,6 +76,7 @@ bool CliTunAdapter::initialize(const std::string& adapterName) {
         return false;
     }
     getLuid(m_adapter, &luid);
+    m_adapterLuid = luid.Value;
     DWORD result = ConvertInterfaceLuidToAlias(&luid, alias, IF_MAX_STRING_SIZE + 1);
     if (result != NO_ERROR) {
         LOG_ERR("Cannot resolve virtual adapter alias (Windows %lu)", result);
@@ -95,6 +96,18 @@ bool CliTunAdapter::configureIP(uint32_t ip, uint32_t mask, int mtu) {
     if (!ok) LOG_ERR("Virtual adapter configuration failed: %s", m_configurationError.c_str());
     return ok;
 }
+
+void CliTunAdapter::beginReadiness() {
+    WindowsReadinessConfig config;
+    config.luid = m_session && m_running.load() ? m_adapterLuid : 0;
+    config.alias = m_networkState.alias;
+    config.ip = m_ip; config.mask = m_mask;
+    m_readiness.begin(&m_readinessBackend, config,
+        [](const std::string& message) { LOG_INFO("%s", message.c_str()); });
+}
+
+WindowsReadinessResult CliTunAdapter::pollReadiness() { return m_readiness.poll(); }
+void CliTunAdapter::cancelReadiness() { m_readiness.cancel(); }
 
 bool CliTunAdapter::checkRoute(uint32_t destination, std::string* error) const {
     std::string detail;
@@ -130,6 +143,7 @@ bool CliTunAdapter::startSession() {
 }
 
 void CliTunAdapter::shutdown() {
+    cancelReadiness();
     m_running = false;
     if (m_readEvent) SetEvent((HANDLE)m_readEvent);
     if (m_readThread.joinable()) m_readThread.join();

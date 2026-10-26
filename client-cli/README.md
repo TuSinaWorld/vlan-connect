@@ -1,6 +1,6 @@
 # VLan CLI 客户端
 
-`vlan-cli` 是 VLan 的命令行客户端，可连接服务端、创建/加入房间并查看连接状态。v0.3.1 仅支持协议 v9，必须与 GUI 和服务端一起升级，不能与 v8 混连。客户端只连接强制鉴权的服务端；收到 `authRequired=0` 时会拒绝连接。
+`vlan-cli` 是 VLan 的命令行客户端，可连接服务端、创建/加入房间并查看连接状态。v0.3.2 使用协议 v9，可连接现有 v0.3.1/v9 服务端，无需为本次 Windows 修复强制升级服务端。v8 与 v9 不能混连，从 v8 升级仍需同步更新服务端及所有客户端。客户端只连接强制鉴权的服务端；收到 `authRequired=0` 时会拒绝连接。
 
 相关文档：
 
@@ -67,6 +67,8 @@ join 1001 roompass
 TUN 初始化或运行期发生终止性错误时，CLI 会自动发送离房请求、清理租约和传输状态并回到大厅，同时保持服务端登录。临时 TUN 发送环满只计为丢包，不触发退房。
 
 Windows 默认将普通诊断写入当前用户的 `%LOCALAPPDATA%\VLan\logs\cli.log`，实际位置以启动日志为准，也可用 `--log-file` 覆盖。文件日志轮转后缀为 `.1`、`.2`。Linux 默认保留终端日志，可用 `--log-file` 显式启用文件日志。防火墙预清理、添加、重试和删除操作记录结果、错误码及耗时；密码、密钥、证明和数据包正文不写入普通日志。
+
+Windows 命令诊断统一为 UTF-8，优先保留有效 UTF-8，识别带 BOM 的 UTF-16，必要时按记录的 OEM/ANSI 码页回退。日志包含 `encoding`、`codepage`、`captured_bytes`、`observed_bytes` 和 `truncated`；超限时不会切断 UTF-8 字符。命令成功与否仍由退出码、Win32 错误和超时决定，不依赖本地化文本。
 
 Windows CLI 源码构建须在 x64 MSVC 2015 或更新的 Developer Command Prompt 中执行：
 

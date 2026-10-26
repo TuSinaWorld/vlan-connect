@@ -126,12 +126,56 @@ if(WIN32)
 endif()
 vlan_test_output(auth_v9_integration_tests)
 
+add_executable(cli_room_readiness_tests
+    cli/cli_room_readiness_tests.cpp
+    "${VLAN_ROOT}/client-cli/src/cli_app.cpp"
+    "${VLAN_ROOT}/client-cli/src/cli_net.cpp"
+    "${VLAN_ROOT}/client-cli/src/cli_peer.cpp"
+    "${VLAN_ROOT}/client-cli/src/cli_tunnel.cpp"
+    "${VLAN_ROOT}/client-cli/src/cli_fec.cpp"
+    "${VLAN_ROOT}/3rdparty/kcp/ikcp.c"
+    "${VLAN_ROOT}/3rdparty/cm256cc/cm256.cpp"
+    "${VLAN_ROOT}/3rdparty/cm256cc/gf256.cpp"
+    ${VLAN_MONOCYPHER})
+if(WIN32)
+    target_sources(cli_room_readiness_tests PRIVATE "${VLAN_ROOT}/client-cli/src/cli_tun_win.cpp")
+    target_compile_definitions(cli_room_readiness_tests PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+    target_link_libraries(cli_room_readiness_tests PRIVATE ws2_32 iphlpapi bcrypt ole32 oleaut32)
+else()
+    target_sources(cli_room_readiness_tests PRIVATE "${VLAN_ROOT}/client-cli/src/cli_tun_linux.cpp")
+endif()
+target_include_directories(cli_room_readiness_tests PRIVATE
+    ${VLAN_COMMON_INCLUDES} "${VLAN_ROOT}/client-cli/src"
+    "${VLAN_ROOT}/3rdparty/kcp" "${VLAN_ROOT}/3rdparty/cm256cc")
+target_compile_definitions(cli_room_readiness_tests PRIVATE cm256cc_STATIC)
+if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|amd64|AMD64|i[3-6]86)$")
+    target_compile_definitions(cli_room_readiness_tests PRIVATE USE_SSSE3)
+    if(NOT MSVC)
+        target_compile_options(cli_room_readiness_tests PRIVATE -mssse3)
+    endif()
+elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "^(aarch64|arm64|ARM64|armv7.*)$")
+    target_compile_definitions(cli_room_readiness_tests PRIVATE USE_NEON)
+endif()
+target_link_libraries(cli_room_readiness_tests PRIVATE Threads::Threads)
+vlan_test_output(cli_room_readiness_tests)
+add_test(NAME cli_room_readiness_tests COMMAND cli_room_readiness_tests)
+
 add_executable(windows_network_config_tests common/windows_network_config_tests.cpp)
 target_include_directories(windows_network_config_tests PRIVATE ${VLAN_COMMON_INCLUDES})
 if(WIN32)
     target_link_libraries(windows_network_config_tests PRIVATE ws2_32 iphlpapi ole32 oleaut32)
 endif()
 vlan_test_output(windows_network_config_tests)
+
+foreach(network_test windows_network_readiness_tests windows_command_encoding_tests)
+    add_executable(${network_test} common/${network_test}.cpp)
+    target_include_directories(${network_test} PRIVATE ${VLAN_COMMON_INCLUDES})
+    if(WIN32)
+        target_link_libraries(${network_test} PRIVATE ws2_32 iphlpapi ole32 oleaut32)
+    endif()
+    vlan_test_output(${network_test})
+    add_test(NAME ${network_test} COMMAND ${network_test})
+endforeach()
 
 add_executable(cli_log_tests cli/cli_log_tests.cpp)
 target_include_directories(cli_log_tests PRIVATE ${VLAN_COMMON_INCLUDES} "${VLAN_ROOT}/client-cli/src")
@@ -164,7 +208,42 @@ target_include_directories(data_plane_tests PRIVATE
 vlan_test_output(data_plane_tests)
 
 if(WIN32)
-    find_package(Qt5 COMPONENTS Core REQUIRED)
+    find_package(Qt5 COMPONENTS Core Network REQUIRED)
+    add_executable(room_readiness_tests
+        gui/room_readiness_tests.cpp
+        "${VLAN_ROOT}/client/src/network/room_manager.cpp"
+        "${VLAN_ROOT}/client/src/network/signal_client.cpp"
+        "${VLAN_ROOT}/client/src/network/data_channel.cpp"
+        "${VLAN_ROOT}/client/src/core/tun_adapter.cpp"
+        "${VLAN_ROOT}/client/src/core/tunnel_manager.cpp"
+        "${VLAN_ROOT}/client/src/core/peer_connection.cpp"
+        "${VLAN_ROOT}/client/src/core/kcp_tunnel.cpp"
+        "${VLAN_ROOT}/client/src/core/raw_udp_tunnel.cpp"
+        "${VLAN_ROOT}/client/src/core/fec_codec.cpp"
+        "${VLAN_ROOT}/client/src/ui/log_manager.cpp"
+        "${VLAN_ROOT}/client/src/ui/ui_strings.cpp"
+        "${VLAN_ROOT}/3rdparty/kcp/ikcp.c"
+        "${VLAN_ROOT}/3rdparty/cm256cc/cm256.cpp"
+        "${VLAN_ROOT}/3rdparty/cm256cc/gf256.cpp"
+        ${VLAN_MONOCYPHER})
+    target_include_directories(room_readiness_tests PRIVATE ${VLAN_COMMON_INCLUDES}
+        "${VLAN_ROOT}/3rdparty/wintun" "${VLAN_ROOT}/3rdparty/kcp"
+        "${VLAN_ROOT}/3rdparty/cm256cc")
+    target_compile_definitions(room_readiness_tests PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX cm256cc_STATIC USE_SSSE3)
+    target_link_libraries(room_readiness_tests PRIVATE Qt5::Core Qt5::Network
+        ws2_32 iphlpapi bcrypt ole32 oleaut32 Threads::Threads)
+    set_target_properties(room_readiness_tests PROPERTIES AUTOMOC ON)
+    vlan_test_output(room_readiness_tests)
+    add_test(NAME room_readiness_tests COMMAND room_readiness_tests)
+
+    add_executable(windows_owned_wintun_integration EXCLUDE_FROM_ALL
+        wintun/windows_owned_wintun_integration.cpp
+        "${VLAN_ROOT}/client-cli/src/cli_tun_win.cpp")
+    target_include_directories(windows_owned_wintun_integration PRIVATE
+        ${VLAN_COMMON_INCLUDES} "${VLAN_ROOT}/client-cli/src")
+    target_link_libraries(windows_owned_wintun_integration PRIVATE
+        ws2_32 iphlpapi ole32 oleaut32 advapi32 Threads::Threads)
+    vlan_test_output(windows_owned_wintun_integration)
     add_executable(wintun_lifecycle_tests
         wintun/wintun_lifecycle_tests.cpp
         "${VLAN_ROOT}/client/src/core/tun_adapter.cpp"

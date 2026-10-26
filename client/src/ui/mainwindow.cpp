@@ -269,6 +269,12 @@ MainWindow::MainWindow(QWidget* parent)
             this, &MainWindow::onRoomJoined);
     connect(m_roomMgr, &RoomManager::roomLeft,
             this, &MainWindow::onRoomLeft);
+    connect(m_roomMgr, &RoomManager::roomOperationPendingChanged,
+            this, [this](bool) {
+        setRoomControlsEnabled(m_roomMgr->inRoom());
+        refreshDashboardState();
+        updateTrayState();
+    });
     connect(m_roomMgr, &RoomManager::roomListUpdated,
             this, &MainWindow::onRoomListUpdated);
     connect(m_roomMgr, &RoomManager::statusMessage,
@@ -991,6 +997,7 @@ void MainWindow::initTray()
     connect(m_trayMenu, &ModernTrayMenu::itemClicked,
             this, &MainWindow::onTrayMenuItemClicked);
 
+    updateTrayState();
     m_trayIcon->show();
 }
 
@@ -1003,6 +1010,7 @@ void MainWindow::updateTrayState()
     bool connected = m_roomMgr && m_roomMgr->signalClient()->isConnected();
     bool connecting = m_roomMgr && m_roomMgr->isConnecting();
     bool inRoom = m_roomMgr && m_roomMgr->inRoom();
+    bool roomPending = m_roomMgr && m_roomMgr->roomOperationPending();
 
     QString stateText;
     if (connecting) {
@@ -1028,11 +1036,11 @@ void MainWindow::updateTrayState()
         m_trayMenu->setItemText(QStringLiteral("refresh_rooms"),
                                 UiStrings::text("tray.refresh"));
         m_trayMenu->setItemText(QStringLiteral("leave_room"),
-                                UiStrings::text("tray.leave"));
+                                UiStrings::text(roomPending ? "login.cancel" : "tray.leave"));
         m_trayMenu->setItemText(QStringLiteral("quit"),
                                 UiStrings::text("tray.quit"));
         m_trayMenu->setItemEnabled(QStringLiteral("refresh_rooms"), connected);
-        m_trayMenu->setItemEnabled(QStringLiteral("leave_room"), inRoom);
+        m_trayMenu->setItemEnabled(QStringLiteral("leave_room"), inRoom || roomPending);
     }
 }
 
@@ -1109,7 +1117,7 @@ void MainWindow::onTrayMenuItemClicked(const QString& id)
     } else if (id == QStringLiteral("refresh_rooms")) {
         onRefreshClicked();
     } else if (id == QStringLiteral("leave_room")) {
-        if (m_roomMgr->inRoom()) {
+        if (m_roomMgr->inRoom() || m_roomMgr->roomOperationPending()) {
             onLeaveRoomClicked();
         }
     } else if (id == QStringLiteral("quit")) {
@@ -1354,6 +1362,7 @@ void MainWindow::onConnectFailed(QString reason) {
 void MainWindow::onLoggedIn(uint32_t peerId) {
     m_connStatusLabel->setText(UiStrings::text("metric.loggedIn").arg(peerId));
     m_roomMgr->refreshRoomList();
+    setRoomControlsEnabled(m_roomMgr->inRoom());
     refreshDashboardState();
     updateTrayState();
 }
@@ -1668,6 +1677,7 @@ void MainWindow::updatePolicyControlState() {
     bool canEdit = m_roomMgr &&
                    m_roomMgr->signalClient()->isConnected() &&
                    !m_roomMgr->inRoom() &&
+                   !m_roomMgr->roomOperationPending() &&
                    m_advancedCheck->isChecked();
 
     auto updateGroup = [canEdit](QComboBox* modeBox,
@@ -1710,12 +1720,15 @@ void MainWindow::promptServerPassword() {
 
 void MainWindow::setRoomControlsEnabled(bool inRoom) {
     bool connected = m_roomMgr && m_roomMgr->signalClient()->isConnected();
-    bool canEditRoom = connected && !inRoom;
+    bool pending = m_roomMgr && m_roomMgr->roomOperationPending();
+    bool canEditRoom = connected && m_roomMgr->myPeerId() != 0 &&
+                       !inRoom && !pending;
 
     m_createBtn->setEnabled(canEditRoom);
     m_joinBtn->setEnabled(canEditRoom);
     m_refreshBtn->setEnabled(connected);
-    m_leaveBtn->setEnabled(connected && inRoom);
+    bindText(m_leaveBtn, pending ? "login.cancel" : "lobby.leave");
+    m_leaveBtn->setEnabled(connected && (inRoom || pending));
     m_roomNameEdit->setEnabled(canEditRoom);
     m_maxPlayersBox->setEnabled(canEditRoom);
     m_passwordEdit->setEnabled(canEditRoom);

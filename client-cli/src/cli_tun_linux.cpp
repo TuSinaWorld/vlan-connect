@@ -312,6 +312,12 @@ bool CliTunAdapter::checkRoute(uint32_t destination, std::string* error) const {
     return ok;
 }
 
+void CliTunAdapter::beginReadiness() {}
+WindowsReadinessResult CliTunAdapter::pollReadiness() {
+    return WindowsReadinessResult(WindowsReadinessState::Ready);
+}
+void CliTunAdapter::cancelReadiness() {}
+
 bool CliTunAdapter::startSession() {
     if (m_tunFd < 0) return false;
     m_running = true;

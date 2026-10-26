@@ -7,7 +7,7 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: Existing stable tag to publish, for example v0.3.1
+        description: Existing stable tag to publish, for example v0.3.2
         required: true
         type: string
 
@@ -72,7 +72,7 @@ jobs:
           set -euo pipefail
 
           cat > release_notes.md <<EOF
-          Build for ${RELEASE_TAG}; protocol v9. Upgrade all GUI/CLI clients and servers together; v8 clients are incompatible.
+          Build for ${RELEASE_TAG}; protocol v9. v0.3.1 and v0.3.2 peers remain compatible. Upgrade all clients and servers together when migrating from v8; v8 clients are incompatible.
 
           ## Assets
 

@@ -254,6 +254,8 @@ static bool applyPolicyToken(const std::string& key,
 
 CliApp::CliApp()
     : m_port(DEFAULT_PORT), m_tun(nullptr),
+      m_tunSetupPending(false), m_tunSetupIsCreate(false),
+      m_tunSetupLastPoll(0), m_tunSetupGeneration(0),
       m_currentRoomId(0), m_myVirtualIP(0),
       m_tcpPolicy(makeDefaultTcpPolicy()),
       m_udpPolicy(makeDefaultUdpPolicy()),
@@ -747,6 +749,10 @@ void CliApp::eventLoop() {
 
         /* Timers */
         uint32_t now = currentTimeMs();
+        if (m_tunSetupPending && now - m_tunSetupLastPoll >= 100) {
+            m_tunSetupLastPoll = now;
+            pollTunReadiness();
+        }
         if (m_hasResumeLease && m_resumeLeaseDeadlineMs != 0)
             expireResumeLeaseIfNeeded();
 
@@ -992,6 +998,8 @@ void CliApp::printStatus() {
     fprintf(stdout, "  Connected: %s\n", m_signal.isConnected() ? "yes" : "no");
     fprintf(stdout, "  PeerId:    %u\n", m_signal.myPeerId());
     fprintf(stdout, "  Room:      %u\n", m_currentRoomId);
+    fprintf(stdout, "  Data plane: %s\n", m_roomReady ? "ready" :
+            m_tunSetupPending ? "preparing virtual network" : "not ready");
     if (m_myVirtualIP)
         fprintf(stdout, "  VirtualIP: %s\n", ipToString(m_myVirtualIP).c_str());
     std::string tcpText = policyText(m_tcpPolicy);
@@ -1462,6 +1470,10 @@ void CliApp::onRoomCreated(uint32_t roomId, uint32_t virtualIP,
                            uint16_t mtu,
                            bool passwordProtected,
                            const Buffer& leaseToken) {
+    if (m_tunSetupPending || m_roomReady || m_currentRoomId != 0) return;
+    m_tunSetupIsCreate = true;
+    m_pendingRoomMembers.clear();
+    m_pendingRoomRelays.clear();
     m_currentRoomId = roomId;
     m_savedRoomId = roomId;
     m_myVirtualIP = virtualIP;
@@ -1474,15 +1486,7 @@ void CliApp::onRoomCreated(uint32_t roomId, uint32_t virtualIP,
     m_tunnel.setMyVirtualIP(virtualIP);
     m_tunnel.setRoomMtu(m_roomMtu);
 
-    const TunSetupResult setup = setupTun();
-    if (!setup.success) {
-        rollbackRoomAfterTunFailure(setup);
-        return;
-    }
-    m_roomReady = true;
-    fprintf(stdout, "* Room created (ID=%u, IP=%s, MTU=%u)\n> ",
-            roomId, ipToString(virtualIP).c_str(), m_roomMtu);
-    fflush(stdout);
+    beginTunReadiness();
 }
 
 void CliApp::onJoinResponse(uint32_t roomId, uint32_t virtualIP,
@@ -1492,6 +1496,12 @@ void CliApp::onJoinResponse(uint32_t roomId, uint32_t virtualIP,
                             bool passwordProtected,
                             const std::vector<PeerInfo>& members,
                             const Buffer& leaseToken) {
+    if (m_tunSetupPending || m_roomReady || m_currentRoomId != 0) return;
+    m_tunSetupIsCreate = false;
+    m_pendingRoomMembers.clear();
+    m_pendingRoomRelays.clear();
+    for (const PeerInfo& info : members)
+        if (info.peerId != m_signal.myPeerId()) m_pendingRoomMembers[info.peerId] = info;
     m_pendingResumeRoom = false;
     m_wantReconnect = false;
     m_currentRoomId = roomId;
@@ -1506,26 +1516,15 @@ void CliApp::onJoinResponse(uint32_t roomId, uint32_t virtualIP,
     m_tunnel.setMyVirtualIP(virtualIP);
     m_tunnel.setRoomMtu(m_roomMtu);
 
-    const TunSetupResult setup = setupTun();
-    if (!setup.success) {
-        rollbackRoomAfterTunFailure(setup);
-        return;
-    }
-    m_roomReady = true;
-
-    fprintf(stdout, "* Joined room (ID=%u, IP=%s, MTU=%u, %zu members)\n> ",
-            roomId, ipToString(virtualIP).c_str(), m_roomMtu, members.size());
-    fflush(stdout);
-
-    for (const PeerInfo& pi : members) {
-        if (pi.peerId == m_signal.myPeerId()) continue;
-        std::string name = pi.name.empty() ? ("Peer" + std::to_string(pi.peerId)) : pi.name;
-        m_tunnel.addPeer(pi.peerId, pi.virtualIP, name);
-        m_signal.requestRelay(pi.peerId);
-    }
+    beginTunReadiness();
 }
 
 void CliApp::onPeerJoined(PeerInfo info) {
+    if (m_tunSetupPending) {
+        if (info.peerId != m_signal.myPeerId()) m_pendingRoomMembers[info.peerId] = info;
+        return;
+    }
+    if (!m_roomReady) return;
     std::string name = info.name.empty() ? ("Peer" + std::to_string(info.peerId)) : info.name;
     m_tunnel.addPeer(info.peerId, info.virtualIP, name);
 
@@ -1552,6 +1551,12 @@ void CliApp::rebuildPeerTransports(uint32_t peerId) {
 }
 
 void CliApp::onPeerResumed(PeerInfo info) {
+    if (m_tunSetupPending) {
+        if (info.peerId != m_signal.myPeerId()) m_pendingRoomMembers[info.peerId] = info;
+        m_pendingRoomRelays.erase(info.peerId);
+        return;
+    }
+    if (!m_roomReady) return;
     CliPeerConnection* peer = m_tunnel.peerById(info.peerId);
     if (!peer) {
         onPeerJoined(info);
@@ -1569,6 +1574,8 @@ void CliApp::onPeerResumed(PeerInfo info) {
 }
 
 void CliApp::onRelayReady(uint32_t peerId) {
+    if (m_tunSetupPending) { m_pendingRoomRelays.insert(peerId); return; }
+    if (!m_roomReady) return;
     CliPeerConnection* peer = m_tunnel.peerById(peerId);
     if (!peer) return;
 
@@ -1602,6 +1609,11 @@ void CliApp::onLogoutAck() {
 }
 
 void CliApp::onPeerLeft(uint32_t peerId) {
+    if (m_tunSetupPending) {
+        m_pendingRoomMembers.erase(peerId);
+        m_pendingRoomRelays.erase(peerId);
+        return;
+    }
     CliPeerConnection* peer = m_tunnel.peerById(peerId);
     std::string name = peer ? peer->name() : ("Peer" + std::to_string(peerId));
     clearPendingRebuild(peerId);
@@ -1658,16 +1670,12 @@ CliApp::TunSetupResult CliApp::setupTun() {
         return TunSetupResult(false, TunSetupStage::Session,
                               "TUN session start failed");
     }
-#ifdef _WIN32
-    std::string routeError;
-    if (!m_tun->checkRoute(0xFFFFFFFFu, &routeError) ||
-        !m_tun->checkRoute(VNET_BROADCAST, &routeError)) {
-        m_tun->shutdown();
-        delete m_tun;
-        m_tun = nullptr;
-        return TunSetupResult(false, TunSetupStage::Address, routeError);
-    }
-#endif
+    m_tun->beginReadiness();
+    return TunSetupResult(true);
+}
+
+CliApp::TunSetupResult CliApp::startTunDataPlane() {
+    if (!m_tun) return TunSetupResult(false, TunSetupStage::DataPlane, "TUN adapter was cancelled");
     m_tunnel.setTunAdapter(m_tun);
     const bool requiresUdp = m_tcpPolicy.transportMode != MODE_RELAY_TCP ||
                              m_udpPolicy.transportMode != MODE_RELAY_TCP;
@@ -1681,12 +1689,81 @@ CliApp::TunSetupResult CliApp::setupTun() {
     }
     m_dataChannel.connectTo(m_resolvedIP, m_port, m_signal.myPeerId());
     fprintf(stdout, "* TUN adapter started, IP=%s, MTU=%d\n> ",
-            ipToString(m_myVirtualIP).c_str(), mtu);
+            ipToString(m_myVirtualIP).c_str(), static_cast<int>(m_roomMtu));
     fflush(stdout);
     return TunSetupResult(true);
 }
 
+void CliApp::beginTunReadiness() {
+    const uint64_t generation = ++m_tunSetupGeneration;
+    m_tunSetupPending = true;
+    m_roomReady = false;
+    m_tunSetupLastPoll = currentTimeMs() - 100;
+    const TunSetupResult setup = setupTun();
+    if (!m_tunSetupPending || generation != m_tunSetupGeneration) return;
+    if (!setup.success) {
+        rollbackRoomAfterTunFailure(setup);
+        return;
+    }
+    fprintf(stdout, "* Preparing virtual network for room %u; type 'leave' to cancel\n> ", m_currentRoomId);
+    fflush(stdout);
+}
+
+WindowsReadinessResult CliApp::readTunReadiness() {
+    if (m_tun) return m_tun->pollReadiness();
+    WindowsReadinessResult result(WindowsReadinessState::Failed);
+    result.error = "TUN adapter disappeared while waiting for readiness";
+    return result;
+}
+
+void CliApp::cancelTunReadiness() {
+    if (m_tun) m_tun->cancelReadiness();
+}
+
+void CliApp::pollTunReadiness() {
+    if (!m_tunSetupPending) return;
+    const uint64_t generation = m_tunSetupGeneration;
+    const WindowsReadinessResult result = readTunReadiness();
+    if (!m_tunSetupPending || generation != m_tunSetupGeneration) return;
+    if (result.state == WindowsReadinessState::Pending) return;
+    if (result.state == WindowsReadinessState::Failed) {
+        rollbackRoomAfterTunFailure(TunSetupResult(false, TunSetupStage::Readiness, result.error));
+        return;
+    }
+    const TunSetupResult started = startTunDataPlane();
+    if (!m_tunSetupPending || generation != m_tunSetupGeneration) return;
+    if (!started.success) { rollbackRoomAfterTunFailure(started); return; }
+    m_tunSetupPending = false;
+    finishRoomSetup();
+}
+
+void CliApp::finishRoomSetup() {
+    m_roomReady = true;
+    fprintf(stdout, "* %s (ID=%u, IP=%s, MTU=%u)\n> ",
+            m_tunSetupIsCreate ? "Room created" : "Joined room",
+            m_currentRoomId, ipToString(m_myVirtualIP).c_str(), m_roomMtu);
+    fflush(stdout);
+    const std::map<uint32_t, PeerInfo> members = m_pendingRoomMembers;
+    const std::set<uint32_t> readyRelays = m_pendingRoomRelays;
+    m_pendingRoomMembers.clear();
+    m_pendingRoomRelays.clear();
+    for (const auto& item : members) {
+        const PeerInfo& info = item.second;
+        const std::string name = info.name.empty() ? "Peer" + std::to_string(info.peerId) : info.name;
+        m_tunnel.addPeer(info.peerId, info.virtualIP, name);
+    }
+    for (const auto& item : members) {
+        if (readyRelays.count(item.first)) onRelayReady(item.first);
+        else m_signal.requestRelay(item.first);
+    }
+}
+
 void CliApp::teardownTun() {
+    ++m_tunSetupGeneration;
+    m_tunSetupPending = false;
+    m_pendingRoomMembers.clear();
+    m_pendingRoomRelays.clear();
+    cancelTunReadiness();
     m_tunnel.stopDataPlane();
     m_pendingRebuild.clear();
     m_probeWatchdogs.clear();
@@ -1731,6 +1808,10 @@ void CliApp::rollbackRoomAfterTunFailure(const TunSetupResult& result) {
 }
 
 void CliApp::handleTunRuntimeFailure(const std::string& error) {
+    if (m_tunSetupPending) {
+        rollbackRoomAfterTunFailure(TunSetupResult(false, TunSetupStage::Readiness, error));
+        return;
+    }
     if (!m_roomReady) return;
     if (m_signal.isConnected() && m_currentRoomId != 0)
         m_signal.leaveRoom();
