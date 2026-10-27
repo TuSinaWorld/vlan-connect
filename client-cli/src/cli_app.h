@@ -30,7 +30,7 @@ namespace VLan {
 class CliApp {
 public:
     CliApp();
-    ~CliApp();
+    virtual ~CliApp();
 
     void setServer(const std::string& host, uint16_t port);
     void setServerPassword(const std::string& password);
@@ -41,6 +41,7 @@ public:
     void requestStop();
 
 private:
+    friend class CliRoomReadinessTests;
     void setupCallbacks();
     void eventLoop();
     void processCommand(const std::string& line);
@@ -78,11 +79,13 @@ private:
     void onLogoutAck();
     void onTransportDead(uint32_t peerId, TrafficClass cls);
 
+protected:
     enum class TunSetupStage {
         None,
         Initialize,
         Address,
         Session,
+        Readiness,
         DataPlane
     };
     struct TunSetupResult {
@@ -94,7 +97,16 @@ private:
                        const std::string& text = std::string())
             : success(ok), stage(failedStage), error(text) {}
     };
-    TunSetupResult setupTun();
+    // Replace adapter effects in orchestration tests without configuring a NIC.
+    virtual TunSetupResult setupTun();
+    virtual TunSetupResult startTunDataPlane();
+    virtual WindowsReadinessResult readTunReadiness();
+    virtual void cancelTunReadiness();
+
+private:
+    void beginTunReadiness();
+    void pollTunReadiness();
+    void finishRoomSetup();
     void teardownTun();
     void rollbackRoomAfterTunFailure(const TunSetupResult& result);
     void handleTunRuntimeFailure(const std::string& error);
@@ -152,6 +164,12 @@ private:
     CliDataChannel    m_dataChannel;
     CliTunnelManager  m_tunnel;
     CliTunAdapter*    m_tun;
+    bool m_tunSetupPending;
+    bool m_tunSetupIsCreate;
+    uint32_t m_tunSetupLastPoll;
+    uint64_t m_tunSetupGeneration;
+    std::map<uint32_t, PeerInfo> m_pendingRoomMembers;
+    std::set<uint32_t> m_pendingRoomRelays;
 
     uint32_t      m_currentRoomId;
     uint32_t      m_myVirtualIP;

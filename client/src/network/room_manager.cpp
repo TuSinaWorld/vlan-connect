@@ -46,6 +46,9 @@ RoomManager::RoomManager(QObject* parent)
       m_port(DEFAULT_PORT),
       m_tcpRelayTimer(nullptr), m_latencyTimer(nullptr), m_trafficTimer(nullptr),
       m_roomListTimer(nullptr),
+      m_readinessTimer(nullptr), m_readinessGeneration(0),
+      m_roomReadinessPending(false), m_roomOperationPending(false),
+      m_pendingRoomCreated(false),
       m_lastUploadBytes(0), m_lastDownloadBytes(0),
       m_currentRoomId(0), m_myVirtualIP(0),
       m_tcpPolicy(makeDefaultTcpPolicy()),
@@ -95,12 +98,18 @@ RoomManager::RoomManager(QObject* parent)
         m_wasInRoom = false;
         m_reconnectScheduled = false;
         ++m_connectionGeneration;
+        if (m_roomReadinessPending) {
+            teardownTun();
+            resetRoomRuntimeState(true);
+        }
         clearResumeLease();
         LogManager::instance().logError(
             QString("[auth] Automatic reconnect stopped: code=%1 reason=%2")
             .arg(code).arg(message));
     });
     connect(m_signal, &SignalClient::serverError, this, [this](const QString& msg) {
+        if (!m_roomReadinessPending)
+            setRoomOperationPending(m_signal->roomOperationPending());
         if (m_connectionPhase == ConnectionPhase::Connecting &&
             m_signal->myPeerId() == 0) {
             m_signal->disconnect();
@@ -337,6 +346,11 @@ void RoomManager::handleConnectionAttemptExhausted(const QString& reason) {
 
 void RoomManager::cancelConnectionAttempt() {
     ++m_connectionGeneration;
+    if (m_roomReadinessPending) {
+        teardownTun();
+        clearResumeLease();
+        resetRoomRuntimeState(true);
+    }
     if (m_lookupId >= 0) {
         QHostInfo::abortHostLookup(m_lookupId);
         m_lookupId = -1;
@@ -438,6 +452,7 @@ void RoomManager::createRoom(const QString& roomName, uint8_t maxPlayers,
     m_signal->createRoom(roomName, maxPlayers, m_tcpPolicy, m_udpPolicy,
                          normalizedMtu, passwordProtected,
                          passwordProtected ? password : QString());
+    setRoomOperationPending(m_signal->roomOperationPending());
 }
 
 void RoomManager::joinRoom(uint32_t roomId, const QString& password) {
@@ -466,10 +481,13 @@ void RoomManager::joinRoom(uint32_t roomId, const QString& password) {
     m_savedRoomPassword = password;
     m_authRetryBlocked = false;
     m_signal->joinRoom(roomId, password);
+    setRoomOperationPending(m_signal->roomOperationPending());
 }
 
 void RoomManager::leaveRoom() {
     const bool wasReady = m_roomReady;
+    const bool wasPending = m_roomOperationPending;
+    const quint64 generation = m_readinessGeneration;
     const bool cancelledPending = m_signal->roomOperationPending();
     if (cancelledPending) {
         m_wantReconnect = false;
@@ -479,11 +497,12 @@ void RoomManager::leaveRoom() {
         m_tunnel->stopDataPlane();
     if (m_currentRoomId != 0 || cancelledPending)
         m_signal->leaveRoom();
+    const bool disconnectedSynchronously = generation != m_readinessGeneration;
     teardownTun();
     m_pendingResumeRoom = false;
     clearResumeLease();
     resetRoomRuntimeState(true);
-    if (wasReady) emit roomLeft();
+    if ((wasReady || wasPending) && !disconnectedSynchronously) emit roomLeft();
 }
 
 void RoomManager::refreshRoomList() {
@@ -518,6 +537,7 @@ void RoomManager::onSignalDisconnected() {
         return;
     m_connectionPhase = ConnectionPhase::Idle;
     bool wasInRoom = m_roomReady;
+    const bool wasPending = m_roomOperationPending;
     bool manualDisconnect = m_manualDisconnecting || m_authRetryBlocked;
 
     if (manualDisconnect) {
@@ -554,7 +574,7 @@ void RoomManager::onSignalDisconnected() {
     m_roomReady = false;
     m_roomMtu = ROOM_MTU_DEFAULT;
     m_logoutPending = false;
-    if (wasInRoom) emit roomLeft();
+    if (wasInRoom || wasPending) emit roomLeft();
     emit connectionStatusChanged(false);
 
     if (manualDisconnect) {
@@ -672,6 +692,7 @@ void RoomManager::onLoginResponse(uint32_t peerId, bool resumeAccepted) {
         if (resumeAccepted && canResume) {
             m_pendingResumeRoom = true;
             m_signal->resumeRoom(m_resumeRoomId, m_resumePeerId, m_resumeToken);
+            setRoomOperationPending(m_signal->roomOperationPending());
         } else if (m_wasInRoom && !m_savedRoomName.isEmpty()) {
             if (canResume && !resumeAccepted)
                 clearResumeLease();
@@ -711,6 +732,9 @@ void RoomManager::onRoomCreated(uint32_t roomId, uint32_t virtualIP,
                                 uint16_t mtu,
                                 bool passwordProtected,
                                 QByteArray leaseToken) {
+    if (!m_roomOperationPending || m_manualDisconnecting ||
+        m_roomReadinessPending || m_roomReady)
+        return;
     m_currentRoomId = roomId;
     m_savedRoomId = roomId;
     m_myVirtualIP = virtualIP;
@@ -723,16 +747,7 @@ void RoomManager::onRoomCreated(uint32_t roomId, uint32_t virtualIP,
     m_tunnel->setMyVirtualIP(virtualIP);
     m_tunnel->setRoomMtu(m_roomMtu);
 
-    const TunSetupResult setup = setupTun();
-    if (!setup.success) {
-        rollbackRoomAfterTunFailure(setup);
-        return;
-    }
-    m_roomReady = true;
-    m_latencyTimer->start(3000);
-    emit roomCreated(roomId);
-    emit statusMessage(UiStrings::text("status.roomCreated")
-                       .arg(roomId).arg(virtualIPToString(virtualIP)).arg(m_roomMtu));
+    beginRoomReadiness(true, QList<PeerInfo>());
 }
 
 void RoomManager::onJoinResponse(uint32_t roomId, uint32_t virtualIP,
@@ -743,6 +758,9 @@ void RoomManager::onJoinResponse(uint32_t roomId, uint32_t virtualIP,
                                  QList<PeerInfo> members,
                                  QByteArray leaseToken)
 {
+    if (!m_roomOperationPending || m_manualDisconnecting ||
+        m_roomReadinessPending || m_roomReady)
+        return;
     m_pendingResumeRoom = false;
     m_wantReconnect = false;
     m_currentRoomId = roomId;
@@ -757,29 +775,15 @@ void RoomManager::onJoinResponse(uint32_t roomId, uint32_t virtualIP,
     m_tunnel->setMyVirtualIP(virtualIP);
     m_tunnel->setRoomMtu(m_roomMtu);
 
-    const TunSetupResult setup = setupTun();
-    if (!setup.success) {
-        rollbackRoomAfterTunFailure(setup);
-        return;
-    }
-    m_roomReady = true;
-    m_latencyTimer->start(3000);
-
-    emit roomJoined(roomId);
-    emit statusMessage(UiStrings::text("status.roomJoined")
-                       .arg(roomId).arg(virtualIPToString(virtualIP)).arg(m_roomMtu));
-
-    for (const PeerInfo& pi : members) {
-        if (pi.peerId == myPeerId()) continue;
-        QString name = QString::fromStdString(pi.name);
-        if (name.isEmpty()) name = QString("Peer%1").arg(pi.peerId);
-        m_tunnel->addPeer(pi.peerId, pi.virtualIP, name);
-        emit peerConnected(pi.peerId, pi.virtualIP, name);
-        m_signal->requestRelay(pi.peerId);
-    }
+    beginRoomReadiness(false, members);
 }
 
 void RoomManager::onPeerJoined(PeerInfo info) {
+    if (m_roomReadinessPending) {
+        if (info.peerId != myPeerId()) m_pendingMembers.insert(info.peerId, info);
+        return;
+    }
+    if (!m_roomReady || info.peerId == myPeerId()) return;
     QString name = QString::fromStdString(info.name);
     if (name.isEmpty()) name = QString("Peer%1").arg(info.peerId);
     m_tunnel->addPeer(info.peerId, info.virtualIP, name);
@@ -790,6 +794,12 @@ void RoomManager::onPeerJoined(PeerInfo info) {
 }
 
 void RoomManager::onPeerResumed(PeerInfo info) {
+    if (m_roomReadinessPending) {
+        if (info.peerId != myPeerId()) m_pendingMembers.insert(info.peerId, info);
+        m_pendingRelayReady.remove(info.peerId);
+        return;
+    }
+    if (!m_roomReady || info.peerId == myPeerId()) return;
     QString name = QString::fromStdString(info.name);
     if (name.isEmpty()) name = QString("Peer%1").arg(info.peerId);
 
@@ -813,6 +823,12 @@ void RoomManager::onPeerResumed(PeerInfo info) {
 }
 
 void RoomManager::onPeerLeft(uint32_t peerId) {
+    if (m_roomReadinessPending) {
+        m_pendingMembers.remove(peerId);
+        m_pendingRelayReady.remove(peerId);
+        return;
+    }
+    if (!m_roomReady) return;
     PeerConnection* peer = m_tunnel->peerById(peerId);
     QString name = peer ? peer->name() : QString("Peer%1").arg(peerId);
     clearPendingRebuild(peerId);
@@ -828,6 +844,11 @@ void RoomManager::onPeerLeft(uint32_t peerId) {
 }
 
 void RoomManager::onRelayReady(uint32_t peerId) {
+    if (m_roomReadinessPending) {
+        m_pendingRelayReady.insert(peerId);
+        return;
+    }
+    if (!m_roomReady) return;
     PeerConnection* peer = m_tunnel->peerById(peerId);
     if (!peer) return;
 
@@ -988,20 +1009,7 @@ RoomManager::TunSetupResult RoomManager::setupTun() {
                               UiStrings::text("status.serverSubnetConflict"));
 
     m_tun = new TunAdapter(this);
-    connect(m_tun, &TunAdapter::errorOccurred,
-            this, &RoomManager::onTunRuntimeError);
-    connect(m_tun, &TunAdapter::firewallRuleChanged,
-            this, [this](bool added, bool success) {
-        if (added) {
-            emit statusMessage(success
-                ? UiStrings::text("status.firewallAdded")
-                : UiStrings::text("status.firewallAddFailed"));
-        } else {
-            emit statusMessage(success
-                ? UiStrings::text("status.firewallRemoved")
-                : UiStrings::text("status.firewallRemoveFailed"));
-        }
-    });
+    bindTunAdapterSignals(m_tun);
     if (!m_tun->initialize()) {
         delete m_tun; m_tun = nullptr;
         return TunSetupResult(false, TunSetupStage::Initialize,
@@ -1019,13 +1027,51 @@ RoomManager::TunSetupResult RoomManager::setupTun() {
         return TunSetupResult(false, TunSetupStage::Session,
                               UiStrings::text("status.tunSessionFailed"));
     }
-    QString routeError;
-    if (!m_tun->checkRoute(0xffffffffu, &routeError) ||
-        !m_tun->checkRoute(VNET_BROADCAST, &routeError)) {
-        m_tun->shutdown();
-        delete m_tun; m_tun = nullptr;
-        return TunSetupResult(false, TunSetupStage::Address, routeError);
-    }
+    m_tun->beginReadiness();
+    return TunSetupResult(true);
+}
+
+void RoomManager::bindTunAdapterSignals(TunAdapter* adapter) {
+    const quint64 generation = m_readinessGeneration;
+    const quint64 connectionGeneration = m_connectionGeneration;
+    connect(adapter, &TunAdapter::errorOccurred, this,
+            [this, adapter, generation, connectionGeneration](const QString& message) {
+        if (m_tun != adapter || generation != m_readinessGeneration ||
+            connectionGeneration != m_connectionGeneration)
+            return;
+        onTunRuntimeError(message);
+    });
+    connect(adapter, &TunAdapter::firewallRuleChanged, this,
+            [this, adapter, generation, connectionGeneration](bool added, bool success) {
+        if (m_tun != adapter || generation != m_readinessGeneration ||
+            connectionGeneration != m_connectionGeneration)
+            return;
+        if (added) {
+            emit statusMessage(success
+                ? UiStrings::text("status.firewallAdded")
+                : UiStrings::text("status.firewallAddFailed"));
+        } else {
+            emit statusMessage(success
+                ? UiStrings::text("status.firewallRemoved")
+                : UiStrings::text("status.firewallRemoveFailed"));
+        }
+    });
+}
+
+WindowsReadinessResult RoomManager::pollTunReadiness() {
+    if (m_tun)
+        return m_tun->pollReadiness();
+    WindowsReadinessResult result(WindowsReadinessState::Failed);
+    result.error = "TUN adapter disappeared while waiting for Windows readiness.";
+    return result;
+}
+
+void RoomManager::cancelTunReadiness() {
+    if (m_tun)
+        m_tun->cancelReadiness();
+}
+
+RoomManager::TunSetupResult RoomManager::startTunDataPlane() {
     m_tunnel->setTunAdapter(m_tun);
     const bool requiresUdp = m_tcpPolicy.transportMode != MODE_RELAY_TCP ||
                              m_udpPolicy.transportMode != MODE_RELAY_TCP;
@@ -1047,8 +1093,127 @@ RoomManager::TunSetupResult RoomManager::setupTun() {
         m_trafficTimer->start(1000);
     emit tunSpeedUpdated(0, 0);
     emit statusMessage(UiStrings::text("status.tunStarted")
-                       .arg(virtualIPToString(m_myVirtualIP)).arg(mtu));
+                       .arg(virtualIPToString(m_myVirtualIP)).arg(m_roomMtu));
     return TunSetupResult(true);
+}
+
+void RoomManager::setRoomOperationPending(bool pending) {
+    if (m_roomOperationPending == pending) return;
+    m_roomOperationPending = pending;
+    emit roomOperationPendingChanged(pending);
+}
+
+void RoomManager::beginRoomReadiness(bool created, const QList<PeerInfo>& members) {
+    m_roomReady = false;
+    m_roomReadinessPending = true;
+    m_pendingRoomCreated = created;
+    m_pendingMembers.clear();
+    m_pendingRelayReady.clear();
+    m_pendingTunError.clear();
+    for (const PeerInfo& member : members) {
+        if (member.peerId != myPeerId())
+            m_pendingMembers.insert(member.peerId, member);
+    }
+    setRoomOperationPending(true);
+    const quint64 generation = ++m_readinessGeneration;
+    const quint64 connectionGeneration = m_connectionGeneration;
+    const TunSetupResult setup = setupTun();
+    if (!m_roomReadinessPending || generation != m_readinessGeneration ||
+        connectionGeneration != m_connectionGeneration)
+        return;
+    if (!setup.success) {
+        rollbackRoomAfterTunFailure(setup);
+        return;
+    }
+    // Windows publishes address, interface and route state asynchronously.
+    // Keep the GUI responsive and the data plane stopped until all gates pass.
+    emit statusMessage(QStringLiteral("Waiting for Windows virtual network readiness..."));
+    m_readinessTimer = new QTimer(this);
+    m_readinessTimer->setInterval(100);
+    connect(m_readinessTimer, &QTimer::timeout, this,
+            [this, generation, connectionGeneration]() {
+        pollRoomReadiness(generation, connectionGeneration);
+    });
+    m_readinessTimer->start();
+}
+
+void RoomManager::pollRoomReadiness(quint64 generation, quint64 connectionGeneration) {
+    if (!m_roomReadinessPending || generation != m_readinessGeneration ||
+        connectionGeneration != m_connectionGeneration)
+        return;
+    if (!m_pendingTunError.isEmpty()) {
+        rollbackRoomAfterTunFailure(TunSetupResult(false, TunSetupStage::Session, m_pendingTunError));
+        return;
+    }
+    const WindowsReadinessResult readiness = pollTunReadiness();
+    if (readiness.state == WindowsReadinessState::Pending)
+        return;
+    // Recheck the generation after a poll: cancellation may be delivered by an
+    // adapter error signal or an injected backend before the result returns.
+    if (!m_roomReadinessPending || generation != m_readinessGeneration ||
+        connectionGeneration != m_connectionGeneration)
+        return;
+    if (!m_pendingTunError.isEmpty()) {
+        rollbackRoomAfterTunFailure(TunSetupResult(false, TunSetupStage::Session, m_pendingTunError));
+        return;
+    }
+    if (readiness.state == WindowsReadinessState::Failed) {
+        QString error = QString::fromUtf8(readiness.error.c_str());
+        if (error.isEmpty()) error = QStringLiteral("Windows virtual network readiness failed.");
+        if (!readiness.diagnostic.empty())
+            LogManager::instance().logDetail(QString::fromUtf8(readiness.diagnostic.c_str()));
+        rollbackRoomAfterTunFailure(TunSetupResult(false, TunSetupStage::Readiness, error));
+        return;
+    }
+    const TunSetupResult started = startTunDataPlane();
+    if (!m_roomReadinessPending || generation != m_readinessGeneration ||
+        connectionGeneration != m_connectionGeneration)
+        return;
+    if (!m_pendingTunError.isEmpty()) {
+        rollbackRoomAfterTunFailure(TunSetupResult(false, TunSetupStage::Session, m_pendingTunError));
+        return;
+    }
+    if (!started.success) {
+        rollbackRoomAfterTunFailure(started);
+        return;
+    }
+    completeRoomReadiness();
+}
+
+void RoomManager::completeRoomReadiness() {
+    if (!m_roomReadinessPending) return;
+    if (m_readinessTimer) {
+        m_readinessTimer->stop();
+        m_readinessTimer->deleteLater();
+        m_readinessTimer = nullptr;
+    }
+    const quint64 generation = m_readinessGeneration;
+    const bool created = m_pendingRoomCreated;
+    const QMap<uint32_t, PeerInfo> members = m_pendingMembers;
+    const QSet<uint32_t> relayReady = m_pendingRelayReady;
+    m_pendingMembers.clear();
+    m_pendingRelayReady.clear();
+    m_pendingTunError.clear();
+    m_roomReadinessPending = false;
+    m_roomReady = true;
+    m_latencyTimer->start(3000);
+    setRoomOperationPending(false);
+    if (!m_roomReady || generation != m_readinessGeneration) return;
+    if (created) emit roomCreated(m_currentRoomId);
+    else emit roomJoined(m_currentRoomId);
+    if (!m_roomReady || generation != m_readinessGeneration) return;
+    emit statusMessage(UiStrings::text(created ? "status.roomCreated" : "status.roomJoined")
+                       .arg(m_currentRoomId).arg(virtualIPToString(m_myVirtualIP)).arg(m_roomMtu));
+    for (const PeerInfo& member : members) {
+        if (!m_roomReady || generation != m_readinessGeneration) return;
+        QString name = QString::fromStdString(member.name);
+        if (name.isEmpty()) name = QString("Peer%1").arg(member.peerId);
+        m_tunnel->addPeer(member.peerId, member.virtualIP, name);
+        emit peerConnected(member.peerId, member.virtualIP, name);
+        if (!m_roomReady || generation != m_readinessGeneration) return;
+        if (relayReady.contains(member.peerId)) onRelayReady(member.peerId);
+        else m_signal->requestRelay(member.peerId);
+    }
 }
 
 void RoomManager::onSecurityFailure(QString message) {
@@ -1066,6 +1231,18 @@ void RoomManager::onSecurityFailure(QString message) {
 
 void RoomManager::teardownTun() {
     m_tearingDownTun = true;
+    ++m_readinessGeneration;
+    m_roomReadinessPending = false;
+    if (m_readinessTimer) {
+        m_readinessTimer->stop();
+        m_readinessTimer->deleteLater();
+        m_readinessTimer = nullptr;
+    }
+    cancelTunReadiness();
+    m_pendingMembers.clear();
+    m_pendingRelayReady.clear();
+    m_pendingTunError.clear();
+    setRoomOperationPending(false);
     if (m_tunnel)
         m_tunnel->stopDataPlane();
     m_pendingRebuild.clear();
@@ -1135,6 +1312,21 @@ void RoomManager::rollbackRoomAfterTunFailure(
 }
 
 void RoomManager::onTunRuntimeError(QString message) {
+    if (!m_tearingDownTun && m_roomReadinessPending) {
+        if (!m_pendingTunError.isEmpty()) return;
+        m_pendingTunError = message.isEmpty() ? QStringLiteral("TUN read thread stopped.") : message;
+        const quint64 generation = m_readinessGeneration;
+        const quint64 connectionGeneration = m_connectionGeneration;
+        QTimer::singleShot(0, this, [this, generation, connectionGeneration, message]() {
+            if (generation != m_readinessGeneration || connectionGeneration != m_connectionGeneration)
+                return;
+            if (m_roomReadinessPending)
+                rollbackRoomAfterTunFailure(TunSetupResult(false, TunSetupStage::Session, m_pendingTunError));
+            else if (m_roomReady)
+                onTunRuntimeError(message);
+        });
+        return;
+    }
     if (m_tearingDownTun || !m_roomReady)
         return;
     if (m_signal && m_signal->isConnected() && m_currentRoomId != 0)

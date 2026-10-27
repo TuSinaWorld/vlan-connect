@@ -2,6 +2,7 @@
 """Exercise actual server/CLI authentication on loopback without a TUN device."""
 import argparse
 import os
+import re
 from pathlib import Path
 import socket
 import struct
@@ -48,9 +49,13 @@ def main():
     parser.add_argument("--cli", required=True, type=Path)
     args = parser.parse_args()
     server_path, cli_path = args.server.resolve(), args.cli.resolve()
+    root = Path(__file__).resolve().parents[2]
+    version_header = (root / "common/version.h").read_text(encoding="utf-8")
+    expected_version = re.search(r'^#define VLAN_RELEASE_VERSION "([0-9]+\.[0-9]+\.[0-9]+)"$',
+                                 version_header, re.MULTILINE)[1]
     for binary in (server_path, cli_path):
         version = subprocess.check_output([str(binary), "--version"], text=True, timeout=5)
-        assert "0.3.1 protocol=9" in version, version
+        assert f"{expected_version} protocol=9" in version, version
     with tempfile.TemporaryDirectory(prefix="vlan-auth-smoke-") as directory:
         work = Path(directory)
         auth = work / "auth.password"
@@ -97,7 +102,6 @@ def main():
                 with socket.create_connection(("127.0.0.1", port), timeout=3) as old:
                     # CLIENT_HELLO contains version + nonce + public key.
                     header = (Path(__file__).resolve().parents[2] / "common/protocol.h").read_text(encoding="utf-8")
-                    import re
                     hello = int(re.search(r"MSG_CLIENT_HELLO\s*=\s*(0x[0-9A-Fa-f]+|\d+)", header)[1], 0)
                     error = int(re.search(r"MSG_ERROR\s*=\s*(0x[0-9A-Fa-f]+|\d+)", header)[1], 0)
                     payload = struct.pack("!H", 8) + bytes(range(48))
