@@ -6,6 +6,7 @@
 #include <QLabel>
 #include <QMap>
 #include "protocol.h"
+#include "probe_quality.h"
 
 namespace VLan {
 
@@ -32,17 +33,27 @@ public slots:
                              VLan::TransportType type);
     void updatePeerLatency(uint32_t peerId, VLan::TrafficClass cls,
                            int latencyMs);
+    void updatePeerQuality(uint32_t peerId, VLan::TrafficClass cls,
+                           VLan::ProbeQualitySnapshot quality);
+
+protected:
+    void changeEvent(QEvent* event) override;
 
 private:
+    struct PeerEntry;
     int  findRow(uint32_t peerId);
     uint32_t peerIdFromRow(int row) const;
     void refreshInfoLabel();
     void refreshSummaryLabels();
     void refreshHeaders();
     void refreshPeerRow(uint32_t peerId);
+    void refreshQualityBanner();
+    void refreshQualityGeometry();
     void showPeerDetail(uint32_t peerId);
     QString transportText(VLan::TrafficClass cls, VLan::TransportType type) const;
     QString latencyText(int latencyMs) const;
+    QString qualityText(const PeerEntry& peer, VLan::TrafficClass cls) const;
+    QString qualityDetails(const VLan::ProbeQualitySnapshot& quality) const;
     QString policySummary(VLan::TrafficClass cls) const;
 
     struct PeerEntry {
@@ -50,13 +61,16 @@ private:
         uint32_t      virtualIP;
         QString       name;
         TransportType transport[3];
+        TransportType lastTransport[3];
         int           latency[3];
+        ProbeQualitySnapshot quality[3];
     };
 
     QLabel*       m_titleLabel;
     QLabel*       m_infoLabel;
     QLabel*       m_roomStatusLabel;
     QLabel*       m_memberCountLabel;
+    QLabel*       m_qualityBanner;
     QTableWidget* m_table;
 
     QMap<uint32_t, PeerEntry> m_peers;

@@ -315,6 +315,51 @@ add_test(NAME tcp_backpressure_tests COMMAND tcp_backpressure_tests)
 add_test(NAME data_channel_tests COMMAND data_channel_tests)
 add_test(NAME data_plane_tests COMMAND data_plane_tests)
 add_test(NAME wintun_lifecycle_tests COMMAND wintun_lifecycle_tests)
+
+add_executable(probe_quality_tests common/probe_quality_tests.cpp)
+target_include_directories(probe_quality_tests PRIVATE ${VLAN_COMMON_INCLUDES})
+vlan_test_output(probe_quality_tests)
+add_test(NAME probe_quality_tests COMMAND probe_quality_tests)
+
+add_executable(probe_transport_tests
+    cli/probe_transport_tests.cpp
+    "${VLAN_ROOT}/client-cli/src/cli_peer.cpp"
+    "${VLAN_ROOT}/client-cli/src/cli_fec.cpp"
+    "${VLAN_ROOT}/3rdparty/kcp/ikcp.c"
+    "${VLAN_ROOT}/3rdparty/cm256cc/cm256.cpp"
+    "${VLAN_ROOT}/3rdparty/cm256cc/gf256.cpp")
+target_include_directories(probe_transport_tests PRIVATE ${VLAN_COMMON_INCLUDES}
+    "${VLAN_ROOT}/client-cli/src" "${VLAN_ROOT}/3rdparty/kcp" "${VLAN_ROOT}/3rdparty/cm256cc")
+target_compile_definitions(probe_transport_tests PRIVATE cm256cc_STATIC)
+target_link_libraries(probe_transport_tests PRIVATE Threads::Threads)
+if(WIN32)
+    target_compile_definitions(probe_transport_tests PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+    target_link_libraries(probe_transport_tests PRIVATE ws2_32)
+endif()
+if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|amd64|AMD64|i[3-6]86)$")
+    target_compile_definitions(probe_transport_tests PRIVATE USE_SSSE3)
+    if(NOT MSVC)
+        target_compile_options(probe_transport_tests PRIVATE -mssse3)
+    endif()
+elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "^(aarch64|arm64|ARM64|armv7.*)$")
+    target_compile_definitions(probe_transport_tests PRIVATE USE_NEON)
+endif()
+vlan_test_output(probe_transport_tests)
+add_test(NAME probe_transport_tests COMMAND probe_transport_tests)
+set_tests_properties(probe_transport_tests PROPERTIES TIMEOUT 50)
+
+find_package(Qt5 COMPONENTS Widgets QUIET)
+if(Qt5Widgets_FOUND)
+    add_executable(room_quality_ui_tests gui/room_quality_ui_tests.cpp
+        "${VLAN_ROOT}/client/src/ui/roomwidget.cpp"
+        "${VLAN_ROOT}/client/src/ui/ui_strings.cpp")
+    target_include_directories(room_quality_ui_tests PRIVATE ${VLAN_COMMON_INCLUDES})
+    target_link_libraries(room_quality_ui_tests PRIVATE Qt5::Widgets)
+    set_target_properties(room_quality_ui_tests PROPERTIES AUTOMOC ON)
+    vlan_test_output(room_quality_ui_tests)
+    add_test(NAME room_quality_ui_tests COMMAND room_quality_ui_tests)
+    set_tests_properties(room_quality_ui_tests PROPERTIES ENVIRONMENT "QT_QPA_PLATFORM=offscreen")
+endif()
 if(NOT WIN32)
     add_test(NAME linux_tun_netlink_tests COMMAND linux_tun_netlink_tests)
     add_test(NAME cli_raw_fec_tests COMMAND cli_raw_fec_tests)

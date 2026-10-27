@@ -63,6 +63,7 @@ public:
     std::function<void(const std::string&)> onSecurityFailure;
 
 private:
+    friend class CliRoomReadinessTests;
     static uint64_t tunnelKey(uint32_t peerId, TrafficClass cls);
     void markTransportDead(uint32_t peerId, TrafficClass cls);
     void flushPendingTransportDead();

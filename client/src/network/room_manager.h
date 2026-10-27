@@ -9,7 +9,7 @@
 #include <QSet>
 #include <QTimer>
 #include "protocol.h"
-#include "relay_probe_watchdog.h"
+#include "probe_quality.h"
 #include "windows_network_readiness.h"
 
 namespace VLan {
@@ -75,6 +75,8 @@ signals:
     void peerDisconnected(uint32_t peerId);
     void peerTransportChanged(uint32_t peerId, VLan::TrafficClass cls, VLan::TransportType type);
     void peerLatencyUpdated(uint32_t peerId, VLan::TrafficClass cls, int latencyMs);
+    void peerQualityUpdated(uint32_t peerId, VLan::TrafficClass cls,
+                            VLan::ProbeQualitySnapshot quality);
     void serverRttUpdated(int rttMs);
     void tunSpeedUpdated(quint64 uploadBytesPerSec, quint64 downloadBytesPerSec);
     void errorOccurred(QString message);
@@ -257,7 +259,12 @@ private:
     RoomTrafficPolicy m_savedUdpPolicy;
     QList<RoomListItem> m_cachedRoomList;
     QMap<TransportKey, bool> m_pendingRebuild;
-    QMap<TransportKey, RelayProbeWatchdog> m_probeWatchdogs;
+    struct QualityLogState {
+        TransportType transport;
+        int anomaly; // 0: healthy, 1: probe timeout, 2: local submission failure.
+        QualityLogState() : transport(TRANSPORT_NONE), anomaly(0) {}
+    };
+    QMap<TransportKey, QualityLogState> m_qualityLogStates;
 };
 
 } // namespace VLan

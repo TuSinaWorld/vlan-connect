@@ -87,7 +87,7 @@
     <ClInclude Include="..\common\traffic_policy_codec.h">
       <Filter>Header Files</Filter>
     </ClInclude>
-    <ClInclude Include="..\common\relay_probe_watchdog.h">
+    <ClInclude Include="..\common\probe_quality.h">
       <Filter>Header Files</Filter>
     </ClInclude>
     <ClInclude Include="..\3rdparty\kcp\ikcp.h">

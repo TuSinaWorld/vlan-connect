@@ -86,6 +86,7 @@ private slots:
     void onUdpKeepalive();
 
 private:
+    friend class RoomReadinessTests;
     void routeFromTun(const QByteArray& ipPacket);
     void routeToTun(uint32_t peerId, const QByteArray& ipPacket);
     void sendUdpDatagram(const QByteArray& datagram,

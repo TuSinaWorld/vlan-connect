@@ -436,16 +436,41 @@ void TunnelManager::addTunDownloadBytes(quint64 bytes) {
 
 void TunnelManager::sendUdpDatagram(const QByteArray& datagram,
                                     const QHostAddress& addr, quint16 port) {
+    // Keep the clear relay header before encryption so a local socket failure
+    // is charged to its actual member/path, rather than to remote reachability.
+    PeerConnection* destinationPeer = nullptr;
+    TrafficClass trafficClass = TRAFFIC_UDP;
+    if (datagram.size() >= static_cast<int>(sizeof(UdpRelayHeader))) {
+        UdpRelayHeader header;
+        memcpy(&header, datagram.constData(), sizeof(header));
+        if ((header.type == UDP_RELAY_DATA || header.type == UDP_RAW_RELAY_DATA) &&
+            (header.trafficClass == TRAFFIC_TCP || header.trafficClass == TRAFFIC_UDP) &&
+            ntohl(header.srcPeerId) == m_myPeerId) {
+            trafficClass = static_cast<TrafficClass>(header.trafficClass);
+            destinationPeer = peerById(ntohl(header.dstPeerId));
+            const TransportType expected = header.type == UDP_RELAY_DATA ?
+                TRANSPORT_RELAY_KCP : TRANSPORT_RELAY_RAW_UDP;
+            if (destinationPeer && destinationPeer->transport(trafficClass) != expected)
+                destinationPeer = nullptr;
+        }
+    }
+    const auto reportSend = [destinationPeer, trafficClass](bool success) {
+        if (destinationPeer)
+            destinationPeer->reportLocalTransportSend(trafficClass, success);
+    };
     if (!dataPlaneAllowsTraffic(m_dataPlaneState, m_securityMode)) {
+        reportSend(false);
         return;
     }
     if (m_securityMode != DataPlaneSecurityMode::Secure ||
         m_secureSessionId == 0 || m_secureMaster.size() != SECURE_KEY_SIZE) {
+        reportSend(false);
         return;
     }
     std::vector<uint8_t> enc = m_udpCipher.encrypt(
         reinterpret_cast<const uint8_t*>(datagram.constData()), datagram.size());
     if (enc.empty()) {
+        reportSend(false);
         recordPacketDrop("udp-encrypt-failed-session-exhausted");
         stopDataPlane();
         emit securityError(QStringLiteral("UDP encryption session exhausted or unavailable; reconnecting for fresh keys"));
@@ -459,7 +484,9 @@ void TunnelManager::sendUdpDatagram(const QByteArray& datagram,
         memcpy(pkt.data() + 1 + SECURE_SESSION_ID_SIZE,
                enc.data(), enc.size());
     }
-    if (m_udpSocket->writeDatagram(pkt, addr, port) != pkt.size())
+    const bool sent = m_udpSocket->writeDatagram(pkt, addr, port) == pkt.size();
+    reportSend(sent);
+    if (!sent)
         recordPacketDrop(QString("udp-send/%1").arg(m_udpSocket->errorString()));
 }
 

@@ -128,16 +128,40 @@ uint64_t CliTunnelManager::tunnelKey(uint32_t peerId, TrafficClass cls) {
 
 void CliTunnelManager::udpSend(const uint8_t* data, size_t len,
                                uint32_t dstIP, uint16_t dstPort) {
+    CliPeerConnection* destinationPeer = nullptr;
+    TrafficClass trafficClass = TRAFFIC_UDP;
+    if (len >= sizeof(UdpRelayHeader)) {
+        UdpRelayHeader header;
+        memcpy(&header, data, sizeof(header));
+        if ((header.type == UDP_RELAY_DATA || header.type == UDP_RAW_RELAY_DATA) &&
+            (header.trafficClass == TRAFFIC_TCP || header.trafficClass == TRAFFIC_UDP) &&
+            ntohl(header.srcPeerId) == m_myPeerId) {
+            trafficClass = static_cast<TrafficClass>(header.trafficClass);
+            destinationPeer = peerById(ntohl(header.dstPeerId));
+            const TransportType expected = header.type == UDP_RELAY_DATA ?
+                TRANSPORT_RELAY_KCP : TRANSPORT_RELAY_RAW_UDP;
+            if (destinationPeer && destinationPeer->transport(trafficClass) != expected)
+                destinationPeer = nullptr;
+        }
+    }
+    const auto reportSend = [destinationPeer, trafficClass](bool success) {
+        if (destinationPeer)
+            destinationPeer->reportLocalTransportSend(trafficClass, success);
+    };
     if (!dataPlaneAllowsTraffic(m_dataPlaneState, m_securityMode) ||
         m_udpFd == SOCK_INVALID) {
+        reportSend(false);
         return;
     }
     Buffer wrapped;
     if (m_securityMode == DataPlaneSecurityMode::Secure) {
-        if (m_secureSessionId == 0 || m_secureMaster.size() != SECURE_KEY_SIZE)
+        if (m_secureSessionId == 0 || m_secureMaster.size() != SECURE_KEY_SIZE) {
+            reportSend(false);
             return;
+        }
         std::vector<uint8_t> enc = m_udpCipher.encrypt(data, len);
         if (enc.empty()) {
+            reportSend(false);
             recordPacketDrop("udp-encrypt-failed-session-exhausted");
             stopDataPlane();
             if (onSecurityFailure)
@@ -155,8 +179,10 @@ void CliTunnelManager::udpSend(const uint8_t* data, size_t len,
     struct sockaddr_in addr = makeAddr(dstIP, dstPort);
     const int sent = sendto(m_udpFd, reinterpret_cast<const char*>(data), static_cast<int>(len), 0,
                             (struct sockaddr*)&addr, sizeof(addr));
+    const int sendError = sent == static_cast<int>(len) ? 0 : sock_error();
+    reportSend(sent == static_cast<int>(len));
     if (sent != static_cast<int>(len))
-        recordPacketDrop("udp-send/" + std::to_string(sock_error()));
+        recordPacketDrop("udp-send/" + std::to_string(sendError));
 }
 
 CliPeerConnection* CliTunnelManager::addPeer(uint32_t peerId, uint32_t virtualIP,

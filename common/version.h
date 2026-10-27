@@ -2,9 +2,9 @@
 #define VLAN_VERSION_H
 
 // Canonical software release version; shared by all executables and Win32 resources.
-#define VLAN_RELEASE_VERSION "0.3.2"
-#define VLAN_RELEASE_VERSION_COMMA 0,3,2,0
-#define VLAN_RELEASE_VERSION_WINDOWS "0.3.2.0"
+#define VLAN_RELEASE_VERSION "0.3.3"
+#define VLAN_RELEASE_VERSION_COMMA 0,3,3,0
+#define VLAN_RELEASE_VERSION_WINDOWS "0.3.3.0"
 #ifndef VLAN_BUILD_COMMIT
 #define VLAN_BUILD_COMMIT "unknown"
 #endif

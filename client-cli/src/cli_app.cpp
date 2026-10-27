@@ -794,30 +794,9 @@ void CliApp::eventLoop() {
             }
         }
 
-        if (m_currentRoomId != 0 && now - m_lastLatencyCheckTime >= 3000) {
+        if (m_roomReady && now - m_lastLatencyCheckTime >= 1000) {
             m_lastLatencyCheckTime = now;
-            for (CliPeerConnection* peer : m_tunnel.allPeers()) {
-                peer->sendLatencyPing();
-                for (int cls = TRAFFIC_TCP; cls <= TRAFFIC_UDP; ++cls) {
-                    const TrafficClass trafficClass = static_cast<TrafficClass>(cls);
-                    RelayProbeWatchdog& watchdog =
-                        m_probeWatchdogs[transportKey(peer->peerId(), trafficClass)];
-                    const bool fresh = peer->latencyMs(trafficClass) >= 0;
-                    const bool recovered = watchdog.outageReported() && fresh;
-                    const bool timedOut = watchdog.observe(now, fresh);
-                    if (recovered)
-                        LOG_INFO("Peer probe recovered: peer=%u class=%s transport=%s rtt=%dms",
-                                 peer->peerId(), trafficClass == TRAFFIC_TCP ? "TCP" : "UDP",
-                                 transportName(peer->transport(trafficClass)),
-                                 peer->latencyMs(trafficClass));
-                    if (timedOut)
-                        LOG_ERR("No peer probe reply: peer=%u class=%s transport=%s server=%s:%u dataChannel=%s; check relay reachability, firewall and routes",
-                                peer->peerId(), trafficClass == TRAFFIC_TCP ? "TCP" : "UDP",
-                                transportName(peer->transport(trafficClass)),
-                                m_resolvedIP.c_str(), m_port,
-                                m_dataChannel.isConnected() ? "connected" : "unavailable");
-                }
-            }
+            updatePeerQuality();
         }
 
         if (m_logoutPending && now >= m_logoutDeadline) {
@@ -1007,6 +986,23 @@ void CliApp::printStatus() {
     fprintf(stdout, "  TCP policy: %s\n", tcpText.c_str());
     fprintf(stdout, "  UDP policy: %s\n", udpText.c_str());
     fprintf(stdout, "  MTU:       %u\n", m_roomMtu);
+    unsigned remotePeers = 0;
+    unsigned abnormalPeers = 0;
+    for (CliPeerConnection* peer : m_tunnel.allPeers()) {
+        if (peer->peerId() == m_signal.myPeerId()) continue;
+        ++remotePeers;
+        bool abnormal = false;
+        for (int cls = TRAFFIC_TCP; cls <= TRAFFIC_UDP; ++cls) {
+            const TrafficClass trafficClass = static_cast<TrafficClass>(cls);
+            const ProbeQualitySnapshot quality = peer->qualitySnapshot(trafficClass);
+            abnormal = abnormal || quality.outage || quality.localSendFailure;
+        }
+        if (abnormal) ++abnormalPeers;
+    }
+    if (remotePeers == 0)
+        fprintf(stdout, "  Link quality: no remote peers; cannot assess peer reachability\n");
+    else
+        fprintf(stdout, "  Link quality: %u/%u remote peers abnormal (see peers)\n", abnormalPeers, remotePeers);
     fprintf(stdout, "--------------\n> ");
     fflush(stdout);
 }
@@ -1014,17 +1010,77 @@ void CliApp::printStatus() {
 void CliApp::printPeers() {
     auto peers = m_tunnel.allPeers();
     fprintf(stdout, "\n--- Peers (%zu) ---\n", peers.size());
+    unsigned remotePeers = 0;
     for (CliPeerConnection* p : peers) {
-        fprintf(stdout, "  [%u] %s  IP=%s  TCP=%s RTT=%dms  UDP=%s RTT=%dms\n",
+        if (p->peerId() == m_signal.myPeerId()) continue;
+        ++remotePeers;
+        fprintf(stdout, "  [%u] %s  IP=%s\n",
                 p->peerId(), p->name().c_str(),
-                ipToString(p->virtualIP()).c_str(),
-                transportName(p->transport(TRAFFIC_TCP)),
-                p->latencyMs(TRAFFIC_TCP),
-                transportName(p->transport(TRAFFIC_UDP)),
-                p->latencyMs(TRAFFIC_UDP));
+                ipToString(p->virtualIP()).c_str());
+        for (int cls = TRAFFIC_TCP; cls <= TRAFFIC_UDP; ++cls) {
+            const TrafficClass trafficClass = static_cast<TrafficClass>(cls);
+            const TransportType transport = p->transport(trafficClass);
+            const ProbeQualitySnapshot quality = p->qualitySnapshot(trafficClass);
+            fprintf(stdout, "    %s traffic: %s RTT=", cls == TRAFFIC_TCP ? "TCP" : "UDP/other",
+                    transportName(transport));
+            if (quality.rttMs < 0) fprintf(stdout, "--");
+            else fprintf(stdout, "%dms", quality.rttMs);
+            if (transport == TRANSPORT_NONE)
+                fprintf(stdout, "  60s probe timeout=connecting");
+            else if (!quality.active || quality.sampling)
+                fprintf(stdout, "  60s probe timeout=sampling");
+            else
+                fprintf(stdout, "  60s probe timeout=%.1f%%", quality.timeoutPercent);
+            fprintf(stdout, " (replies=%u timeouts=%u pending=%u send-failures=%u)",
+                    quality.replies, quality.timeouts, quality.pending, quality.sendFailures);
+            if (quality.localSendFailure)
+                fprintf(stdout, " [local probe submission failed]");
+            else if (quality.outage)
+                fprintf(stdout, transport == TRANSPORT_RELAY_RAW_UDP || transport == TRANSPORT_RELAY_KCP ?
+                        " [UDP path may be restricted]" : " [link response abnormal]");
+            fprintf(stdout, "\n");
+        }
     }
+    if (remotePeers == 0)
+        fprintf(stdout, "  No remote peers; peer link quality cannot be assessed.\n");
+    fprintf(stdout, "  Last 60s, refreshed each second; probe timeout=10s.\n"
+                    "  End-to-end probe timeouts exclude loss repaired by KCP/FEC/TCP; not raw UDP packet loss.\n");
     fprintf(stdout, "------------------\n> ");
     fflush(stdout);
+}
+
+void CliApp::updatePeerQuality() {
+    for (CliPeerConnection* peer : m_tunnel.allPeers()) {
+        if (peer->peerId() == m_signal.myPeerId()) continue;
+        peer->sendLatencyPing();
+        for (int cls = TRAFFIC_TCP; cls <= TRAFFIC_UDP; ++cls) {
+            const TrafficClass trafficClass = static_cast<TrafficClass>(cls);
+            const TransportType transport = peer->transport(trafficClass);
+            const ProbeQualitySnapshot quality = peer->qualitySnapshot(trafficClass);
+            if (transport == TRANSPORT_NONE) continue;
+            QualityLogState& state = m_qualityLogStates[transportKey(peer->peerId(), trafficClass)];
+            if (state.transport != transport) {
+                state.transport = transport;
+                state.anomaly = 0;
+            }
+            const int anomaly = quality.localSendFailure ? 2 : quality.outage ? 1 : 0;
+            if (anomaly == state.anomaly || (!quality.active && anomaly == 0)) continue;
+            const bool localRecovered = anomaly == 0 && state.anomaly == 2;
+            state.anomaly = anomaly;
+            const bool usesUdp = transport == TRANSPORT_RELAY_KCP || transport == TRANSPORT_RELAY_RAW_UDP;
+            const char* advice = anomaly == 2 ? "Local probe submission failed; check local data-channel/transport state" :
+                anomaly == 1 ? (usesUdp ?
+                    "UDP path probes keep timing out; UDP may be restricted. Check server UDP port, firewall and peer state; if needed set BOTH room traffic policies to TCP Relay" :
+                    "Link probes keep timing out; check the TCP relay connection and peer state") :
+                localRecovered ? "Local probe submission has resumed" : "Peer probe responses recovered";
+            LOG_INFO("[quality] event=%s peer=%u class=%s transport=%s window_s=60 replies=%u timeouts=%u pending=%u send_failures=%u rtt_ms=%d timeout_percent=%.1f; %s",
+                     anomaly == 2 ? "local-send-failure" : anomaly == 1 ? "probe-timeout" :
+                         localRecovered ? "local-send-recovered" : "recovered",
+                     peer->peerId(), cls == TRAFFIC_TCP ? "TCP" : "UDP/other", transportName(transport),
+                     quality.replies, quality.timeouts, quality.pending, quality.sendFailures,
+                     quality.rttMs, quality.timeoutPercent, advice);
+        }
+    }
 }
 
 void CliApp::doConnect() {
@@ -1570,6 +1626,9 @@ void CliApp::onPeerResumed(PeerInfo info) {
              transportName(peer->transport(TRAFFIC_UDP)));
     fprintf(stdout, "* %s reconnected, rebuilding relay...\n> ", name.c_str());
     fflush(stdout);
+    peer->resetQuality();
+    m_qualityLogStates.erase(transportKey(info.peerId, TRAFFIC_TCP));
+    m_qualityLogStates.erase(transportKey(info.peerId, TRAFFIC_UDP));
     rebuildPeerTransports(info.peerId);
 }
 
@@ -1617,8 +1676,8 @@ void CliApp::onPeerLeft(uint32_t peerId) {
     CliPeerConnection* peer = m_tunnel.peerById(peerId);
     std::string name = peer ? peer->name() : ("Peer" + std::to_string(peerId));
     clearPendingRebuild(peerId);
-    m_probeWatchdogs.erase(transportKey(peerId, TRAFFIC_TCP));
-    m_probeWatchdogs.erase(transportKey(peerId, TRAFFIC_UDP));
+    m_qualityLogStates.erase(transportKey(peerId, TRAFFIC_TCP));
+    m_qualityLogStates.erase(transportKey(peerId, TRAFFIC_UDP));
     m_tunnel.removePeer(peerId);
     fprintf(stdout, "* Player %s left\n> ", name.c_str());
     fflush(stdout);
@@ -1766,7 +1825,7 @@ void CliApp::teardownTun() {
     cancelTunReadiness();
     m_tunnel.stopDataPlane();
     m_pendingRebuild.clear();
-    m_probeWatchdogs.clear();
+    m_qualityLogStates.clear();
     m_dataChannel.disconnect();
     m_tunnel.removeAllPeers();
     if (m_tun) {
@@ -1877,6 +1936,11 @@ void CliApp::setupTcpRelayTunnel(uint32_t peerId, TrafficClass cls) {
     if (!peer || peer->transport(cls) != TRANSPORT_NONE) return;
 
     uint32_t myId = m_signal.myPeerId();
+    peer->setTcpRelayControlReady([this]() {
+        return m_tunnel.dataPlaneState() == DataPlaneState::Running &&
+               m_tunnel.securityMode() != DataPlaneSecurityMode::Unconfigured &&
+               (m_dataChannel.isConnected() || m_signal.isConnected());
+    });
     peer->setTcpRelaySender([this, myId](uint32_t dstPeerId, TrafficClass trafficClass,
                                          const Buffer& data) {
         if (m_tunnel.dataPlaneState() == DataPlaneState::Running &&
