@@ -9,6 +9,7 @@
 #include <functional>
 #include <sstream>
 #include <algorithm>
+#include "room_operation.h"
 
 #ifdef _WIN32
 #include <winsock2.h>
@@ -58,6 +59,10 @@ public:
     virtual WindowsCommandResult firewallRuleExists(const std::wstring& rule) = 0;
     virtual WindowsCommandResult broadcastRouteExists(const std::wstring& alias) = 0;
     virtual void retryDelay() = 0;
+    virtual bool shouldContinue() const { return true; }
+    virtual unsigned long commandTimeout(unsigned long cap) const { return cap; }
+    virtual void operationStarted(const char*) {}
+    virtual void beginCleanup() {}
 };
 
 struct WindowsNetworkState {
@@ -344,25 +349,29 @@ inline void logWindowsNetwork(const WindowsNetworkLogger& log,
 
 inline bool removeWindowsFirewall(WindowsNetworkCommands& commands,
     WindowsNetworkState& state, const WindowsNetworkLogger& log, const char* operation) {
+    commands.operationStarted(operation);
+    if (!commands.shouldContinue()) return false;
     WindowsCommandResult found = commands.firewallRuleExists(state.firewallRule);
     if (found.absent || !found.ok()) {
         logWindowsNetwork(log, state, operation, 1, found);
         return found.absent;
     }
     WindowsCommandResult result = commands.execute({L"advfirewall", L"firewall",
-        L"delete", L"rule", L"name=" + state.firewallRule}, 10000);
+        L"delete", L"rule", L"name=" + state.firewallRule}, commands.commandTimeout(10000));
     logWindowsNetwork(log, state, operation, 1, result);
     return result.ok();
 }
 
 inline bool rollbackWindowsNetwork(WindowsNetworkCommands& commands,
     WindowsNetworkState& state, const WindowsNetworkLogger& log) {
+    commands.beginCleanup();
     bool ok = true;
     if (state.broadcastActive) {
+        commands.operationStarted("broadcast-remove");
         WindowsCommandResult result = commands.broadcastRouteExists(state.alias);
         if (result.ok() && !result.absent)
             result = commands.execute({L"interface", L"ipv4", L"delete", L"route",
-                L"255.255.255.255/32", state.alias, L"store=active"}, 10000);
+                L"255.255.255.255/32", state.alias, L"store=active"}, commands.commandTimeout(10000));
         logWindowsNetwork(log, state, "broadcast-remove", 1, result);
         if (result.ok() || result.absent) state.broadcastActive = false;
         else ok = false;
@@ -394,7 +403,12 @@ inline bool configureWindowsNetwork(WindowsNetworkCommands& commands,
         if (set) ++prefix; else zeroSeen = true;
     }
     const auto run = [&](const char* operation, std::vector<std::wstring> args) {
-        WindowsCommandResult result = commands.execute(args, 10000);
+        commands.operationStarted(operation);
+        if (!commands.shouldContinue()) {
+            if (error) *error = "Virtual network preparation cancelled or timed out";
+            return false;
+        }
+        WindowsCommandResult result = commands.execute(args, commands.commandTimeout(10000));
         logWindowsNetwork(log, state, operation, 1, result);
         if (!result.ok() && error) {
             std::ostringstream out;
@@ -422,10 +436,12 @@ inline bool configureWindowsNetwork(WindowsNetworkCommands& commands,
     const std::wstring localAddresses = windowsAscii(windowsIPv4(ip) + "," +
         windowsIPv4((ip & mask) | ~mask) + ",255.255.255.255");
     for (int attempt = 1; attempt <= 3; ++attempt) {
+        commands.operationStarted("firewall-add");
+        if (!commands.shouldContinue()) return fail("Virtual network preparation cancelled or timed out");
         WindowsCommandResult result = commands.execute({L"advfirewall", L"firewall",
             L"add", L"rule", L"name=" + state.firewallRule, L"dir=in",
             L"action=allow", L"localip=" + localAddresses,
-            L"remoteip=" + subnet, L"profile=any", L"enable=yes"}, 10000);
+            L"remoteip=" + subnet, L"profile=any", L"enable=yes"}, commands.commandTimeout(10000));
         logWindowsNetwork(log, state, "firewall-add", attempt, result);
         if (result.ok()) { state.firewallActive = true; break; }
         // A timed out command may have committed before termination. Reconcile
@@ -441,10 +457,12 @@ inline bool configureWindowsNetwork(WindowsNetworkCommands& commands,
     // Address assignment can create a default /32 with a much higher metric.
     // Replace only this newly created virtual interface's limited broadcast
     // route; routes on physical/VPN interfaces remain untouched.
+    commands.operationStarted("broadcast-precleanup");
+    if (!commands.shouldContinue()) return fail("Virtual network preparation cancelled or timed out");
     WindowsCommandResult previousRoute = commands.broadcastRouteExists(state.alias);
     if (previousRoute.ok() && !previousRoute.absent)
         previousRoute = commands.execute({L"interface", L"ipv4", L"delete", L"route",
-            L"255.255.255.255/32", state.alias, L"store=active"}, 10000);
+            L"255.255.255.255/32", state.alias, L"store=active"}, commands.commandTimeout(10000));
     logWindowsNetwork(log, state, "broadcast-precleanup", 1, previousRoute);
     if (!previousRoute.ok() && !previousRoute.absent)
         return fail("Virtual broadcast route precleanup failed");
@@ -473,9 +491,20 @@ inline std::wstring quoteWindowsArgument(const std::wstring& argument) {
 
 class SystemWindowsNetworkCommands : public WindowsNetworkCommands {
 public:
+    explicit SystemWindowsNetworkCommands(std::shared_ptr<RoomTaskControl> control = std::shared_ptr<RoomTaskControl>())
+        : m_control(control), m_cleanup(false) {}
+    bool shouldContinue() const override { return m_cleanup || !m_control || m_control->allowed(); }
+    unsigned long commandTimeout(unsigned long cap) const override {
+        if (m_cleanup) return (std::min)(cap, 5000ul);
+        return m_control ? m_control->remainingMs(cap) : cap;
+    }
+    void operationStarted(const char* operation) override { if (m_control) m_control->report(operation); }
+    void beginCleanup() override { m_cleanup = true; }
     WindowsCommandResult execute(const std::vector<std::wstring>& arguments,
                                  unsigned long timeoutMs) override {
         WindowsCommandResult result;
+        timeoutMs = commandTimeout(timeoutMs);
+        if (!shouldContinue() || !timeoutMs) return interruptedResult();
         const ULONGLONG started = GetTickCount64();
         result.parentConsoleCodePage = GetConsoleOutputCP();
         std::string rawOutput;
@@ -537,6 +566,14 @@ public:
                 }
                 DWORD wait = WaitForSingleObject(process.hProcess, 20);
                 if (wait == WAIT_OBJECT_0) { finished = true; continue; }
+                if (!shouldContinue()) {
+                    result.systemError = m_control && m_control->cancelled() ? ERROR_CANCELLED : ERROR_TIMEOUT;
+                    result.timedOut = result.systemError == ERROR_TIMEOUT;
+                    TerminateProcess(process.hProcess, result.systemError);
+                    WaitForSingleObject(process.hProcess, 1000);
+                    finished = true;
+                    continue;
+                }
                 if (wait == WAIT_FAILED) {
                     result.systemError = GetLastError();
                     TerminateProcess(process.hProcess, result.systemError);
@@ -563,6 +600,7 @@ public:
     }
 
     WindowsCommandResult firewallRuleExists(const std::wstring& rule) override {
+        if (!shouldContinue()) return interruptedResult();
         WindowsCommandResult result;
         ULONGLONG started = GetTickCount64();
         HRESULT init = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
@@ -584,12 +622,18 @@ public:
         if (rules) rules->Release();
         if (policy) policy->Release();
         if (uninitialize) CoUninitialize();
+        if (!shouldContinue()) {
+            WindowsCommandResult stopped = interruptedResult();
+            stopped.elapsedMs = static_cast<DWORD>(GetTickCount64() - started);
+            return stopped;
+        }
         result.elapsedMs = static_cast<DWORD>(GetTickCount64() - started);
         result.output = result.absent ? "Exact firewall rule does not exist" :
             result.ok() ? "Exact firewall rule exists" : "Firewall rule lookup failed";
         return result;
     }
     WindowsCommandResult broadcastRouteExists(const std::wstring& alias) override {
+        if (!shouldContinue()) return interruptedResult();
         WindowsCommandResult result;
         const ULONGLONG started = GetTickCount64();
         MIB_IPFORWARD_ROW2 row;
@@ -605,12 +649,29 @@ public:
         }
         if (status == ERROR_NOT_FOUND || status == ERROR_FILE_NOT_FOUND) result.absent = true;
         else result.systemError = status;
+        if (!shouldContinue()) {
+            WindowsCommandResult stopped = interruptedResult();
+            stopped.elapsedMs = static_cast<DWORD>(GetTickCount64() - started);
+            return stopped;
+        }
         result.output = result.absent ? "Exact interface broadcast route does not exist" :
             result.ok() ? "Exact interface broadcast route exists" : "Broadcast route lookup failed";
         result.elapsedMs = static_cast<DWORD>(GetTickCount64() - started);
         return result;
     }
-    void retryDelay() override { Sleep(250); }
+    void retryDelay() override {
+        for (int i = 0; i < 10 && shouldContinue(); ++i) Sleep(25);
+    }
+private:
+    WindowsCommandResult interruptedResult() const {
+        WindowsCommandResult result;
+        result.systemError = m_control && m_control->cancelled() ? ERROR_CANCELLED : ERROR_TIMEOUT;
+        result.timedOut = result.systemError == ERROR_TIMEOUT;
+        result.output = result.timedOut ? "Room preparation deadline expired" : "Room preparation cancelled";
+        return result;
+    }
+    std::shared_ptr<RoomTaskControl> m_control;
+    bool m_cleanup;
 };
 
 inline bool checkWindowsOverlayRoute(const std::wstring& alias, uint32_t ip,

@@ -14,7 +14,7 @@ namespace VLan {
 SignalClient::SignalClient(QObject* parent)
     : QObject(parent), m_socket(nullptr), m_myPeerId(0), m_serverPort(0), m_connectTimeoutMs(8000),
       m_lastRecvTime(0), m_connectStartedMs(0), m_authStartedMs(0), m_pingSentTime(0), m_joinPending(false), m_roomOperationPending(false), m_authOperation(0),
-      m_pendingCreateMtu(ROOM_MTU_DEFAULT),
+      m_blockRoomResponses(false), m_pendingCreateMtu(ROOM_MTU_DEFAULT),
       m_serverAuthRequired(false), m_secureReady(false),
       m_fatalDisconnectPending(false), m_secureSessionId(0),
       m_roomListRevision(0), m_snapshotRevision(0),
@@ -86,6 +86,7 @@ void SignalClient::resetSecureState() {
     m_authOperation = 0;
     m_joinPending = false;
     m_roomOperationPending = false;
+    m_blockRoomResponses = false;
     crypto_wipe(m_expectedServerProof, sizeof(m_expectedServerProof));
     crypto_wipe(m_roomChallenge, sizeof(m_roomChallenge));
     crypto_wipe(m_authSalt, sizeof(m_authSalt));
@@ -199,6 +200,7 @@ void SignalClient::createRoom(const QString& roomName, uint8_t maxPlayers,
                               RoomTrafficPolicy udpPolicy, uint16_t mtu,
                               bool passwordProtected, const QString& password) {
     if (m_roomOperationPending || m_authOperation != 0 || !m_secureReady) return;
+    m_blockRoomResponses = false;
     m_roomOperationPending = true;
     ByteBuffer bb;
     bb.writeString(roomName.toStdString());
@@ -226,6 +228,7 @@ void SignalClient::createRoom(const QString& roomName, uint8_t maxPlayers,
 
 void SignalClient::joinRoom(uint32_t roomId, const QString& password) {
     if (m_roomOperationPending || m_authOperation != 0 || !m_secureReady || roomId == 0) return;
+    m_blockRoomResponses = false;
     m_roomOperationPending = true;
     if (!m_pendingRoomPassword.isEmpty()) crypto_wipe(m_pendingRoomPassword.data(), m_pendingRoomPassword.size());
     m_pendingRoomPassword = password.toUtf8(); m_joinPending = true;
@@ -235,6 +238,7 @@ void SignalClient::joinRoom(uint32_t roomId, const QString& password) {
 void SignalClient::resumeRoom(uint32_t roomId, uint32_t peerId,
                               const QByteArray& resumeToken) {
     if (m_roomOperationPending || !m_secureReady || resumeToken.size() != RECONNECT_TOKEN_SIZE) return;
+    m_blockRoomResponses = false;
     m_roomOperationPending = true;
     ByteBuffer bb;
     bb.writeU32(roomId);
@@ -251,8 +255,13 @@ void SignalClient::leaveRoom() {
 }
 
 void SignalClient::logout() {
-    cancelRoomOperation();
+    abandonRoomOperation();
     sendMsg(MSG_LOGOUT);
+}
+
+void SignalClient::abandonRoomOperation() {
+    m_blockRoomResponses = true;
+    cancelRoomOperation();
 }
 
 void SignalClient::listRooms() {
@@ -446,6 +455,13 @@ void SignalClient::sendServerAuth() {
 }
 
 void SignalClient::pollAuthTask() {
+    if ((m_authOperation == 2 || m_authOperation == 3) && m_roomOperationGuard &&
+        !m_roomOperationGuard()) {
+        m_blockRoomResponses = true;
+        cancelRoomOperation();
+        emit roomOperationUncertain(QStringLiteral("Room request deadline exceeded."));
+        return;
+    }
     AuthKdfTask::Result result;
     if (!m_authTask.poll(result)) return;
     const int operation = m_authOperation; m_authOperation = 0;
@@ -736,6 +752,10 @@ bool SignalClient::processMessage(uint8_t msgType,
             return true;
         }
         case MSG_ROOM_CREATED: {
+            if (m_blockRoomResponses) {
+                LogManager::instance().logNormal("[room-op] Ignored late ROOM_CREATED while cancelling the old session");
+                return true;
+            }
             m_roomOperationPending = false;
             const uint32_t roomId = bb.readU32();
             const uint32_t vip = bb.readU32();
@@ -752,6 +772,10 @@ bool SignalClient::processMessage(uint8_t msgType,
             return true;
         }
         case MSG_JOIN_RESP: {
+            if (m_blockRoomResponses) {
+                LogManager::instance().logNormal("[room-op] Ignored late JOIN_RESP while cancelling the old session");
+                return true;
+            }
             m_roomOperationPending = false;
             m_joinPending = false;
             const uint32_t roomId = bb.readU32();
@@ -906,6 +930,16 @@ bool SignalClient::processMessage(uint8_t msgType,
             return true;
 
         case MSG_AUTH_CHALLENGE: {
+            if (m_blockRoomResponses) {
+                LogManager::instance().logNormal("[room-op] Ignored late room authentication challenge while cancelling");
+                return true;
+            }
+            if (m_roomOperationGuard && !m_roomOperationGuard()) {
+                m_blockRoomResponses = true;
+                cancelRoomOperation();
+                emit roomOperationUncertain(QStringLiteral("Room request deadline exceeded."));
+                return true;
+            }
             const uint8_t profile = bb.readU8();
             if (profile != AUTH_KDF_PROFILE) {
                 failAuthentication(AuthErrorCode::UnsupportedKdf, QStringLiteral("Unsupported room KDF profile.")); return false;
@@ -919,10 +953,22 @@ bool SignalClient::processMessage(uint8_t msgType,
         }
 
         case MSG_ERROR: {
-            cancelRoomOperation();
             const uint16_t code = bb.readU16();
             const QString message = QString::fromStdString(bb.readString());
+            if (m_blockRoomResponses && !isFatalAuthError(code)) {
+                LogManager::instance().logNormal("[room-op] Ignored late room error while cancelling");
+                return true;
+            }
             if (isFatalAuthError(code)) { failAuthentication(static_cast<AuthErrorCode>(code), message); return false; }
+            if (m_roomOperationPending && code == static_cast<uint16_t>(AuthErrorCode::General)) {
+                // v9 has no request correlation ID. This may belong to an
+                // earlier request; do not clear pending and accept a later
+                // success as if the server transaction were known to fail.
+                m_blockRoomResponses = true;
+                emit roomOperationUncertain(message);
+                return true;
+            }
+            cancelRoomOperation();
             if (code == static_cast<uint16_t>(AuthErrorCode::RoomPassword)) {
                 QPointer<SignalClient> guard(this); emit fatalAuthError(code, message);
                 if (guard.isNull()) return false;

@@ -3,6 +3,7 @@
 #include "signal_message_validator.h"
 #include "tcp_frame_probe.h"
 #include "traffic_policy_codec.h"
+#include "room_operation.h"
 #include <cstring>
 #include <algorithm>
 
@@ -16,7 +17,7 @@ namespace VLan {
 
 CliSignalClient::CliSignalClient()
     : m_myPeerId(0), m_pingSentTime(0), m_connectStartTime(0), m_authStartedMs(0), m_authOperation(0), m_pendingCreateMtu(ROOM_MTU_DEFAULT), m_hasPendingAuth(false),
-      m_roomOperationPending(false), m_sendFailurePending(false),
+      m_roomOperationPending(false), m_discardRoomResponses(false), m_roomRequestStarted(0), m_sendFailurePending(false),
       m_serverAuthRequired(false), m_secureReady(false),
       m_disconnectNotified(false), m_secureSessionId(0),
       m_roomListRevision(0), m_snapshotRevision(0),
@@ -50,6 +51,7 @@ void CliSignalClient::resetSecureState() {
     cancelRoomOperation();
     m_authTask.cancel(); m_authOperation = 0;
     m_roomOperationPending = false; m_sendFailurePending = false;
+    m_discardRoomResponses = false; m_roomRequestStarted = 0;
     crypto_wipe(m_authSalt, sizeof(m_authSalt));
     crypto_wipe(m_expectedServerProof, sizeof(m_expectedServerProof));
     crypto_wipe(m_roomChallenge, sizeof(m_roomChallenge));
@@ -129,6 +131,7 @@ void CliSignalClient::createRoom(const std::string& roomName, uint8_t maxPlayers
                                  uint16_t mtu, bool passwordProtected, const std::string& password) {
     if (m_roomOperationPending || m_authOperation != 0 || !m_secureReady) return;
     m_roomOperationPending = true;
+    m_discardRoomResponses = false; m_roomRequestStarted = roomMonotonicMs();
     ByteBuffer bb; bb.writeString(roomName); bb.writeU8(maxPlayers);
     bb.writeU8(static_cast<uint8_t>(tcpPolicy.transportMode));
     bb.writeU8(static_cast<uint8_t>(tcpPolicy.fecMode));
@@ -148,6 +151,7 @@ void CliSignalClient::createRoom(const std::string& roomName, uint8_t maxPlayers
 void CliSignalClient::joinRoom(uint32_t roomId, const std::string& password) {
     if (m_roomOperationPending || m_authOperation != 0 || !m_secureReady || roomId == 0) return;
     m_roomOperationPending = true;
+    m_discardRoomResponses = false; m_roomRequestStarted = roomMonotonicMs();
     if (!m_pendingRoomPassword.empty()) crypto_wipe(&m_pendingRoomPassword[0], m_pendingRoomPassword.size());
     m_pendingRoomPassword = password; m_hasPendingAuth = true;
     ByteBuffer bb; bb.writeU32(roomId); sendMsg(MSG_JOIN_ROOM, bb);
@@ -156,6 +160,7 @@ void CliSignalClient::joinRoom(uint32_t roomId, const std::string& password) {
 void CliSignalClient::resumeRoom(uint32_t roomId, uint32_t peerId, const uint8_t* resumeToken) {
     if (m_roomOperationPending || !m_secureReady || !resumeToken) return;
     m_roomOperationPending = true;
+    m_discardRoomResponses = false; m_roomRequestStarted = roomMonotonicMs();
     ByteBuffer bb;
     bb.writeU32(roomId);
     bb.writeU32(peerId);
@@ -167,7 +172,8 @@ void CliSignalClient::leaveRoom() {
     if (m_roomOperationPending) { cancelRoomOperation(); m_sendFailurePending = true; return; }
     sendMsg(MSG_LEAVE_ROOM);
 }
-void CliSignalClient::logout() { cancelRoomOperation(); sendMsg(MSG_LOGOUT); }
+void CliSignalClient::abandonRoomOperation() { cancelRoomOperation(); m_discardRoomResponses = true; }
+void CliSignalClient::logout() { abandonRoomOperation(); sendMsg(MSG_LOGOUT); }
 void CliSignalClient::listRooms() { sendMsg(MSG_LIST_ROOMS); }
 
 void CliSignalClient::requestRelay(uint32_t targetPeerId) {
@@ -399,6 +405,12 @@ void CliSignalClient::checkTimeouts() {
     if (m_sendFailurePending) {
         m_conn.reset(); resetSecureState(); notifyDisconnectedOnce(); return;
     }
+    if (m_roomOperationPending && roomMonotonicMs() - m_roomRequestStarted >= 15000) {
+        abandonRoomOperation();
+        if (onRoomOperationFailure) onRoomOperationFailure("Room request timed out after 15 seconds");
+        else { m_sendFailurePending = true; if (onServerError) onServerError("Room request timed out after 15 seconds"); }
+        return;
+    }
     pollAuthTask();
     if (!m_conn.connected && m_conn.connecting) {
         if (currentTimeMs() - m_connectStartTime > 8000) {
@@ -566,6 +578,15 @@ bool CliSignalClient::processMessage(uint8_t msgType,
             return true;
         }
         case MSG_ROOM_CREATED: {
+            if (m_roomOperationPending && roomMonotonicMs() - m_roomRequestStarted >= 15000) {
+                abandonRoomOperation();
+                if (onRoomOperationFailure) onRoomOperationFailure("Room response arrived after its deadline");
+                else m_sendFailurePending = true;
+            }
+            if (!m_roomOperationPending || m_discardRoomResponses) {
+                LOG_INFO("[room-operation] ignored late/unexpected ROOM_CREATED");
+                return true;
+            }
             m_roomOperationPending = false;
             const uint32_t roomId = bb.readU32();
             const uint32_t virtualIP = bb.readU32();
@@ -583,6 +604,15 @@ bool CliSignalClient::processMessage(uint8_t msgType,
             return true;
         }
         case MSG_JOIN_RESP: {
+            if (m_roomOperationPending && roomMonotonicMs() - m_roomRequestStarted >= 15000) {
+                abandonRoomOperation();
+                if (onRoomOperationFailure) onRoomOperationFailure("Room response arrived after its deadline");
+                else m_sendFailurePending = true;
+            }
+            if (!m_roomOperationPending || m_discardRoomResponses) {
+                LOG_INFO("[room-operation] ignored late/unexpected JOIN_RESP");
+                return true;
+            }
             m_roomOperationPending = false;
             const uint32_t roomId = bb.readU32();
             const uint32_t virtualIP = bb.readU32();
@@ -740,6 +770,9 @@ bool CliSignalClient::processMessage(uint8_t msgType,
             return true;
 
         case MSG_AUTH_CHALLENGE: {
+            if (m_discardRoomResponses) {
+                LOG_INFO("[room-operation] ignored room challenge during cancelled-session cleanup"); return true;
+            }
             const uint8_t profile = bb.readU8();
             if (profile != AUTH_KDF_PROFILE) { failAuthentication(AuthErrorCode::UnsupportedKdf, "unsupported room KDF profile"); return false; }
             if (!m_hasPendingAuth) { failSignalFrame(msgType, len, "unexpected-room-challenge", 0); return false; }
@@ -751,10 +784,20 @@ bool CliSignalClient::processMessage(uint8_t msgType,
         }
 
         case MSG_ERROR: {
-            cancelRoomOperation();
             const uint16_t code = bb.readU16();
             const std::string message = bb.readString();
             if (isFatalAuthError(code)) { failAuthentication(static_cast<AuthErrorCode>(code), message); return false; }
+            if (m_discardRoomResponses) {
+                LOG_INFO("[room-operation] ignored late error during cancelled-session cleanup"); return true;
+            }
+            const bool roomPending = m_roomOperationPending;
+            if (roomPending && code != static_cast<uint16_t>(AuthErrorCode::RoomPassword)) {
+                abandonRoomOperation();
+                if (onRoomOperationFailure) onRoomOperationFailure(message);
+                else m_sendFailurePending = true;
+            } else {
+                cancelRoomOperation();
+            }
             if (code == static_cast<uint16_t>(AuthErrorCode::RoomPassword) && onFatalAuthError) onFatalAuthError(code, message);
             if (!m_pendingRoomPassword.empty()) crypto_wipe(&m_pendingRoomPassword[0], m_pendingRoomPassword.size());
     m_pendingRoomPassword.clear();

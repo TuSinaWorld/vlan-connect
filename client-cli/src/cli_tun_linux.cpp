@@ -15,6 +15,7 @@
 #include <linux/netlink.h>
 #include <fcntl.h>
 #include <unistd.h>
+#include <poll.h>
 
 namespace VLan {
 
@@ -22,8 +23,11 @@ namespace {
 
 class SystemNetlinkTransport : public NetlinkTransport {
 public:
+    explicit SystemNetlinkTransport(const std::shared_ptr<RoomTaskControl>& control = std::shared_ptr<RoomTaskControl>())
+        : m_control(control) {}
     bool transact(const Buffer& request, int* errorCode) override {
         if (errorCode) *errorCode = 0;
+        if (m_control && !m_control->allowed()) { if (errorCode) *errorCode = ECANCELED; return false; }
         int fd = socket(AF_NETLINK, SOCK_RAW, NETLINK_ROUTE);
         if (fd < 0) {
             if (errorCode) *errorCode = errno;
@@ -50,7 +54,16 @@ public:
             return false;
         }
         uint8_t reply[8192];
+        const uint64_t started = roomMonotonicMs();
         for (;;) {
+            if ((m_control && !m_control->allowed()) || roomMonotonicMs() - started >= 2000) {
+                if (errorCode) *errorCode = m_control && m_control->cancelled() ? ECANCELED : ETIMEDOUT;
+                close(fd); return false;
+            }
+            struct pollfd descriptor = {fd, POLLIN, 0};
+            const int ready = poll(&descriptor, 1, 50);
+            if (ready == 0 || (ready < 0 && errno == EINTR)) continue;
+            if (ready < 0) { if (errorCode) *errorCode = errno; close(fd); return false; }
             ssize_t received = recv(fd, reply, sizeof(reply), 0);
             if (received < 0) {
                 if (errno == EINTR) continue;
@@ -75,10 +88,12 @@ public:
             }
         }
     }
+private:
+    std::shared_ptr<RoomTaskControl> m_control;
 };
 
 SystemNetlinkTransport g_systemNetlink;
-uint32_t g_netlinkSequence = 1;
+std::atomic<uint32_t> g_netlinkSequence(1);
 
 void appendAttribute(Buffer& request, uint16_t type,
                      const void* data, size_t length) {
@@ -234,6 +249,7 @@ CliTunAdapter::~CliTunAdapter() {
 }
 
 bool CliTunAdapter::initialize(const std::string& adapterName) {
+    if (m_setupControl && !m_setupControl->allowed()) return false;
     m_tunFd = open("/dev/net/tun", O_RDWR);
     if (m_tunFd < 0) {
         LOG_ERR("Failed to open /dev/net/tun (need root?)");
@@ -262,10 +278,11 @@ bool CliTunAdapter::initialize(const std::string& adapterName) {
     }
 
     LOG_INFO("TUN interface created: %s", ifr.ifr_name);
-    return true;
+    return !m_setupControl || m_setupControl->allowed();
 }
 
 bool CliTunAdapter::configureIP(uint32_t ip, uint32_t mask, int mtu) {
+    if (m_setupControl && !m_setupControl->allowed()) return false;
     m_ip   = ip;
     m_mask = mask;
     m_configurationError.clear();
@@ -276,7 +293,9 @@ bool CliTunAdapter::configureIP(uint32_t ip, uint32_t mask, int mtu) {
     }
     int errorCode = 0;
     LinuxTunConfiguration state;
-    if (!configureLinuxTun(m_netlinkTransport, m_interfaceIndex,
+    SystemNetlinkTransport controlled(m_setupControl);
+    NetlinkTransport* transport = m_netlinkTransport == &g_systemNetlink ? &controlled : m_netlinkTransport;
+    if (!configureLinuxTun(transport, m_interfaceIndex,
                            ip, mask, mtu, &state, &errorCode)) {
         m_configurationError = std::string("TUN rtnetlink configuration failed: ") +
             strerror(errorCode ? errorCode : EIO);
@@ -319,6 +338,7 @@ WindowsReadinessResult CliTunAdapter::pollReadiness() {
 void CliTunAdapter::cancelReadiness() {}
 
 bool CliTunAdapter::startSession() {
+    if (m_setupControl && !m_setupControl->allowed()) return false;
     if (m_tunFd < 0) return false;
     m_running = true;
     m_readThread = std::thread(&CliTunAdapter::readLoop, this);

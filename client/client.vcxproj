@@ -166,6 +166,8 @@
     <ClInclude Include="..\common\byte_buffer.h" />
     <ClInclude Include="..\common\traffic_policy_codec.h" />
     <ClInclude Include="..\common\probe_quality.h" />
+    <ClInclude Include="..\common\room_operation.h" />
+    <ClInclude Include="src\core\tun_lifecycle_task.h" />
     <ClInclude Include="..\3rdparty\kcp\ikcp.h" />
     <ClInclude Include="..\3rdparty\cm256cc\cm256.h" />
     <ClInclude Include="..\3rdparty\cm256cc\gf256.h" />

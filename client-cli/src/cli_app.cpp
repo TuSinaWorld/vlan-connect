@@ -256,6 +256,8 @@ CliApp::CliApp()
     : m_port(DEFAULT_PORT), m_tun(nullptr),
       m_tunSetupPending(false), m_tunSetupIsCreate(false),
       m_tunSetupLastPoll(0), m_tunSetupGeneration(0),
+      m_connectionGeneration(0), m_roomRecovery(false), m_roomRecoveryAttempt(false),
+      m_roomRecoveryScheduled(false), m_roomRecoveryAt(0), m_cleanupWarned(false), m_stopAfterCleanup(false),
       m_currentRoomId(0), m_myVirtualIP(0),
       m_tcpPolicy(makeDefaultTcpPolicy()),
       m_udpPolicy(makeDefaultUdpPolicy()),
@@ -289,6 +291,8 @@ CliApp::~CliApp() {
 }
 
 void CliApp::setServer(const std::string& host, uint16_t port) {
+    m_roomRecoveryScheduled = false;
+    m_roomRecoveryAttempt = false;
     m_serverHost = host;
     m_port = port;
     m_serverPassword.clear();
@@ -355,6 +359,7 @@ void CliApp::setupCallbacks() {
     m_signal.onConnectFailed = [this](const std::string& reason) {
         fprintf(stdout, "* Connection failed: %s\n", reason.c_str());
         fflush(stdout);
+        if (m_roomRecoveryAttempt) { m_roomRecoveryAttempt = false; m_wantReconnect = false; return; }
         if (m_wantReconnect)
             m_nextReconnectTime = currentTimeMs() +
                 reconnectDelayMs(m_reconnectAttempts);
@@ -427,25 +432,23 @@ void CliApp::setupCallbacks() {
         m_pendingResumeRoom = false;
         m_wasInRoom = false;
         clearResumeLease();
+        m_roomRecoveryScheduled = false;
+        m_roomRecoveryAttempt = false;
+        if (!m_tunJob && !m_roomReady) m_roomOperation.finishCleanup();
         LOG_ERR("Automatic reconnect stopped: code=%u reason=%s", code, msg.c_str());
     };
     m_signal.onServerError   = [this](const std::string& msg) {
         fprintf(stdout, "* Server error: %s\n> ", msg.c_str());
         fflush(stdout);
-        if (m_pendingResumeRoom) {
-            m_pendingResumeRoom = false;
-            clearResumeLease();
-            if (m_wasInRoom && !m_savedRoomName.empty()) {
-                m_wantReconnect = true;
-                m_signal.listRooms();
-                return;
-            }
-        }
         if (m_signal.myPeerId() == 0) {
+            if (m_roomRecoveryAttempt) { m_roomRecoveryAttempt = false; m_wantReconnect = false; }
             m_signal.disconnect();
             if (m_wantReconnect)
                 m_nextReconnectTime = currentTimeMs() + RECONNECT_INTERVAL_MS;
         }
+    };
+    m_signal.onRoomOperationFailure = [this](const std::string& reason) {
+        recoverRoomOperation(reason);
     };
     m_signal.onServerRtt     = [this](int rtt) {
         LOG_DBG("Server RTT: %d ms", rtt);
@@ -749,6 +752,7 @@ void CliApp::eventLoop() {
 
         /* Timers */
         uint32_t now = currentTimeMs();
+        pollRoomOperation();
         if (m_tunSetupPending && now - m_tunSetupLastPoll >= 100) {
             m_tunSetupLastPoll = now;
             pollTunReadiness();
@@ -799,9 +803,16 @@ void CliApp::eventLoop() {
             updatePeerQuality();
         }
 
-        if (m_logoutPending && now >= m_logoutDeadline) {
+        if (m_logoutPending && static_cast<int32_t>(now - m_logoutDeadline) >= 0) {
             finishGracefulDisconnect();
         }
+        if (m_roomRecoveryScheduled && !m_tunJob && m_signal.fd() == SOCK_INVALID &&
+            roomMonotonicMs() >= m_roomRecoveryAt && !m_authRetryBlocked) {
+            m_roomRecoveryScheduled = false;
+            m_roomRecoveryAttempt = true;
+            doConnect();
+        }
+        if (m_stopAfterCleanup && !m_tunJob && !m_logoutPending) m_running = false;
 
         if (m_securityReconnectPending) {
             m_securityReconnectPending = false;
@@ -813,7 +824,7 @@ void CliApp::eventLoop() {
             }
         }
 
-        if (!m_authRetryBlocked && m_wantReconnect && m_signal.fd() == SOCK_INVALID
+        if (!m_authRetryBlocked && m_wantReconnect && !m_tunJob && m_signal.fd() == SOCK_INVALID
             && now >= m_nextReconnectTime) {
             if (m_reconnectAttempts >= MAX_RECONNECT_ATTEMPTS) {
                 m_wantReconnect = false;
@@ -979,6 +990,12 @@ void CliApp::printStatus() {
     fprintf(stdout, "  Room:      %u\n", m_currentRoomId);
     fprintf(stdout, "  Data plane: %s\n", m_roomReady ? "ready" :
             m_tunSetupPending ? "preparing virtual network" : "not ready");
+    fprintf(stdout, "  Room operation: %s (id=%llu elapsed=%llums)%s\n",
+            roomOperationPhaseName(m_roomOperation.phase()),
+            static_cast<unsigned long long>(m_roomOperation.id()),
+            static_cast<unsigned long long>(m_roomOperation.phase() == RoomOperationPhase::Idle ? 0 :
+                m_roomOperation.elapsedMs(roomMonotonicMs())), m_tunJob && m_roomOperation.cleanupSlow(roomMonotonicMs()) ?
+                "; cleanup not finished; adapter remains owned by its worker" : "");
     if (m_myVirtualIP)
         fprintf(stdout, "  VirtualIP: %s\n", ipToString(m_myVirtualIP).c_str());
     std::string tcpText = policyText(m_tcpPolicy);
@@ -1084,6 +1101,7 @@ void CliApp::updatePeerQuality() {
 }
 
 void CliApp::doConnect() {
+    if (!m_roomRecoveryAttempt) m_roomRecoveryScheduled = false;
     m_authRetryBlocked = false;
     m_securityReconnectPending = false;
     if (m_signal.isConnected()) {
@@ -1091,6 +1109,11 @@ void CliApp::doConnect() {
         fflush(stdout);
         return;
     }
+    if (m_tunJob) {
+        fprintf(stdout, "* Previous virtual network cleanup is not complete; wait before reconnecting\n> ");
+        fflush(stdout); return;
+    }
+    ++m_connectionGeneration;
     if (!m_wantReconnect) {
         expireResumeLeaseIfNeeded();
         if (!(m_wasInRoom && hasUsableResumeLease()))
@@ -1133,6 +1156,15 @@ void CliApp::doConnect() {
 }
 
 void CliApp::doDisconnect() {
+    m_roomRecovery = false;
+    m_roomRecoveryScheduled = false;
+    m_roomRecoveryAttempt = false;
+    m_wantReconnect = false;
+    m_pendingResumeRoom = false;
+    m_wasInRoom = false;
+    clearResumeLease();
+    m_serverPassword.clear();
+    m_signal.setServerPassword("");
     if (!m_signal.isConnected() && m_signal.fd() == SOCK_INVALID) {
         fprintf(stdout, "* Already disconnected\n> ");
         fflush(stdout);
@@ -1142,7 +1174,7 @@ void CliApp::doDisconnect() {
 }
 
 void CliApp::doCreateRoom(const std::string& args) {
-    if (m_signal.roomOperationPending()) {
+    if (roomOperationBusy() || m_signal.roomOperationPending()) {
         fprintf(stdout, "* A room request is already pending; wait for its result\n> ");
         fflush(stdout);
         return;
@@ -1266,12 +1298,14 @@ void CliApp::doCreateRoom(const std::string& args) {
             passwordProtected ? "[password]" : "");
     fflush(stdout);
 
+    if (!beginRoomRequest()) return;
     m_signal.createRoom(roomName, static_cast<uint8_t>(maxPlayers),
                         m_savedTcpPolicy, m_savedUdpPolicy,
                         roomMtu, passwordProtected, password);
+    if (!m_signal.roomOperationPending()) m_roomOperation.finishCleanup();
 }
 void CliApp::doJoinRoom(const std::string& args) {
-    if (m_signal.roomOperationPending()) {
+    if (roomOperationBusy() || m_signal.roomOperationPending()) {
         fprintf(stdout, "* A room request is already pending; wait for its result\n> ");
         fflush(stdout);
         return;
@@ -1327,19 +1361,14 @@ void CliApp::doJoinRoom(const std::string& args) {
 
     fprintf(stdout, "* Joining room %u ...\n", roomId);
     fflush(stdout);
+    if (!beginRoomRequest()) return;
     m_signal.joinRoom(roomId, password);
+    if (!m_signal.roomOperationPending()) m_roomOperation.finishCleanup();
 }
 
 void CliApp::doLeaveRoom() {
-    if (m_signal.roomOperationPending()) {
-        m_wantReconnect = false;
-        m_manualDisconnecting = true;
-        m_pendingResumeRoom = false;
-        clearResumeLease();
-        resetRoomRuntimeState(true);
-        m_signal.leaveRoom();
-        fprintf(stdout, "* Pending room request cancelled; reconnect before choosing another room\n> ");
-        fflush(stdout);
+    if (m_roomOperation.pending() || m_signal.roomOperationPending()) {
+        recoverRoomOperation("Room operation cancelled by user");
         return;
     }
     if (m_currentRoomId == 0) {
@@ -1353,6 +1382,7 @@ void CliApp::doLeaveRoom() {
     m_pendingResumeRoom = false;
     clearResumeLease();
     resetRoomRuntimeState(true);
+    if (!m_tunJob) m_roomOperation.finishCleanup();
     fprintf(stdout, "* Left room\n> ");
     fflush(stdout);
 }
@@ -1360,6 +1390,9 @@ void CliApp::doLeaveRoom() {
 // ───────── Signal callbacks ─────────
 
 void CliApp::beginGracefulDisconnect(bool exitAfterDisconnect) {
+    m_roomRecovery = false;
+    m_roomRecoveryScheduled = false;
+    m_roomRecoveryAttempt = false;
     m_securityReconnectPending = false;
     m_wantReconnect = false;
     m_pendingResumeRoom = false;
@@ -1383,6 +1416,7 @@ void CliApp::beginGracefulDisconnect(bool exitAfterDisconnect) {
 }
 
 void CliApp::finishGracefulDisconnect() {
+    if (m_roomRecovery) { completeRoomRecovery(); return; }
     m_logoutPending = false;
     m_logoutDeadline = 0;
     teardownTun();
@@ -1391,7 +1425,8 @@ void CliApp::finishGracefulDisconnect() {
     if (m_signal.fd() != SOCK_INVALID)
         m_signal.disconnect();
     if (m_exitAfterDisconnect) {
-        m_running = false;
+        m_stopAfterCleanup = true;
+        if (!m_tunJob) m_running = false;
     } else {
         m_manualDisconnecting = false;
         m_exitAfterDisconnect = false;
@@ -1418,6 +1453,19 @@ void CliApp::onSignalConnected() {
 }
 
 void CliApp::onSignalDisconnected() {
+    if (m_roomRecovery) { completeRoomRecovery(); return; }
+    if (m_roomRecoveryAttempt) {
+        m_roomRecoveryAttempt = false; m_wantReconnect = false;
+        m_manualDisconnecting = false; teardownTun(); resetRoomRuntimeState(true);
+        fprintf(stdout, "* Lobby recovery login failed; type 'connect' to retry\n> "); fflush(stdout); return;
+    }
+    const RoomOperationPhase disconnectedPhase = m_roomOperation.phase();
+    if (!m_manualDisconnecting && !m_authRetryBlocked &&
+        (disconnectedPhase == RoomOperationPhase::WaitingServer ||
+         disconnectedPhase == RoomOperationPhase::PreparingAdapter ||
+         disconnectedPhase == RoomOperationPhase::WaitingReadiness)) {
+        recoverRoomOperation("Signaling disconnected during room operation"); return;
+    }
     bool wasInRoom = m_roomReady;
     bool manualDisconnect = m_manualDisconnecting || m_authRetryBlocked;
 
@@ -1453,7 +1501,8 @@ void CliApp::onSignalDisconnected() {
     if (manualDisconnect) {
         m_manualDisconnecting = false;
         if (m_exitAfterDisconnect) {
-            m_running = false;
+            m_stopAfterCleanup = true;
+            if (!m_tunJob) m_running = false;
         } else {
             m_exitAfterDisconnect = false;
             fprintf(stdout, "* Disconnected from server\n> ");
@@ -1481,6 +1530,11 @@ void CliApp::onLoginResponse(uint32_t peerId, bool resumeAccepted) {
     fprintf(stdout, "* Logged in, peerId=%u\n", peerId);
     fflush(stdout);
     m_tunnel.setMyPeerId(peerId);
+    if (m_roomRecoveryAttempt) {
+        m_roomRecoveryAttempt = false; m_wantReconnect = false;
+        m_wasInRoom = false; m_pendingResumeRoom = false;
+        LOG_INFO("[room-operation] recovered to lobby; no room request replayed");
+    }
     if (!m_signal.secureEnabled()) {
         LOG_ERR("Insecure server rejected: authentication is not required");
         beginGracefulDisconnect(false);
@@ -1502,7 +1556,7 @@ void CliApp::onLoginResponse(uint32_t peerId, bool resumeAccepted) {
             m_pendingResumeRoom = true;
             fprintf(stdout, "* Reconnected. Resuming room %u...\n", m_resumeRoomId);
             fflush(stdout);
-            m_signal.resumeRoom(m_resumeRoomId, m_resumePeerId, m_resumeToken.data());
+            if (beginRoomRequest()) m_signal.resumeRoom(m_resumeRoomId, m_resumePeerId, m_resumeToken.data());
         } else if (m_wasInRoom && !m_savedRoomName.empty()) {
             if (canResume && !resumeAccepted)
                 clearResumeLease();
@@ -1526,7 +1580,11 @@ void CliApp::onRoomCreated(uint32_t roomId, uint32_t virtualIP,
                            uint16_t mtu,
                            bool passwordProtected,
                            const Buffer& leaseToken) {
-    if (m_tunSetupPending || m_roomReady || m_currentRoomId != 0) return;
+    if (m_roomOperation.phase() != RoomOperationPhase::WaitingServer || m_roomOperation.expired(roomMonotonicMs()) ||
+        m_tunSetupPending || m_roomReady || m_currentRoomId != 0 || m_roomRecovery) {
+        LOG_INFO("[room-operation] ignored ROOM_CREATED outside active request"); return;
+    }
+    if (!m_roomOperation.beginPreparation(roomMonotonicMs())) return;
     m_tunSetupIsCreate = true;
     m_pendingRoomMembers.clear();
     m_pendingRoomRelays.clear();
@@ -1552,7 +1610,11 @@ void CliApp::onJoinResponse(uint32_t roomId, uint32_t virtualIP,
                             bool passwordProtected,
                             const std::vector<PeerInfo>& members,
                             const Buffer& leaseToken) {
-    if (m_tunSetupPending || m_roomReady || m_currentRoomId != 0) return;
+    if (m_roomOperation.phase() != RoomOperationPhase::WaitingServer || m_roomOperation.expired(roomMonotonicMs()) ||
+        m_tunSetupPending || m_roomReady || m_currentRoomId != 0 || m_roomRecovery) {
+        LOG_INFO("[room-operation] ignored JOIN_RESP outside active request"); return;
+    }
+    if (!m_roomOperation.beginPreparation(roomMonotonicMs())) return;
     m_tunSetupIsCreate = false;
     m_pendingRoomMembers.clear();
     m_pendingRoomRelays.clear();
@@ -1663,6 +1725,7 @@ void CliApp::onRelayReady(uint32_t peerId) {
 }
 
 void CliApp::onLogoutAck() {
+    if (m_roomRecovery) { completeRoomRecovery(); return; }
     if (m_logoutPending)
         finishGracefulDisconnect();
 }
@@ -1704,6 +1767,99 @@ void CliApp::onTransportDead(uint32_t peerId, TrafficClass cls) {
 }
 // ───────── TUN setup/teardown ─────────
 
+bool CliApp::roomOperationBusy() const {
+    return !m_roomOperation.canStart() || m_tunJob || m_roomRecovery || m_roomRecoveryScheduled;
+}
+
+void CliApp::logRoomPhase(const char* event) {
+    LOG_INFO("[room-operation] id=%llu connection=%llu phase=%s event=%s elapsed_ms=%llu",
+        static_cast<unsigned long long>(m_roomOperation.id()),
+        static_cast<unsigned long long>(m_roomOperation.connectionGeneration()),
+        roomOperationPhaseName(m_roomOperation.phase()), event,
+        static_cast<unsigned long long>(m_roomOperation.elapsedMs(roomMonotonicMs())));
+}
+
+bool CliApp::beginRoomRequest() {
+    if (m_tunJob || m_roomRecovery || !m_roomOperation.begin(roomMonotonicMs(), m_connectionGeneration)) return false;
+    logRoomPhase("begin"); return true;
+}
+
+std::shared_ptr<CliTunLifecycleBackend> CliApp::createTunLifecycleBackend(const std::shared_ptr<RoomTaskControl>& control) {
+    return std::make_shared<NativeCliTunLifecycleBackend>(control);
+}
+
+void CliApp::recoverRoomOperation(const std::string& reason) {
+    if (m_roomRecovery || m_roomOperation.phase() == RoomOperationPhase::CleaningUp ||
+        m_roomOperation.phase() == RoomOperationPhase::Cancelling) return;
+    m_roomOperation.beginCancel(roomMonotonicMs());
+    logRoomPhase("cancel");
+    LOG_INFO("[room-operation] terminal reason=%s", reason.c_str());
+    m_roomRecovery = true;
+    m_roomRecoveryAttempt = false;
+    m_roomRecoveryScheduled = false;
+    m_wantReconnect = false; m_pendingResumeRoom = false; m_manualDisconnecting = true;
+    m_wasInRoom = false; clearResumeLease();
+    m_signal.abandonRoomOperation();
+    teardownTun(); resetRoomRuntimeState(true);
+    m_dataChannel.clearSecurityContext(); m_tunnel.clearSecurityContext();
+    if (m_signal.isConnected() && m_signal.myPeerId() != 0) {
+        m_logoutPending = true; m_logoutDeadline = currentTimeMs() + 1000;
+        m_signal.logout();
+    } else completeRoomRecovery();
+}
+
+void CliApp::completeRoomRecovery() {
+    if (!m_roomRecovery) return;
+    m_roomRecovery = false;
+    m_logoutPending = false; m_logoutDeadline = 0;
+    m_signal.disconnect();
+    m_manualDisconnecting = false;
+    if (!m_tunJob) m_roomOperation.finishCleanup();
+    m_roomRecoveryScheduled = !m_authRetryBlocked && !m_playerName.empty();
+    m_roomRecoveryAt = roomMonotonicMs() + 1000;
+    LOG_INFO("[room-operation] old session closed; one lobby login scheduled=%u", m_roomRecoveryScheduled ? 1 : 0);
+}
+
+void CliApp::pollRoomOperation() {
+    if (m_tunJob) {
+        const std::vector<CliTunLifecycleEvent> events = m_tunJob->events();
+        for (const CliTunLifecycleEvent& event : events) {
+            if (event.kind == CliTunLifecycleEvent::Cleaned) {
+                LOG_INFO("[room-operation] worker cleanup finished task=%llu", static_cast<unsigned long long>(event.generation));
+                continue;
+            }
+            if (event.generation != m_tunSetupGeneration || !m_tunSetupPending || m_roomRecovery) {
+                LOG_INFO("[room-operation] ignored old worker event task=%llu", static_cast<unsigned long long>(event.generation));
+                continue;
+            }
+            if (event.kind == CliTunLifecycleEvent::Progress) {
+                if (event.stage == "waiting-readiness") m_roomOperation.beginReadiness(event.at);
+                logRoomPhase(event.stage.c_str());
+            } else if (event.kind == CliTunLifecycleEvent::Failed) {
+                recoverRoomOperation(event.error);
+            } else if (event.kind == CliTunLifecycleEvent::Ready) {
+                if (m_roomOperation.expired(roomMonotonicMs())) {
+                    recoverRoomOperation("Virtual network initialization deadline expired"); continue;
+                }
+                m_tun = event.adapter;
+                const TunSetupResult result = startTunDataPlane();
+                if (!result.success) { recoverRoomOperation(result.error); continue; }
+                m_tunSetupPending = false;
+                finishRoomSetup();
+            }
+        }
+        if (m_tunJob->done()) {
+            m_tunJob.reset(); m_tunControl.reset();
+            if (!m_roomRecovery && !m_roomReady && !m_logoutPending) m_roomOperation.finishCleanup();
+        }
+    }
+    if (m_roomOperation.expired(roomMonotonicMs())) recoverRoomOperation("Room operation deadline expired");
+    if (m_tunJob && m_roomOperation.cleanupSlow(roomMonotonicMs()) && !m_cleanupWarned) {
+        m_cleanupWarned = true;
+        LOG_INFO("[room-operation] Cleanup not finished after 10 seconds; native call/adapter remains worker owned");
+    }
+}
+
 CliApp::TunSetupResult CliApp::setupTun() {
     if (m_tun) return TunSetupResult(true);
     uint32_t serverIP = 0;
@@ -1740,8 +1896,7 @@ CliApp::TunSetupResult CliApp::startTunDataPlane() {
                              m_udpPolicy.transportMode != MODE_RELAY_TCP;
     if (!m_tunnel.startDataPlane(requiresUdp)) {
         m_tunnel.setTunAdapter(nullptr);
-        m_tun->shutdown();
-        delete m_tun;
+        // The lifecycle worker owns the adapter; it will unwind and clean it.
         m_tun = nullptr;
         return TunSetupResult(false, TunSetupStage::DataPlane,
                               "Data-plane startup failed");
@@ -1758,6 +1913,27 @@ void CliApp::beginTunReadiness() {
     m_tunSetupPending = true;
     m_roomReady = false;
     m_tunSetupLastPoll = currentTimeMs() - 100;
+    m_cleanupWarned = false;
+    if (!inlineTunSetupForTesting()) {
+        if (m_tunJob) { recoverRoomOperation("Previous virtual adapter cleanup is still active"); return; }
+        uint32_t serverIP = 0;
+        if (inet_pton(AF_INET, m_resolvedIP.c_str(), &serverIP) == 1 && (ntohl(serverIP) & VNET_MASK) == VNET_SUBNET) {
+            recoverRoomOperation("Server address conflicts with the virtual network subnet"); return;
+        }
+        m_tunControl = std::make_shared<RoomTaskControl>(m_roomOperation.id(), m_connectionGeneration, m_roomOperation.localDeadlineMs());
+        const uint64_t operationId = m_roomOperation.id(), connection = m_connectionGeneration;
+        m_tunControl->progress = [operationId, connection](const std::string& stage) {
+            LOG_INFO("[room-operation] id=%llu connection=%llu phase=%s event=begin",
+                static_cast<unsigned long long>(operationId), static_cast<unsigned long long>(connection), stage.c_str());
+        };
+        const std::shared_ptr<CliTunLifecycleBackend> backend = createTunLifecycleBackend(m_tunControl);
+        m_tunJob.reset(new CliTunLifecycleJob(generation, m_myVirtualIP, m_roomMtu, m_tunControl,
+            [backend](const std::shared_ptr<RoomTaskControl>&) { return backend; }));
+        logRoomPhase("prepare-begin");
+        m_tunJob->start();
+        fprintf(stdout, "* Server accepted room %u; preparing local network; type 'leave' to cancel\n> ", m_currentRoomId);
+        fflush(stdout); return;
+    }
     const TunSetupResult setup = setupTun();
     if (!m_tunSetupPending || generation != m_tunSetupGeneration) return;
     if (!setup.success) {
@@ -1780,6 +1956,7 @@ void CliApp::cancelTunReadiness() {
 }
 
 void CliApp::pollTunReadiness() {
+    if (!inlineTunSetupForTesting()) return;
     if (!m_tunSetupPending) return;
     const uint64_t generation = m_tunSetupGeneration;
     const WindowsReadinessResult result = readTunReadiness();
@@ -1797,6 +1974,10 @@ void CliApp::pollTunReadiness() {
 }
 
 void CliApp::finishRoomSetup() {
+    if (!m_roomOperation.markInRoom(roomMonotonicMs())) {
+        recoverRoomOperation("Room became ready after its deadline"); return;
+    }
+    logRoomPhase("ready");
     m_roomReady = true;
     fprintf(stdout, "* %s (ID=%u, IP=%s, MTU=%u)\n> ",
             m_tunSetupIsCreate ? "Room created" : "Joined room",
@@ -1822,18 +2003,24 @@ void CliApp::teardownTun() {
     m_tunSetupPending = false;
     m_pendingRoomMembers.clear();
     m_pendingRoomRelays.clear();
-    cancelTunReadiness();
+    if (inlineTunSetupForTesting()) cancelTunReadiness();
     m_tunnel.stopDataPlane();
     m_pendingRebuild.clear();
     m_qualityLogStates.clear();
     m_dataChannel.disconnect();
     m_tunnel.removeAllPeers();
-    if (m_tun) {
+    m_tunnel.setTunAdapter(nullptr);
+    if (m_tunJob) {
+        m_tun = nullptr;
+        m_roomOperation.beginCleanup(roomMonotonicMs());
+        m_tunJob->cancel();
+    } else if (m_tun) {
         m_tunnel.setTunAdapter(nullptr);
         m_tun->shutdown();
         delete m_tun;
         m_tun = nullptr;
     }
+    if (!m_tunJob) m_roomOperation.finishCleanup();
 }
 
 void CliApp::resetRoomRuntimeState(bool clearSavedRoom) {
@@ -1981,7 +2168,7 @@ void CliApp::handleReconnectRoomList(const std::vector<CliRoomListItem>& rooms) 
         fprintf(stdout, "* Found room \"%s\" (ID=%u), rejoining...\n",
                 m_savedRoomName.c_str(), foundRoomId);
         fflush(stdout);
-        m_signal.joinRoom(foundRoomId, password);
+        if (beginRoomRequest()) m_signal.joinRoom(foundRoomId, password);
     } else if (matches.size() > 1) {
         fprintf(stdout, "* Multiple matching rooms found. Type 'list' and choose manually.\n> ");
         fflush(stdout);
@@ -1989,7 +2176,7 @@ void CliApp::handleReconnectRoomList(const std::vector<CliRoomListItem>& rooms) 
         fprintf(stdout, "* Room \"%s\" not found, creating with same settings...\n",
                 m_savedRoomName.c_str());
         fflush(stdout);
-        m_signal.createRoom(m_savedRoomName, m_savedMaxPlayers,
+        if (beginRoomRequest()) m_signal.createRoom(m_savedRoomName, m_savedMaxPlayers,
                             m_savedTcpPolicy, m_savedUdpPolicy,
                             m_savedRoomMtu, m_savedRoomPasswordProtected, password);
     }

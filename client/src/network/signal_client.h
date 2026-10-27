@@ -7,6 +7,7 @@
 #include <QByteArray>
 #include <QHostAddress>
 #include <QMap>
+#include <functional>
 #include "protocol.h"
 #include "payload_cipher.h"
 #include "secure_frame.h"
@@ -59,6 +60,8 @@ public:
                     const QByteArray& resumeToken);
     void leaveRoom();
     void logout();
+    void abandonRoomOperation();
+    void setRoomOperationGuard(const std::function<bool()>& guard) { m_roomOperationGuard = guard; }
     void listRooms();
     void requestRelay(uint32_t targetPeerId);
     void sendRelayData(uint32_t srcPeerId, uint32_t dstPeerId,
@@ -97,6 +100,7 @@ signals:
     void serverPasswordRequired();
     void secureSessionEstablished(uint32_t sessionId, QByteArray master);
     void serverError(QString message);
+    void roomOperationUncertain(QString message);
     void fatalAuthError(uint16_t code, QString message);
     void serverRttUpdated(int rttMs);
 
@@ -110,6 +114,7 @@ private slots:
     void onRecvTimeoutCheck();
 
 private:
+    friend class RoomReadinessTests;
     void createSocket();
     void sendMsg(uint8_t msgType, const ByteBuffer& body);
     void sendMsg(uint8_t msgType);
@@ -143,6 +148,8 @@ private:
     QByteArray  m_pendingRoomPassword;
     bool        m_joinPending;
     bool        m_roomOperationPending;
+    bool        m_blockRoomResponses;
+    std::function<bool()> m_roomOperationGuard;
     AuthKdfTask m_authTask;
     int         m_authOperation; // 1 server handshake, 2 create, 3 join
     ByteBuffer  m_pendingCreate;

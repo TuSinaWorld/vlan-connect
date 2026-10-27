@@ -90,6 +90,12 @@
     <ClInclude Include="..\common\probe_quality.h">
       <Filter>Header Files</Filter>
     </ClInclude>
+    <ClInclude Include="..\common\room_operation.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="src\core\tun_lifecycle_task.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
     <ClInclude Include="..\3rdparty\kcp\ikcp.h">
       <Filter>Header Files</Filter>
     </ClInclude>

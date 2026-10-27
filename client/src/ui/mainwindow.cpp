@@ -275,6 +275,13 @@ MainWindow::MainWindow(QWidget* parent)
         refreshDashboardState();
         updateTrayState();
     });
+    connect(m_roomMgr, &RoomManager::roomOperationPhaseChanged,
+            this, [this](const QString& status) {
+        m_roomWidget->setOperationStatus(status);
+        setRoomControlsEnabled(m_roomMgr->inRoom());
+        refreshDashboardState();
+        updateTrayState();
+    });
     connect(m_roomMgr, &RoomManager::roomListUpdated,
             this, &MainWindow::onRoomListUpdated);
     connect(m_roomMgr, &RoomManager::statusMessage,
@@ -1019,6 +1026,8 @@ void MainWindow::updateTrayState()
         stateText = UiStrings::text("metric.connecting");
     } else if (connected && inRoom) {
         stateText = UiStrings::text("tray.roomConnected").arg(m_roomMgr->currentRoomId());
+    } else if (roomPending) {
+        stateText = UiStrings::text("room.metric.pending");
     } else if (connected) {
         stateText = UiStrings::text("metric.connected");
     } else {
@@ -1080,9 +1089,11 @@ void MainWindow::refreshDashboardState()
     }
 
     if (m_dashRoomLabel) {
-        m_dashRoomLabel->setText(inRoom
+        m_dashRoomLabel->setText(m_roomMgr->roomOperationPending()
+            ? UiStrings::text("room.metric.pending") : inRoom
             ? UiStrings::text("metric.roomValue").arg(m_roomMgr->currentRoomId())
             : UiStrings::text("metric.notJoined"));
+        m_dashRoomLabel->setToolTip(m_roomMgr->roomOperationStatus());
         m_dashRoomLabel->setObjectName(inRoom ? "MetricValueGood" : "MetricValue");
         repolish(m_dashRoomLabel);
     }
@@ -1151,9 +1162,12 @@ void MainWindow::quitProgram()
     if (m_trayIcon) {
         m_trayIcon->hide();
     }
-    if (m_roomMgr->signalClient()->isConnected() ||
-        m_roomMgr->isConnecting()) {
-        m_roomMgr->disconnectFromServer();
+    // Even a disconnected signaling socket can still have a lifecycle owner
+    // finishing preparation/cleanup. Always detach and cancel before exiting.
+    const bool hadConnection = m_roomMgr->signalClient()->isConnected() ||
+                               m_roomMgr->isConnecting();
+    m_roomMgr->disconnectFromServer();
+    if (hadConnection) {
         QTimer::singleShot(1200, this, [this]() {
             if (m_quitRequested)
                 finishProgramQuit();
@@ -1165,6 +1179,10 @@ void MainWindow::quitProgram()
 
 void MainWindow::finishProgramQuit()
 {
+    if (m_roomMgr && m_roomMgr->roomOperationBusy()) {
+        QTimer::singleShot(100, this, [this]() { finishProgramQuit(); });
+        return;
+    }
     QApplication::quit();
 }
 
@@ -1680,6 +1698,7 @@ void MainWindow::updatePolicyControlState() {
                    m_roomMgr->signalClient()->isConnected() &&
                    !m_roomMgr->inRoom() &&
                    !m_roomMgr->roomOperationPending() &&
+                   !m_roomMgr->roomOperationBusy() &&
                    m_advancedCheck->isChecked();
 
     auto updateGroup = [canEdit](QComboBox* modeBox,
@@ -1723,14 +1742,15 @@ void MainWindow::promptServerPassword() {
 void MainWindow::setRoomControlsEnabled(bool inRoom) {
     bool connected = m_roomMgr && m_roomMgr->signalClient()->isConnected();
     bool pending = m_roomMgr && m_roomMgr->roomOperationPending();
+    bool cleanup = m_roomMgr && m_roomMgr->roomCleanupPending();
     bool canEditRoom = connected && m_roomMgr->myPeerId() != 0 &&
-                       !inRoom && !pending;
+                       !inRoom && !pending && !m_roomMgr->roomOperationBusy();
 
     m_createBtn->setEnabled(canEditRoom);
     m_joinBtn->setEnabled(canEditRoom);
     m_refreshBtn->setEnabled(connected);
-    bindText(m_leaveBtn, pending ? "login.cancel" : "lobby.leave");
-    m_leaveBtn->setEnabled(connected && (inRoom || pending));
+    bindText(m_leaveBtn, cleanup ? "room.action.cleaning" : pending ? "login.cancel" : "lobby.leave");
+    m_leaveBtn->setEnabled((connected && inRoom) || (pending && !cleanup));
     m_roomNameEdit->setEnabled(canEditRoom);
     m_maxPlayersBox->setEnabled(canEditRoom);
     m_passwordEdit->setEnabled(canEditRoom);

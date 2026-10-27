@@ -6,6 +6,8 @@
 #include "cli_tunnel.h"
 #include "cli_tun.h"
 #include "probe_quality.h"
+#include "room_operation.h"
+#include "cli_tun_lifecycle.h"
 #include <atomic>
 #include <thread>
 #include <string>
@@ -103,10 +105,18 @@ protected:
     virtual TunSetupResult startTunDataPlane();
     virtual WindowsReadinessResult readTunReadiness();
     virtual void cancelTunReadiness();
+    virtual bool inlineTunSetupForTesting() const { return false; }
+    virtual std::shared_ptr<CliTunLifecycleBackend> createTunLifecycleBackend(const std::shared_ptr<RoomTaskControl>& control);
 
 private:
     void beginTunReadiness();
     void pollTunReadiness();
+    void pollRoomOperation();
+    void recoverRoomOperation(const std::string& reason);
+    void completeRoomRecovery();
+    bool beginRoomRequest();
+    bool roomOperationBusy() const;
+    void logRoomPhase(const char* event);
     void finishRoomSetup();
     void teardownTun();
     void rollbackRoomAfterTunFailure(const TunSetupResult& result);
@@ -169,6 +179,16 @@ private:
     bool m_tunSetupIsCreate;
     uint32_t m_tunSetupLastPoll;
     uint64_t m_tunSetupGeneration;
+    uint64_t m_connectionGeneration;
+    RoomOperationTracker m_roomOperation;
+    std::unique_ptr<CliTunLifecycleJob> m_tunJob;
+    std::shared_ptr<RoomTaskControl> m_tunControl;
+    bool m_roomRecovery;
+    bool m_roomRecoveryAttempt;
+    bool m_roomRecoveryScheduled;
+    uint64_t m_roomRecoveryAt;
+    bool m_cleanupWarned;
+    bool m_stopAfterCleanup;
     std::map<uint32_t, PeerInfo> m_pendingRoomMembers;
     std::set<uint32_t> m_pendingRoomRelays;
 

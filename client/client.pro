@@ -52,6 +52,7 @@ SOURCES += \
 
 HEADERS += \
     src/core/tun_adapter.h \
+    src/core/tun_lifecycle_task.h \
     src/core/kcp_tunnel.h \
     src/core/raw_udp_tunnel.h \
     src/core/tunnel_manager.h \
@@ -73,6 +74,7 @@ HEADERS += \
     ../3rdparty/cm256cc/export.h \
     ../common/protocol.h \
     ../common/version.h \
+    ../common/room_operation.h \
     ../common/byte_buffer.h \
     ../common/traffic_policy_codec.h \
     ../common/probe_quality.h \

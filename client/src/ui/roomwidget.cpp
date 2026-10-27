@@ -122,6 +122,13 @@ void RoomWidget::setMyInfo(uint32_t peerId, uint32_t virtualIP) {
         refreshPeerRow(id);
 }
 
+void RoomWidget::setOperationStatus(const QString& status) {
+    if (m_operationStatus == status) return;
+    m_operationStatus = status;
+    refreshInfoLabel();
+    refreshQualityBanner();
+}
+
 void RoomWidget::setRoomContext(uint32_t roomId, uint16_t mtu) {
     m_roomId = roomId;
     m_roomMtu = normalizeRoomMtu(mtu);
@@ -244,6 +251,10 @@ void RoomWidget::updatePeerQuality(uint32_t peerId, TrafficClass cls,
 
 void RoomWidget::refreshInfoLabel() {
     if (!m_infoLabel) return;
+    if (!m_operationStatus.isEmpty()) {
+        m_infoLabel->setText(UiStrings::text("room.metric.pending"));
+        return;
+    }
     if (m_myPeerId == 0) {
         m_infoLabel->setText(UiStrings::text("members.notJoined"));
         return;
@@ -369,6 +380,12 @@ void RoomWidget::changeEvent(QEvent* event) {
 
 void RoomWidget::refreshQualityBanner() {
     if (!m_qualityBanner) return;
+    if (!m_operationStatus.isEmpty()) {
+        m_qualityBanner->setText(m_operationStatus);
+        m_qualityBanner->setStyleSheet("QLabel#MemberQualityBanner { color: #536274; background: #f4f8ff; border: 1px solid #dce9f6; border-radius: 6px; padding: 8px 10px; }");
+        m_qualityBanner->show();
+        return;
+    }
     int remoteCount = 0;
     int abnormalCount = 0;
     bool udpProblem = false, tcpProblem = false, localProblem = false;

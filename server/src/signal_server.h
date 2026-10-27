@@ -44,6 +44,7 @@ public:
     void stop();
 
 private:
+    friend class ServerControlResponseTests;
     enum class DisconnectReason {
         Network,
         Takeover,
@@ -120,8 +121,10 @@ private:
 
     bool sendMsg(int fd, uint8_t msgType, const ByteBuffer& body);
     void sendMsg(int fd, uint8_t msgType);
-    void sendClientMsg(ClientSession& c, uint8_t msgType, const ByteBuffer& body);
-    void sendClientMsg(ClientSession& c, uint8_t msgType);
+    bool sendClientMsg(ClientSession& c, uint8_t msgType, const ByteBuffer& body);
+    bool sendClientMsg(ClientSession& c, uint8_t msgType);
+    void failRequiredControl(ClientSession& c, uint8_t msgType);
+    void rollbackNewMembership(ClientSession& c, uint32_t roomId);
     bool sendDataMsg(ClientSession& c, uint8_t msgType, const ByteBuffer& body);
     void sendError(int fd, const std::string& text,
                    AuthErrorCode code = AuthErrorCode::General);
@@ -135,7 +138,7 @@ private:
     bool validateResumeLease(uint32_t roomId, uint32_t peerId,
                              const uint8_t token[RECONNECT_TOKEN_SIZE],
                              Room** roomOut, RoomLease** leaseOut);
-    void sendJoinResponse(ClientSession& c, Room* room,
+    bool sendJoinResponse(ClientSession& c, Room* room,
                           const uint8_t token[RECONNECT_TOKEN_SIZE]);
     void markSessionOffline(ClientSession& c);
     void closeClientForTakeover(ClientSession& c);

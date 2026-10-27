@@ -22,6 +22,7 @@ public:
     void setRoomContext(uint32_t roomId, uint16_t mtu);
     void clear();
     void retranslateUi();
+    void setOperationStatus(const QString& status);
 
     void setPolicies(VLan::RoomTrafficPolicy tcpPolicy,
                      VLan::RoomTrafficPolicy udpPolicy);
@@ -72,6 +73,7 @@ private:
     QLabel*       m_memberCountLabel;
     QLabel*       m_qualityBanner;
     QTableWidget* m_table;
+    QString m_operationStatus;
 
     QMap<uint32_t, PeerEntry> m_peers;
     uint32_t m_myPeerId;

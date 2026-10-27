@@ -11,6 +11,8 @@
 #include "protocol.h"
 #include "probe_quality.h"
 #include "windows_network_readiness.h"
+#include "room_operation.h"
+#include <memory>
 
 namespace VLan {
 
@@ -18,6 +20,7 @@ class TunAdapter;
 class TunnelManager;
 class SignalClient;
 class DataChannel;
+class GuiTunLifecycleTask;
 
 /*
  * Orchestrates the full lifecycle:
@@ -53,6 +56,9 @@ public:
 
     bool inRoom() const { return m_roomReady; }
     bool roomOperationPending() const { return m_roomOperationPending; }
+    bool roomCleanupPending() const;
+    bool roomOperationBusy() const;
+    QString roomOperationStatus() const;
     uint32_t currentRoomId() const { return m_currentRoomId; }
     uint32_t myVirtualIP()   const { return m_myVirtualIP; }
     uint32_t myPeerId()      const;
@@ -70,6 +76,7 @@ signals:
     void roomJoined(uint32_t roomId);
     void roomLeft();
     void roomOperationPendingChanged(bool pending);
+    void roomOperationPhaseChanged(QString status);
     void roomListUpdated(QList<VLan::RoomListItem> rooms);
     void peerConnected(uint32_t peerId, uint32_t virtualIP, QString name);
     void peerDisconnected(uint32_t peerId);
@@ -152,6 +159,10 @@ private:
     void pollRoomReadiness(quint64 generation, quint64 connectionGeneration);
     void completeRoomReadiness();
     void setRoomOperationPending(bool pending);
+    void pollRoomOperation();
+    void publishRoomOperation();
+    void beginRoomRecovery(const QString& reason, bool reportError = true);
+    void maybeFinishRoomRecovery();
     void bindTunAdapterSignals(TunAdapter* adapter);
     void teardownTun();
     void rollbackRoomAfterTunFailure(const TunSetupResult& result);
@@ -265,6 +276,16 @@ private:
         QualityLogState() : transport(TRANSPORT_NONE), anomaly(0) {}
     };
     QMap<TransportKey, QualityLogState> m_qualityLogStates;
+    RoomOperationTracker m_operation;
+    QTimer* m_operationTimer;
+    std::shared_ptr<GuiTunLifecycleTask> m_lifecycleTask;
+    std::shared_ptr<RoomTaskControl> m_lifecycleControl;
+    QString m_operationLastText;
+    RoomOperationPhase m_loggedOperationPhase;
+    bool m_recoveryActive;
+    bool m_recoveryLoginScheduled;
+    bool m_recoveryLoginAttempt;
+    bool m_cleanupWarningShown;
 };
 
 } // namespace VLan
