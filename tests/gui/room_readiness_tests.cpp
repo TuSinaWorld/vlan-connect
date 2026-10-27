@@ -5,6 +5,8 @@
 #include "../../client/src/core/tunnel_manager.h"
 #include "../../client/src/core/peer_connection.h"
 #include "../../client/src/core/tun_adapter.h"
+#include "../../client/src/core/raw_udp_tunnel.h"
+#include "../../client/src/core/kcp_tunnel.h"
 #include <cassert>
 #include <cstdio>
 #include <functional>
@@ -267,6 +269,114 @@ class RoomReadinessTests {
         assert(ticks >= 5 && manager.polls >= 2 && manager.starts == 0);
         manager.leaveRoom();
     }
+    static void qualitySoloMembershipAndResume() {
+        FakeRoomManager manager;
+        manager.state = WindowsReadinessState::Ready;
+        begin(manager, true);
+        poll(manager);
+        assert(manager.m_latencyTimer->interval() == 1000);
+        int updates = 0;
+        QObject::connect(&manager, &RoomManager::peerQualityUpdated,
+                         [&](uint32_t, TrafficClass, ProbeQualitySnapshot) { ++updates; });
+        for (int i = 0; i < 20; ++i) manager.onLatencyUpdate();
+        assert(updates == 0 && manager.m_qualityLogStates.isEmpty());
+
+        manager.onPeerJoined(peer(2, "quality peer"));
+        PeerConnection* remote = manager.m_tunnel->peerById(2);
+        assert(remote);
+        manager.onLatencyUpdate();
+        assert(updates == 2);
+        assert(!remote->qualitySnapshot(TRAFFIC_TCP).active);
+        assert(!remote->qualitySnapshot(TRAFFIC_TCP).outage);
+        remote->setTcpRelaySender([remote](uint32_t, TrafficClass cls, const QByteArray& ping) {
+            QByteArray pong = ping;
+            assert(pong.size() == 6);
+            pong[1] = static_cast<char>(LATENCY_PROBE_PONG);
+            assert(remote->handleLatencyProbe(cls, pong));
+        });
+        remote->setTransport(TRAFFIC_TCP, TRANSPORT_RELAY_TCP);
+        remote->setTransport(TRAFFIC_UDP, TRANSPORT_RELAY_TCP);
+        for (int i = 0; i < 6; ++i) manager.onLatencyUpdate();
+        assert(remote->qualitySnapshot(TRAFFIC_TCP).replies == 6);
+        assert(!remote->qualitySnapshot(TRAFFIC_TCP).sampling);
+        assert(!remote->qualitySnapshot(TRAFFIC_UDP).outage);
+        int qualityMessages = 0;
+        QObject::connect(&manager, &RoomManager::statusMessage,
+                         [&](const QString&) { ++qualityMessages; });
+        remote->setTcpRelayControlReady([]() { return false; });
+        manager.onLatencyUpdate();
+        manager.onLatencyUpdate();
+        assert(qualityMessages == 2); // One local-failure event per path.
+        assert(remote->qualitySnapshot(TRAFFIC_TCP).sendFailures == 2);
+        assert(remote->qualitySnapshot(TRAFFIC_TCP).timeouts == 0);
+        assert(!remote->qualitySnapshot(TRAFFIC_TCP).outage);
+        remote->setTcpRelayControlReady([]() { return true; });
+        manager.onLatencyUpdate();
+        assert(qualityMessages == 4); // One local recovery event per path.
+        manager.onPeerResumed(peer(2, "quality peer"));
+        assert(remote->qualitySnapshot(TRAFFIC_TCP).replies == 0);
+        assert(remote->qualitySnapshot(TRAFFIC_UDP).timeouts == 0);
+        assert(manager.m_qualityLogStates.isEmpty());
+        manager.onPeerLeft(2);
+        const int afterRemoval = updates;
+        for (int i = 0; i < 20; ++i) manager.onLatencyUpdate();
+        assert(updates == afterRemoval && manager.m_qualityLogStates.isEmpty());
+        manager.onPeerJoined(peer(2, "new session"));
+        assert(manager.m_tunnel->peerById(2)->qualitySnapshot(TRAFFIC_TCP).replies == 0);
+        manager.leaveRoom();
+        assert(manager.m_qualityLogStates.isEmpty());
+    }
+    static void udpSocketFailuresAreLocal() {
+        TunnelManager manager;
+        manager.setMyPeerId(1);
+        assert(manager.installSecureSession(1, QByteArray(SECURE_KEY_SIZE, 'q')));
+        manager.m_dataPlaneState = DataPlaneState::Running; // Packet edge only, no TUN.
+        PeerConnection* remote = manager.addPeer(2, VNET_SUBNET | 2, "socket errors");
+        PeerConnection* other = manager.addPeer(3, VNET_SUBNET | 3, "unaffected");
+        RawUdpTunnel* raw = manager.createRawUdpTunnel(remote, QHostAddress::LocalHostIPv6, 54321,
+            FEC_NONE, ROOM_MTU_DEFAULT, TRAFFIC_TCP);
+        raw->setRelayMode(1, 2);
+        // IPv6 destination on the manager's IPv4 socket is a local failure.
+        // Port zero itself is accepted by Windows, so cannot serve as an error fixture.
+        remote->sendLatencyPing(TRAFFIC_TCP);
+        ProbeQualitySnapshot quality = remote->qualitySnapshot(TRAFFIC_TCP);
+        assert(quality.localSendFailure && quality.sendFailures == 1);
+        assert(!quality.outage && quality.timeouts == 0 && quality.pending == 0);
+        assert(!other->qualitySnapshot(TRAFFIC_TCP).localSendFailure);
+        assert(!remote->qualitySnapshot(TRAFFIC_UDP).localSendFailure);
+
+        QUdpSocket receiver;
+        assert(receiver.bind(QHostAddress(QHostAddress::LocalHost), quint16(0)));
+        raw->setPeerEndpoint(QHostAddress::LocalHost, receiver.localPort());
+        remote->sendLatencyPing(TRAFFIC_TCP);
+        quality = remote->qualitySnapshot(TRAFFIC_TCP);
+        assert(!quality.localSendFailure && quality.sendFailures == 1 && quality.pending == 1);
+        // Local submission success is the contract under test; delivery and
+        // remote responses are covered by the transport tests separately.
+
+        KcpTunnel* kcp = manager.createKcpTunnel(remote, QHostAddress::LocalHostIPv6, 54321,
+            TRANSPORT_RELAY_KCP, FEC_NONE, ROOM_MTU_DEFAULT, KCP_PROFILE_REALTIME, TRAFFIC_UDP);
+        kcp->setRelayMode(1, 2);
+        remote->sendLatencyPing(TRAFFIC_UDP);
+        kcp->update(); // Accepted KCP enqueue later reaches a failing OS send.
+        quality = remote->qualitySnapshot(TRAFFIC_UDP);
+        assert(quality.localSendFailure && quality.sendFailures == 1 && quality.timeouts == 0);
+        remote->sendLatencyPing(TRAFFIC_UDP);
+        quality = remote->qualitySnapshot(TRAFFIC_UDP);
+        assert(quality.localSendFailure && quality.sendFailures == 2 && quality.pending == 0);
+        assert(!remote->qualitySnapshot(TRAFFIC_TCP).localSendFailure);
+
+        UdpRelayHeader header = {};
+        header.type = UDP_RELAY_DATA;
+        header.trafficClass = TRAFFIC_UDP;
+        writeU32BE(reinterpret_cast<uint8_t*>(&header.srcPeerId), 1);
+        writeU32BE(reinterpret_cast<uint8_t*>(&header.dstPeerId), 2);
+        manager.sendUdpDatagram(QByteArray(reinterpret_cast<const char*>(&header), sizeof(header)),
+                                QHostAddress::LocalHost, receiver.localPort());
+        assert(!remote->qualitySnapshot(TRAFFIC_UDP).localSendFailure);
+        assert(remote->qualitySnapshot(TRAFFIC_UDP).timeouts == 0);
+        manager.stopDataPlane();
+    }
 public:
     static void run() {
         delayedReadyKeepsCurrentMembership();
@@ -279,6 +389,8 @@ public:
         pendingRuntimeErrorWinsOverReadyBeforeDeferredDelivery();
         cancellationDuringPollWins();
         pendingTimerDoesNotBlockEventLoop();
+        qualitySoloMembershipAndResume();
+        udpSocketFailuresAreLocal();
     }
 };
 

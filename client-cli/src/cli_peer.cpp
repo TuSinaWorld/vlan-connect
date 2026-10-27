@@ -445,9 +445,6 @@ CliPeerConnection::CliPeerConnection(uint32_t peerId, uint32_t virtualIP,
         m_rawUdpTunnel[i] = nullptr;
         m_tcpRelayLastRecv[i] = now;
         m_tcpRelayLastSend[i] = now;
-        m_rtt[i] = -1;
-        m_latencyPingSentTime[i] = 0;
-        m_latencyLastReply[i] = 0;
     }
 }
 
@@ -508,6 +505,8 @@ void CliPeerConnection::clearRawUdpTunnel(TrafficClass cls) {
 void CliPeerConnection::setTransport(TrafficClass cls, TransportType t) {
     int idx = static_cast<int>(cls);
     if (idx < 0 || idx > 2) idx = TRAFFIC_UDP;
+    if (m_transport[idx] != t)
+        m_quality[idx].setPath(static_cast<int>(t));
     m_transport[idx] = t;
 }
 
@@ -518,9 +517,7 @@ void CliPeerConnection::clearTransport(TrafficClass cls) {
     m_transport[idx] = TRANSPORT_NONE;
     m_tcpRelayLastRecv[idx] = now;
     m_tcpRelayLastSend[idx] = now;
-    m_rtt[idx] = -1;
-    m_latencyPingSentTime[idx] = 0;
-    m_latencyLastReply[idx] = 0;
+    m_quality[idx].suspend();
 }
 
 void CliPeerConnection::onTunnelDataReceived(TrafficClass cls, const Buffer& data) {
@@ -589,12 +586,24 @@ bool CliPeerConnection::isTcpRelayDead() const {
 int CliPeerConnection::latencyMs(TrafficClass cls) const {
     int idx = static_cast<int>(cls);
     if (idx < 0 || idx > 2) idx = TRAFFIC_UDP;
-    if (m_latencyLastReply[idx] == 0)
-        return -1;
-    uint32_t now = currentTimeMs();
-    if (now - m_latencyLastReply[idx] > CLI_LATENCY_STALE_MS)
-        return -1;
-    return m_rtt[idx];
+    return m_quality[idx].latencyMs(currentTimeMs());
+}
+
+ProbeQualitySnapshot CliPeerConnection::qualitySnapshot(TrafficClass cls) {
+    int idx = static_cast<int>(cls);
+    if (idx < 0 || idx > 2) idx = TRAFFIC_UDP;
+    return m_quality[idx].snapshot(currentTimeMs());
+}
+
+void CliPeerConnection::resetQuality() {
+    for (int idx = 0; idx < 3; ++idx)
+        m_quality[idx].reset();
+}
+
+void CliPeerConnection::reportLocalTransportSend(TrafficClass cls, bool success) {
+    int idx = static_cast<int>(cls);
+    if (idx < 0 || idx > 2) idx = TRAFFIC_UDP;
+    m_quality[idx].reportTransportSend(currentTimeMs(), success);
 }
 
 int CliPeerConnection::latencyMs() const {
@@ -616,16 +625,16 @@ void CliPeerConnection::sendLatencyPing(TrafficClass cls) {
     int idx = static_cast<int>(cls);
     if (idx < 0 || idx > 2) idx = TRAFFIC_UDP;
     if (m_transport[idx] == TRANSPORT_NONE) return;
-    m_latencyPingSentTime[idx] = currentTimeMs();
+    const uint32_t token = m_quality[idx].beginProbe(currentTimeMs());
     Buffer probe(6, 0);
     probe[0] = CLI_LATENCY_PROBE_MARKER;
     probe[1] = CLI_LATENCY_PROBE_PING;
-    uint32_t ts = m_latencyPingSentTime[idx];
-    probe[2] = (ts >> 24) & 0xFF;
-    probe[3] = (ts >> 16) & 0xFF;
-    probe[4] = (ts >> 8) & 0xFF;
-    probe[5] = ts & 0xFF;
-    sendControlPacket(cls, probe);
+    probe[2] = (token >> 24) & 0xFF;
+    probe[3] = (token >> 16) & 0xFF;
+    probe[4] = (token >> 8) & 0xFF;
+    probe[5] = token & 0xFF;
+    const bool sent = sendControlPacket(cls, probe);
+    m_quality[idx].completeSend(token, currentTimeMs(), sent);
 }
 
 void CliPeerConnection::sendLatencyPing() {
@@ -647,13 +656,11 @@ bool CliPeerConnection::handleLatencyProbe(TrafficClass cls, const Buffer& data)
         return true;
     }
     if (data[1] == CLI_LATENCY_PROBE_PONG) {
-        uint32_t sentTs = (static_cast<uint32_t>(data[2]) << 24) |
+        uint32_t token = (static_cast<uint32_t>(data[2]) << 24) |
                           (static_cast<uint32_t>(data[3]) << 16) |
                           (static_cast<uint32_t>(data[4]) << 8) |
                            static_cast<uint32_t>(data[5]);
-        m_rtt[idx] = static_cast<int>(currentTimeMs() - sentTs);
-        if (m_rtt[idx] < 0) m_rtt[idx] = 0;
-        m_latencyLastReply[idx] = currentTimeMs();
+        m_quality[idx].reply(token, currentTimeMs());
         return true;
     }
     return false;
@@ -669,6 +676,7 @@ bool CliPeerConnection::sendControlPacket(TrafficClass cls, const Buffer& data) 
     TransportType t = m_transport[idx];
     if (t == TRANSPORT_RELAY_TCP) {
         if (!m_tcpSender) return false;
+        if (m_tcpControlReady && !m_tcpControlReady()) return false;
         m_tcpSender(m_peerId, cls, data);
         return true;
     }

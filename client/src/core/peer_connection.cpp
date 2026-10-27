@@ -18,9 +18,6 @@ PeerConnection::PeerConnection(uint32_t peerId, uint32_t virtualIP,
         m_rawUdpTunnel[i] = nullptr;
         m_tcpRelayLastRecv[i] = now;
         m_tcpRelayLastSend[i] = now;
-        m_rtt[i] = -1;
-        m_latencyPingSentTime[i] = 0;
-        m_latencyLastReply[i] = 0;
     }
 }
 
@@ -90,6 +87,7 @@ void PeerConnection::setTransport(TrafficClass cls, TransportType t) {
     int idx = static_cast<int>(cls);
     if (idx < 0 || idx > 2) idx = TRAFFIC_UDP;
     if (m_transport[idx] != t) {
+        m_quality[idx].setPath(static_cast<int>(t));
         m_transport[idx] = t;
         emit transportChanged(m_peerId, cls, t);
     }
@@ -100,9 +98,7 @@ void PeerConnection::clearTransport(TrafficClass cls) {
     if (idx < 0 || idx > 2) idx = TRAFFIC_UDP;
     uint32_t now = currentTimeMs();
     m_transport[idx] = TRANSPORT_NONE;
-    m_rtt[idx] = -1;
-    m_latencyPingSentTime[idx] = 0;
-    m_latencyLastReply[idx] = 0;
+    m_quality[idx].suspend();
     m_tcpRelayLastRecv[idx] = now;
     m_tcpRelayLastSend[idx] = now;
     emit transportChanged(m_peerId, cls, TRANSPORT_NONE);
@@ -177,28 +173,40 @@ bool PeerConnection::isTcpRelayDead() const {
 int PeerConnection::latencyMs(TrafficClass cls) const {
     int idx = static_cast<int>(cls);
     if (idx < 0 || idx > 2) idx = TRAFFIC_UDP;
-    if (m_latencyLastReply[idx] == 0)
-        return -1;
-    uint32_t now = currentTimeMs();
-    if (now - m_latencyLastReply[idx] > LATENCY_STALE_MS)
-        return -1;
-    return m_rtt[idx];
+    return m_quality[idx].latencyMs(currentTimeMs());
+}
+
+ProbeQualitySnapshot PeerConnection::qualitySnapshot(TrafficClass cls) {
+    int idx = static_cast<int>(cls);
+    if (idx < 0 || idx > 2) idx = TRAFFIC_UDP;
+    return m_quality[idx].snapshot(currentTimeMs());
+}
+
+void PeerConnection::resetQuality() {
+    for (int idx = 0; idx < 3; ++idx)
+        m_quality[idx].reset();
+}
+
+void PeerConnection::reportLocalTransportSend(TrafficClass cls, bool success) {
+    int idx = static_cast<int>(cls);
+    if (idx < 0 || idx > 2) idx = TRAFFIC_UDP;
+    m_quality[idx].reportTransportSend(currentTimeMs(), success);
 }
 
 void PeerConnection::sendLatencyPing(TrafficClass cls) {
     int idx = static_cast<int>(cls);
     if (idx < 0 || idx > 2) idx = TRAFFIC_UDP;
     if (m_transport[idx] == TRANSPORT_NONE) return;
-    m_latencyPingSentTime[idx] = currentTimeMs();
+    const uint32_t token = m_quality[idx].beginProbe(currentTimeMs());
     QByteArray probe(6, '\0');
     probe[0] = static_cast<char>(LATENCY_PROBE_MARKER);
     probe[1] = static_cast<char>(LATENCY_PROBE_PING);
-    uint32_t ts = m_latencyPingSentTime[idx];
-    probe[2] = static_cast<char>((ts >> 24) & 0xFF);
-    probe[3] = static_cast<char>((ts >> 16) & 0xFF);
-    probe[4] = static_cast<char>((ts >> 8) & 0xFF);
-    probe[5] = static_cast<char>(ts & 0xFF);
-    sendControlPacket(cls, probe);
+    probe[2] = static_cast<char>((token >> 24) & 0xFF);
+    probe[3] = static_cast<char>((token >> 16) & 0xFF);
+    probe[4] = static_cast<char>((token >> 8) & 0xFF);
+    probe[5] = static_cast<char>(token & 0xFF);
+    const bool sent = sendControlPacket(cls, probe);
+    m_quality[idx].completeSend(token, currentTimeMs(), sent);
 }
 
 bool PeerConnection::handleLatencyProbe(TrafficClass cls, const QByteArray& data) {
@@ -209,8 +217,6 @@ bool PeerConnection::handleLatencyProbe(TrafficClass cls, const QByteArray& data
     uint8_t probeType = static_cast<uint8_t>(data[1]);
     int idx = static_cast<int>(cls);
     if (idx < 0 || idx > 2) idx = TRAFFIC_UDP;
-    LogManager::instance().logDetail(QString("[peer] handleLatencyProbe peerId=%1 class=%2 type=%3")
-        .arg(m_peerId).arg(idx).arg(probeType == LATENCY_PROBE_PING ? "PING" : "PONG"));
     if (probeType == LATENCY_PROBE_PING) {
         QByteArray pong(6, '\0');
         pong[0] = static_cast<char>(LATENCY_PROBE_MARKER);
@@ -221,16 +227,11 @@ bool PeerConnection::handleLatencyProbe(TrafficClass cls, const QByteArray& data
         return true;
     }
     if (probeType == LATENCY_PROBE_PONG) {
-        uint32_t sentTs = (static_cast<uint8_t>(data[2]) << 24) |
-                          (static_cast<uint8_t>(data[3]) << 16) |
-                          (static_cast<uint8_t>(data[4]) << 8) |
-                           static_cast<uint8_t>(data[5]);
-        uint32_t now = currentTimeMs();
-        m_rtt[idx] = static_cast<int>(now - sentTs);
-        if (m_rtt[idx] < 0) m_rtt[idx] = 0;
-        m_latencyLastReply[idx] = now;
-        LogManager::instance().logDetail(QString("[peer] latency PONG peerId=%1 class=%2 rtt=%3 ms")
-            .arg(m_peerId).arg(idx).arg(m_rtt[idx]));
+        const uint32_t token = (static_cast<uint32_t>(static_cast<uint8_t>(data[2])) << 24) |
+                               (static_cast<uint32_t>(static_cast<uint8_t>(data[3])) << 16) |
+                               (static_cast<uint32_t>(static_cast<uint8_t>(data[4])) << 8) |
+                                static_cast<uint32_t>(static_cast<uint8_t>(data[5]));
+        m_quality[idx].reply(token, currentTimeMs());
         return true;
     }
     return false;
@@ -242,6 +243,7 @@ bool PeerConnection::sendControlPacket(TrafficClass cls, const QByteArray& data)
     TransportType t = m_transport[idx];
     if (t == TRANSPORT_RELAY_TCP) {
         if (!m_tcpSender) return false;
+        if (m_tcpControlReady && !m_tcpControlReady()) return false;
         m_tcpSender(m_peerId, cls, data);
         return true;
     }

@@ -517,6 +517,8 @@ void MainWindow::setupUI() {
             m_roomWidget, &RoomWidget::updatePeerTransport);
     connect(m_roomMgr, &RoomManager::peerLatencyUpdated,
             m_roomWidget, &RoomWidget::updatePeerLatency);
+    connect(m_roomMgr, &RoomManager::peerQualityUpdated,
+            m_roomWidget, &RoomWidget::updatePeerQuality);
     connect(m_roomMgr, &RoomManager::serverRttUpdated,
             this, &MainWindow::onServerRttUpdated);
     connect(m_roomMgr, &RoomManager::serverPasswordRequired,

@@ -15,6 +15,10 @@
 #include <QPushButton>
 #include <QScrollArea>
 #include <QVariant>
+#include <QEvent>
+#include <QFontMetrics>
+#include <QTimer>
+#include <algorithm>
 
 namespace VLan {
 
@@ -24,6 +28,7 @@ RoomWidget::RoomWidget(QWidget* parent)
       m_infoLabel(nullptr),
       m_roomStatusLabel(nullptr),
       m_memberCountLabel(nullptr),
+      m_qualityBanner(nullptr),
       m_table(nullptr),
       m_myPeerId(0),
       m_myVirtualIP(0),
@@ -65,7 +70,18 @@ RoomWidget::RoomWidget(QWidget* parent)
 
     layout->addWidget(toolbar);
 
+    m_qualityBanner = new QLabel();
+    m_qualityBanner->setObjectName("MemberQualityBanner");
+    m_qualityBanner->setWordWrap(true);
+    m_qualityBanner->setTextFormat(Qt::PlainText);
+    m_qualityBanner->setTextInteractionFlags(Qt::TextSelectableByMouse);
+    m_qualityBanner->setSizePolicy(QSizePolicy::Ignored, QSizePolicy::Preferred);
+    layout->addWidget(m_qualityBanner);
+
     m_table = new QTableWidget(0, 7);
+    m_table->setObjectName("MemberQualityTable");
+    m_table->setTextElideMode(Qt::ElideRight);
+    m_table->setMinimumWidth(0);
     m_table->horizontalHeader()->setSectionResizeMode(0, QHeaderView::Fixed);
     m_table->horizontalHeader()->setSectionResizeMode(1, QHeaderView::Fixed);
     m_table->horizontalHeader()->setSectionResizeMode(2, QHeaderView::Stretch);
@@ -101,6 +117,9 @@ void RoomWidget::setMyInfo(uint32_t peerId, uint32_t virtualIP) {
     m_myVirtualIP = virtualIP;
     refreshInfoLabel();
     refreshSummaryLabels();
+    const QList<uint32_t> keys = m_peers.keys();
+    for (uint32_t id : keys)
+        refreshPeerRow(id);
 }
 
 void RoomWidget::setRoomContext(uint32_t roomId, uint16_t mtu) {
@@ -157,6 +176,7 @@ void RoomWidget::addPeer(uint32_t peerId, uint32_t virtualIP, QString name) {
     if (isNewPeer) {
         for (int i = 0; i < 3; ++i) {
             e.transport[i] = TRANSPORT_NONE;
+            e.lastTransport[i] = TRANSPORT_NONE;
             e.latency[i] = -1;
         }
     }
@@ -191,8 +211,15 @@ void RoomWidget::updatePeerTransport(uint32_t peerId, TrafficClass cls,
     if (!m_peers.contains(peerId)) return;
     int idx = static_cast<int>(cls);
     if (idx < 0 || idx > 2) idx = TRAFFIC_UDP;
+    if (type != TRANSPORT_NONE) {
+        if (m_peers[peerId].lastTransport[idx] != TRANSPORT_NONE &&
+            m_peers[peerId].lastTransport[idx] != type)
+            m_peers[peerId].quality[idx] = ProbeQualitySnapshot();
+        m_peers[peerId].lastTransport[idx] = type;
+    }
     m_peers[peerId].transport[idx] = type;
     refreshPeerRow(peerId);
+    refreshQualityBanner();
 }
 
 void RoomWidget::updatePeerLatency(uint32_t peerId, TrafficClass cls,
@@ -202,6 +229,17 @@ void RoomWidget::updatePeerLatency(uint32_t peerId, TrafficClass cls,
     if (idx < 0 || idx > 2) idx = TRAFFIC_UDP;
     m_peers[peerId].latency[idx] = latencyMs;
     refreshPeerRow(peerId);
+}
+
+void RoomWidget::updatePeerQuality(uint32_t peerId, TrafficClass cls,
+                                  ProbeQualitySnapshot quality) {
+    if (!m_peers.contains(peerId) || peerId == m_myPeerId) return;
+    int idx = static_cast<int>(cls);
+    if (idx < 0 || idx > 2) idx = TRAFFIC_UDP;
+    m_peers[peerId].quality[idx] = quality;
+    m_peers[peerId].latency[idx] = quality.rttMs;
+    refreshPeerRow(peerId);
+    refreshQualityBanner();
 }
 
 void RoomWidget::refreshInfoLabel() {
@@ -221,9 +259,11 @@ void RoomWidget::refreshSummaryLabels() {
             : UiStrings::text("members.roomStatus").arg(m_roomId).arg(m_roomMtu));
     }
     if (m_memberCountLabel) {
-        int totalMembers = m_myPeerId == 0 ? 0 : (m_peers.size() + 1);
+        int totalMembers = m_myPeerId == 0 ? 0 :
+            (m_peers.size() + (m_peers.contains(m_myPeerId) ? 0 : 1));
         m_memberCountLabel->setText(UiStrings::text("members.memberCount").arg(totalMembers));
     }
+    refreshQualityBanner();
 }
 
 void RoomWidget::refreshHeaders() {
@@ -236,6 +276,7 @@ void RoomWidget::refreshHeaders() {
         << UiStrings::text("members.col.tcpRtt")
         << UiStrings::text("members.col.udp")
         << UiStrings::text("members.col.udpRtt"));
+    refreshQualityGeometry();
 }
 
 void RoomWidget::refreshPeerRow(uint32_t peerId) {
@@ -247,11 +288,15 @@ void RoomWidget::refreshPeerRow(uint32_t peerId) {
         QString::number(e.peerId),
         e.virtualIP ? virtualIPToString(e.virtualIP) : QStringLiteral("-"),
         e.name,
-        transportText(TRAFFIC_TCP, e.transport[TRAFFIC_TCP]),
-        latencyText(e.latency[TRAFFIC_TCP]),
-        transportText(TRAFFIC_UDP, e.transport[TRAFFIC_UDP]),
-        latencyText(e.latency[TRAFFIC_UDP])
+        e.peerId == m_myPeerId ? QString::fromUtf8("—") : transportText(TRAFFIC_TCP, e.transport[TRAFFIC_TCP]),
+        qualityText(e, TRAFFIC_TCP),
+        e.peerId == m_myPeerId ? QString::fromUtf8("—") : transportText(TRAFFIC_UDP, e.transport[TRAFFIC_UDP]),
+        qualityText(e, TRAFFIC_UDP)
     };
+
+    const bool abnormal = e.peerId != m_myPeerId &&
+        (e.quality[TRAFFIC_TCP].outage || e.quality[TRAFFIC_TCP].localSendFailure ||
+         e.quality[TRAFFIC_UDP].outage || e.quality[TRAFFIC_UDP].localSendFailure);
 
     for (int col = 0; col < 7; ++col) {
         QTableWidgetItem* item = m_table->item(row, col);
@@ -261,6 +306,10 @@ void RoomWidget::refreshPeerRow(uint32_t peerId) {
             m_table->setItem(row, col, item);
         }
         item->setText(values[col]);
+        item->setBackground(abnormal ? QBrush(QColor("#fff5d9")) : QBrush());
+        item->setToolTip(col == 4 || col == 6
+            ? qualityDetails(e.quality[col == 4 ? TRAFFIC_TCP : TRAFFIC_UDP]) +
+              QLatin1Char('\n') + UiStrings::text("quality.description") : QString());
         if (col == 4 || col == 6)
             item->setForeground(QBrush());
     }
@@ -281,6 +330,106 @@ void RoomWidget::refreshPeerRow(uint32_t peerId) {
         else if (udpLatency < 200) udpItem->setForeground(QColor("#f59e0b"));
         else udpItem->setForeground(QColor("#ef4444"));
     }
+    if (tcpItem && (e.quality[TRAFFIC_TCP].outage || e.quality[TRAFFIC_TCP].localSendFailure))
+        tcpItem->setForeground(QColor("#9a5800"));
+    if (udpItem && (e.quality[TRAFFIC_UDP].outage || e.quality[TRAFFIC_UDP].localSendFailure))
+        udpItem->setForeground(QColor("#9a5800"));
+}
+
+void RoomWidget::refreshQualityGeometry() {
+    if (!m_table) return;
+    const QFontMetrics metrics(m_table->font());
+    int qualityWidth = metrics.width(UiStrings::text("quality.rate").arg("100.0"));
+    const char* qualityKeys[] = {"members.col.tcpRtt", "members.col.udpRtt",
+                                "quality.sendFailure", "quality.noReply", "quality.sampling"};
+    for (const char* key : qualityKeys)
+        qualityWidth = std::max(qualityWidth, metrics.width(UiStrings::text(key)));
+    qualityWidth += 20;
+    m_table->horizontalHeader()->setMinimumSectionSize(
+        std::max(48, metrics.width(UiStrings::text("members.col.name")) + 20));
+    m_table->setColumnWidth(0, std::max(64, metrics.width(UiStrings::text("members.col.peerId")) + 20));
+    m_table->setColumnWidth(1, std::max(110, metrics.width(QStringLiteral("255.255.255.255")) + 20));
+    const int transportWidth = std::max(172,
+        std::max(metrics.width(UiStrings::text("members.kcpRealtime") + QStringLiteral(" +100%")),
+                 std::max(metrics.width(UiStrings::text("members.col.tcp")),
+                          metrics.width(UiStrings::text("members.col.udp")))) + 20);
+    m_table->setColumnWidth(3, transportWidth);
+    m_table->setColumnWidth(5, transportWidth);
+    m_table->setColumnWidth(4, qualityWidth);
+    m_table->setColumnWidth(6, qualityWidth);
+    m_table->verticalHeader()->setDefaultSectionSize(std::max(44, metrics.lineSpacing() * 2 + 14));
+}
+
+void RoomWidget::changeEvent(QEvent* event) {
+    QWidget::changeEvent(event);
+    if (event->type() == QEvent::FontChange || event->type() == QEvent::ApplicationFontChange ||
+        event->type() == QEvent::StyleChange)
+        refreshQualityGeometry();
+}
+
+void RoomWidget::refreshQualityBanner() {
+    if (!m_qualityBanner) return;
+    int remoteCount = 0;
+    int abnormalCount = 0;
+    bool udpProblem = false, tcpProblem = false, localProblem = false;
+    for (auto it = m_peers.constBegin(); it != m_peers.constEnd(); ++it) {
+        const PeerEntry& peer = it.value();
+        if (peer.peerId == m_myPeerId) continue;
+        ++remoteCount;
+        bool abnormal = false;
+        for (int idx = TRAFFIC_TCP; idx <= TRAFFIC_UDP; ++idx) {
+            const ProbeQualitySnapshot& quality = peer.quality[idx];
+            if (quality.localSendFailure) {
+                localProblem = abnormal = true;
+                continue;
+            }
+            if (!quality.outage) continue;
+            abnormal = true;
+            if (peer.lastTransport[idx] == TRANSPORT_RELAY_KCP ||
+                peer.lastTransport[idx] == TRANSPORT_RELAY_RAW_UDP)
+                udpProblem = true;
+            else
+                tcpProblem = true;
+        }
+        if (abnormal) ++abnormalCount;
+    }
+    if (m_myPeerId == 0 || (remoteCount > 0 && abnormalCount == 0)) {
+        m_qualityBanner->hide();
+        return;
+    }
+    if (remoteCount == 0) {
+        m_qualityBanner->setText(UiStrings::text("quality.solo"));
+        m_qualityBanner->setStyleSheet("QLabel#MemberQualityBanner { color: #536274; background: #f4f8ff; border: 1px solid #dce9f6; border-radius: 6px; padding: 8px 10px; }");
+    } else {
+        QStringList lines;
+        lines << UiStrings::text("quality.abnormalMembers").arg(abnormalCount);
+        if (udpProblem) lines << UiStrings::text("quality.banner.udp");
+        if (tcpProblem) lines << UiStrings::text("quality.banner.tcp");
+        if (localProblem) lines << UiStrings::text("quality.banner.local");
+        m_qualityBanner->setText(lines.join(QLatin1Char('\n')));
+        m_qualityBanner->setStyleSheet("QLabel#MemberQualityBanner { color: #8a5100; background: #fff5d9; border: 1px solid #edcd80; border-radius: 6px; padding: 8px 10px; }");
+    }
+    m_qualityBanner->show();
+}
+
+QString RoomWidget::qualityText(const PeerEntry& peer, TrafficClass cls) const {
+    if (peer.peerId == m_myPeerId) return QString::fromUtf8("—");
+    const ProbeQualitySnapshot& quality = peer.quality[static_cast<int>(cls)];
+    QString latency = latencyText(quality.rttMs);
+    if (quality.localSendFailure)
+        latency = UiStrings::text("quality.sendFailure");
+    else if (quality.outage)
+        latency = UiStrings::text("quality.noReply");
+    else if (peer.transport[static_cast<int>(cls)] == TRANSPORT_NONE)
+        return UiStrings::text("quality.connecting");
+    return latency + QLatin1Char('\n') + (quality.sampling
+        ? UiStrings::text("quality.sampling")
+        : UiStrings::text("quality.rate").arg(QString::number(quality.timeoutPercent, 'f', 1)));
+}
+
+QString RoomWidget::qualityDetails(const ProbeQualitySnapshot& quality) const {
+    return UiStrings::text("quality.samples")
+        .arg(quality.replies).arg(quality.timeouts).arg(quality.pending).arg(quality.sendFailures);
 }
 
 QString RoomWidget::transportText(TrafficClass cls, TransportType type) const {
@@ -395,14 +544,14 @@ void RoomWidget::showPeerDetail(uint32_t peerId) {
     contentLayout->setContentsMargins(18, 14, 18, 14);
     contentLayout->setSpacing(0);
 
-    QString copyText;
-    auto addInfoRow = [&](const QString& label, const QString& value, const QColor& color) {
+    QList<QPair<QString, QLabel*> > detailRows;
+    auto addInfoRow = [&](const QString& label, const QString& value, const QColor& color) -> QLabel* {
         QHBoxLayout* row = new QHBoxLayout();
         row->setContentsMargins(0, 8, 0, 8);
         row->setSpacing(14);
         QLabel* key = new QLabel(label);
         key->setObjectName("DetailKey");
-        key->setFixedWidth(112);
+        key->setFixedWidth(std::max(112, key->fontMetrics().width(label) + 4));
         QLabel* val = new QLabel(value);
         val->setObjectName("DetailValue");
         val->setWordWrap(true);
@@ -418,20 +567,24 @@ void RoomWidget::showPeerDetail(uint32_t peerId) {
         line->setObjectName("DetailLine");
         line->setFixedHeight(1);
         contentLayout->addWidget(line);
-        copyText += label + QStringLiteral(": ") + value + QLatin1Char('\n');
+        detailRows.append(qMakePair(label, val));
+        return val;
     };
 
     addInfoRow(UiStrings::text("members.detail.peerId"), QString::number(e.peerId), QColor("#147a72"));
     addInfoRow(UiStrings::text("members.detail.virtualIp"), e.virtualIP ? virtualIPToString(e.virtualIP) : QStringLiteral("-"), QColor());
     addInfoRow(UiStrings::text("members.detail.name"), e.name.isEmpty() ? QStringLiteral("-") : e.name, QColor());
     addInfoRow(UiStrings::text("members.detail.tcp"), transportText(TRAFFIC_TCP, e.transport[TRAFFIC_TCP]), QColor("#2ec4b6"));
-    addInfoRow(UiStrings::text("members.detail.tcpRtt"), latencyText(e.latency[TRAFFIC_TCP]), QColor());
+    QLabel* tcpQuality = addInfoRow(UiStrings::text("members.detail.tcpRtt"), qualityText(e, TRAFFIC_TCP), QColor());
+    QLabel* tcpSamples = addInfoRow(UiStrings::text("quality.detail.tcpSamples"), qualityDetails(e.quality[TRAFFIC_TCP]), QColor());
     addInfoRow(UiStrings::text("members.detail.udp"), transportText(TRAFFIC_UDP, e.transport[TRAFFIC_UDP]), QColor("#3b82f6"));
-    addInfoRow(UiStrings::text("members.detail.udpRtt"), latencyText(e.latency[TRAFFIC_UDP]), QColor());
+    QLabel* udpQuality = addInfoRow(UiStrings::text("members.detail.udpRtt"), qualityText(e, TRAFFIC_UDP), QColor());
+    QLabel* udpSamples = addInfoRow(UiStrings::text("quality.detail.udpSamples"), qualityDetails(e.quality[TRAFFIC_UDP]), QColor());
     addInfoRow(UiStrings::text("members.detail.room"), m_roomId == 0 ? QStringLiteral("-") : QString::number(m_roomId), QColor());
     addInfoRow(UiStrings::text("members.detail.mtu"), QString::number(m_roomMtu), QColor());
     addInfoRow(UiStrings::text("members.detail.tcpPolicy"), policySummary(TRAFFIC_TCP), QColor());
     addInfoRow(UiStrings::text("members.detail.udpPolicy"), policySummary(TRAFFIC_UDP), QColor());
+    addInfoRow(UiStrings::text("quality.detail.metric"), UiStrings::text("quality.description"), QColor());
 
     QScrollArea* scroll = new QScrollArea();
     scroll->setWidgetResizable(true);
@@ -452,7 +605,10 @@ void RoomWidget::showPeerDetail(uint32_t peerId) {
     closeBtn->setObjectName("PrimaryBtn");
     closeBtn->setMinimumSize(76, 34);
     closeBtn->setCursor(Qt::PointingHandCursor);
-    connect(copyBtn, &QPushButton::clicked, [copyText]() {
+    connect(copyBtn, &QPushButton::clicked, [detailRows]() {
+        QString copyText;
+        for (const auto& info : detailRows)
+            copyText += info.first + QStringLiteral(": ") + info.second->text() + QLatin1Char('\n');
         QApplication::clipboard()->setText(copyText.trimmed());
     });
     connect(closeBtn, &QPushButton::clicked, &dialog, &QDialog::accept);
@@ -461,6 +617,19 @@ void RoomWidget::showPeerDetail(uint32_t peerId) {
     footer->addWidget(closeBtn);
     mainLayout->addLayout(footer);
 
+    QTimer qualityTimer;
+    connect(&qualityTimer, &QTimer::timeout, &dialog, [&, peerId]() {
+        if (!m_peers.contains(peerId)) {
+            dialog.reject();
+            return;
+        }
+        const PeerEntry& current = m_peers[peerId];
+        tcpQuality->setText(qualityText(current, TRAFFIC_TCP));
+        udpQuality->setText(qualityText(current, TRAFFIC_UDP));
+        tcpSamples->setText(qualityDetails(current.quality[TRAFFIC_TCP]));
+        udpSamples->setText(qualityDetails(current.quality[TRAFFIC_UDP]));
+    });
+    qualityTimer.start(1000);
     dialog.exec();
 }
 

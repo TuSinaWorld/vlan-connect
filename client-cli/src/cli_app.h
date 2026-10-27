@@ -5,7 +5,7 @@
 #include "cli_net.h"
 #include "cli_tunnel.h"
 #include "cli_tun.h"
-#include "relay_probe_watchdog.h"
+#include "probe_quality.h"
 #include <atomic>
 #include <thread>
 #include <string>
@@ -48,6 +48,7 @@ private:
     void printHelp();
     void printStatus();
     void printPeers();
+    void updatePeerQuality();
 
     void doConnect();
     void doDisconnect();
@@ -224,7 +225,12 @@ private:
 
     std::vector<CliRoomListItem> m_cachedRoomList;
     std::set<uint64_t> m_pendingRebuild;
-    std::map<uint64_t, RelayProbeWatchdog> m_probeWatchdogs;
+    struct QualityLogState {
+        TransportType transport;
+        int anomaly;
+        QualityLogState() : transport(TRANSPORT_NONE), anomaly(0) {}
+    };
+    std::map<uint64_t, QualityLogState> m_qualityLogStates;
 };
 
 } // namespace VLan

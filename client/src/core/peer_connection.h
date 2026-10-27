@@ -5,6 +5,7 @@
 #include <QTimer>
 #include <functional>
 #include "protocol.h"
+#include "probe_quality.h"
 
 namespace VLan {
 
@@ -42,6 +43,7 @@ public:
 
     using TcpSendFunc = std::function<void(uint32_t dstPeerId, TrafficClass cls, const QByteArray& data)>;
     void setTcpRelaySender(TcpSendFunc sender) { m_tcpSender = sender; }
+    void setTcpRelayControlReady(std::function<bool()> ready) { m_tcpControlReady = ready; }
 
     void setTransport(TrafficClass cls, TransportType t);
     void clearTransport(TrafficClass cls);
@@ -59,6 +61,9 @@ public:
     }
 
     int  latencyMs(TrafficClass cls) const;
+    ProbeQualitySnapshot qualitySnapshot(TrafficClass cls);
+    void resetQuality();
+    void reportLocalTransportSend(TrafficClass cls, bool success);
     void sendLatencyPing(TrafficClass cls);
     bool handleLatencyProbe(TrafficClass cls, const QByteArray& data);
 
@@ -79,11 +84,10 @@ private:
     KcpTunnel*    m_kcpTunnel[3];
     RawUdpTunnel* m_rawUdpTunnel[3];
     TcpSendFunc   m_tcpSender;
+    std::function<bool()> m_tcpControlReady;
     uint32_t      m_tcpRelayLastRecv[3];
     uint32_t      m_tcpRelayLastSend[3];
-    int           m_rtt[3];
-    uint32_t      m_latencyPingSentTime[3];
-    uint32_t      m_latencyLastReply[3];
+    ProbeQualityTracker m_quality[3];
 };
 
 } // namespace VLan

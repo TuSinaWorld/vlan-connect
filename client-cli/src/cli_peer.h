@@ -4,6 +4,7 @@
 #include "cli_common.h"
 #include "cli_fec.h"
 #include "ikcp.h"
+#include "probe_quality.h"
 #include <functional>
 #include <map>
 
@@ -166,6 +167,7 @@ public:
     void setTransport(TrafficClass cls, TransportType t);
     void clearTransport(TrafficClass cls);
     void setTcpRelaySender(TcpRelaySendFunc sender) { m_tcpSender = sender; }
+    void setTcpRelayControlReady(std::function<bool()> ready) { m_tcpControlReady = ready; }
 
     int sendData(const Buffer& ipPacket);
 
@@ -174,6 +176,9 @@ public:
     bool isTcpRelayDead(TrafficClass cls) const;
     bool isTcpRelayDead() const;
     int  latencyMs(TrafficClass cls) const;
+    ProbeQualitySnapshot qualitySnapshot(TrafficClass cls);
+    void resetQuality();
+    void reportLocalTransportSend(TrafficClass cls, bool success);
     int  latencyMs() const;
     void sendLatencyPing(TrafficClass cls);
     void sendLatencyPing();
@@ -193,14 +198,13 @@ private:
     CliKcpTunnel*    m_kcpTunnel[3];
     CliRawUdpTunnel* m_rawUdpTunnel[3];
     TcpRelaySendFunc m_tcpSender;
+    std::function<bool()> m_tcpControlReady;
 
     PeerDataCallback    m_onData;
 
     uint32_t m_tcpRelayLastRecv[3];
     uint32_t m_tcpRelayLastSend[3];
-    int      m_rtt[3];
-    uint32_t m_latencyPingSentTime[3];
-    uint32_t m_latencyLastReply[3];
+    ProbeQualityTracker m_quality[3];
 };
 
 } // namespace VLan

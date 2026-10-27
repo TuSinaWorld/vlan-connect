@@ -819,6 +819,14 @@ void RoomManager::onPeerResumed(PeerInfo info) {
         .arg(transportName(peer->transport(TRAFFIC_TCP)))
         .arg(transportName(peer->transport(TRAFFIC_UDP))));
     emit statusMessage(UiStrings::text("status.peerResumedRebuild").arg(peer->name()));
+    peer->resetQuality();
+    for (int cls = TRAFFIC_TCP; cls <= TRAFFIC_UDP; ++cls) {
+        TransportKey key;
+        key.peerId = info.peerId;
+        key.cls = static_cast<TrafficClass>(cls);
+        m_qualityLogStates.remove(key);
+        emit peerQualityUpdated(info.peerId, key.cls, peer->qualitySnapshot(key.cls));
+    }
     rebuildPeerTransports(info.peerId);
 }
 
@@ -832,9 +840,9 @@ void RoomManager::onPeerLeft(uint32_t peerId) {
     PeerConnection* peer = m_tunnel->peerById(peerId);
     QString name = peer ? peer->name() : QString("Peer%1").arg(peerId);
     clearPendingRebuild(peerId);
-    for (auto it = m_probeWatchdogs.begin(); it != m_probeWatchdogs.end(); ) {
+    for (auto it = m_qualityLogStates.begin(); it != m_qualityLogStates.end(); ) {
         if (it.key().peerId == peerId)
-            it = m_probeWatchdogs.erase(it);
+            it = m_qualityLogStates.erase(it);
         else
             ++it;
     }
@@ -935,6 +943,12 @@ void RoomManager::setupTcpRelayTunnel(uint32_t peerId, TrafficClass cls) {
         return;
 
     uint32_t myId = myPeerId();
+    peer->setTcpRelayControlReady([this]() {
+        return m_tunnel->dataPlaneState() == DataPlaneState::Running &&
+               m_tunnel->securityMode() != DataPlaneSecurityMode::Unconfigured &&
+               ((m_dataChannel && m_dataChannel->isConnected()) ||
+                (m_signal && m_signal->isConnected()));
+    });
     peer->setTcpRelaySender([this, myId](uint32_t dstPeerId, TrafficClass trafficClass,
                                          const QByteArray& data) {
         if (m_tunnel->dataPlaneState() == DataPlaneState::Running &&
@@ -1196,7 +1210,7 @@ void RoomManager::completeRoomReadiness() {
     m_pendingTunError.clear();
     m_roomReadinessPending = false;
     m_roomReady = true;
-    m_latencyTimer->start(3000);
+    m_latencyTimer->start(1000);
     setRoomOperationPending(false);
     if (!m_roomReady || generation != m_readinessGeneration) return;
     if (created) emit roomCreated(m_currentRoomId);
@@ -1246,7 +1260,7 @@ void RoomManager::teardownTun() {
     if (m_tunnel)
         m_tunnel->stopDataPlane();
     m_pendingRebuild.clear();
-    m_probeWatchdogs.clear();
+    m_qualityLogStates.clear();
     if (m_latencyTimer)
         m_latencyTimer->stop();
     if (m_trafficTimer)
@@ -1364,43 +1378,47 @@ void RoomManager::onTcpRelayHealthCheck() {
 }
 
 void RoomManager::onLatencyUpdate() {
-    const uint32_t now = currentTimeMs();
+    if (!m_roomReady) return;
     for (PeerConnection* peer : m_tunnel->allPeers()) {
+        if (peer->peerId() == myPeerId()) continue;
         peer->sendLatencyPing(TRAFFIC_TCP);
         peer->sendLatencyPing(TRAFFIC_UDP);
-        emit peerLatencyUpdated(peer->peerId(), TRAFFIC_TCP,
-                                peer->latencyMs(TRAFFIC_TCP));
-        emit peerLatencyUpdated(peer->peerId(), TRAFFIC_UDP,
-                                peer->latencyMs(TRAFFIC_UDP));
         for (int cls = TRAFFIC_TCP; cls <= TRAFFIC_UDP; ++cls) {
             const TrafficClass trafficClass = static_cast<TrafficClass>(cls);
+            const ProbeQualitySnapshot quality = peer->qualitySnapshot(trafficClass);
+            const TransportType transport = peer->transport(trafficClass);
+            emit peerLatencyUpdated(peer->peerId(), trafficClass, quality.rttMs);
+            emit peerQualityUpdated(peer->peerId(), trafficClass, quality);
+            // A temporary rebuild cancels pending probes but keeps outage history.
+            // Do not mistake its inactive interval for a recovery.
+            if (transport == TRANSPORT_NONE) continue;
             TransportKey key;
             key.peerId = peer->peerId();
             key.cls = trafficClass;
-            RelayProbeWatchdog& watchdog = m_probeWatchdogs[key];
-            const bool fresh = peer->latencyMs(trafficClass) >= 0;
-            const bool recovered = watchdog.outageReported() && fresh;
-            const bool timedOut = watchdog.observe(now, fresh);
-            if (recovered) {
-                LogManager::instance().logNormal(
-                    QString("[room] Peer probe recovered: peer=%1 class=%2 transport=%3 rtt=%4ms")
-                    .arg(peer->peerId()).arg(trafficClassName(trafficClass))
-                    .arg(transportName(peer->transport(trafficClass)))
-                    .arg(peer->latencyMs(trafficClass)));
+            QualityLogState& state = m_qualityLogStates[key];
+            if (state.transport != transport) {
+                state.transport = transport;
+                state.anomaly = 0;
             }
-            if (!timedOut)
-                continue;
-            const bool usesUdp = peer->transport(trafficClass) == TRANSPORT_RELAY_KCP ||
-                                 peer->transport(trafficClass) == TRANSPORT_RELAY_RAW_UDP;
-            emit errorOccurred(UiStrings::text(usesUdp ? "status.udpRelayUnreachable"
-                                                      : "status.relayUnreachable")
+            const int anomaly = quality.localSendFailure ? 2 : quality.outage ? 1 : 0;
+            if (anomaly == state.anomaly) continue;
+            if (!quality.active && anomaly == 0) continue;
+            const bool usesUdp = transport == TRANSPORT_RELAY_KCP ||
+                                 transport == TRANSPORT_RELAY_RAW_UDP;
+            const bool localRecovered = anomaly == 0 && state.anomaly == 2;
+            const char* messageKey = anomaly == 2 ? "quality.warning.local" :
+                anomaly == 1 ? (usesUdp ? "quality.warning.udp" : "quality.warning.tcp") :
+                localRecovered ? "quality.localRecovered" : "quality.recovered";
+            state.anomaly = anomaly;
+            emit statusMessage(UiStrings::text(messageKey)
                                .arg(peer->name()).arg(trafficClassName(trafficClass)));
-            LogManager::instance().logError(
-                QString("[room] No peer probe reply: peer=%1 class=%2 transport=%3 server=%4:%5 dataChannel=%6")
-                .arg(peer->peerId()).arg(trafficClassName(trafficClass))
-                .arg(transportName(peer->transport(trafficClass)))
-                .arg(m_resolvedAddr.toString()).arg(m_port)
-                .arg(m_dataChannel && m_dataChannel->isConnected() ? "connected" : "unavailable"));
+            LogManager::instance().logNormal(
+                QString("[quality] event=%1 peer=%2 class=%3 transport=%4 window_s=60 replies=%5 timeouts=%6 pending=%7 send_failures=%8 rtt_ms=%9 timeout_percent=%10")
+                .arg(anomaly == 2 ? "local-send-failure" : anomaly == 1 ? "probe-timeout" :
+                     localRecovered ? "local-send-recovered" : "recovered")
+                .arg(peer->peerId()).arg(trafficClassName(trafficClass)).arg(transportName(transport))
+                .arg(quality.replies).arg(quality.timeouts).arg(quality.pending)
+                .arg(quality.sendFailures).arg(quality.rttMs).arg(quality.timeoutPercent, 0, 'f', 1));
         }
     }
 }

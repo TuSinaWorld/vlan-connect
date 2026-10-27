@@ -180,6 +180,113 @@ class CliRoomReadinessTests {
         assert(app.cancels == 1 && app.starts == 0 && app.polls == 0);
         assert(!app.m_roomReady && !app.m_tunSetupPending);
     }
+    static void qualitySoloMembershipAndResume() {
+        FakeCliApp app;
+        app.state = WindowsReadinessState::Ready;
+        begin(app, true);
+        app.pollTunReadiness();
+        for (int i = 0; i < 20; ++i) app.updatePeerQuality();
+        assert(app.m_qualityLogStates.empty());
+        app.printStatus();
+        app.printPeers();
+        app.onPeerJoined(peer(2, "quality peer"));
+        CliPeerConnection* remote = app.m_tunnel.peerById(2);
+        assert(remote);
+        app.updatePeerQuality();
+        assert(!remote->qualitySnapshot(TRAFFIC_TCP).active);
+        assert(!remote->qualitySnapshot(TRAFFIC_TCP).outage);
+        remote->setTcpRelaySender([remote](uint32_t, TrafficClass cls, const Buffer& ping) {
+            Buffer pong = ping;
+            assert(pong.size() == 6);
+            pong[1] = CLI_LATENCY_PROBE_PONG;
+            assert(remote->handleLatencyProbe(cls, pong));
+        });
+        remote->setTransport(TRAFFIC_TCP, TRANSPORT_RELAY_TCP);
+        remote->setTransport(TRAFFIC_UDP, TRANSPORT_RELAY_TCP);
+        for (int i = 0; i < 6; ++i) app.updatePeerQuality();
+        assert(remote->qualitySnapshot(TRAFFIC_TCP).replies == 6);
+        assert(!remote->qualitySnapshot(TRAFFIC_TCP).sampling);
+        assert(!remote->qualitySnapshot(TRAFFIC_UDP).outage);
+        remote->setTcpRelayControlReady([]() { return false; });
+        app.updatePeerQuality();
+        app.updatePeerQuality();
+        assert(remote->qualitySnapshot(TRAFFIC_TCP).sendFailures == 2);
+        assert(remote->qualitySnapshot(TRAFFIC_TCP).timeouts == 0);
+        assert(!remote->qualitySnapshot(TRAFFIC_TCP).outage);
+        assert(app.m_qualityLogStates[app.transportKey(2, TRAFFIC_TCP)].anomaly == 2);
+        remote->setTcpRelayControlReady([]() { return true; });
+        app.updatePeerQuality();
+        assert(app.m_qualityLogStates[app.transportKey(2, TRAFFIC_TCP)].anomaly == 0);
+        app.printStatus();
+        app.printPeers();
+        app.onPeerResumed(peer(2, "quality peer"));
+        assert(remote->qualitySnapshot(TRAFFIC_TCP).replies == 0);
+        assert(remote->qualitySnapshot(TRAFFIC_UDP).timeouts == 0);
+        assert(app.m_qualityLogStates.empty());
+        app.onPeerLeft(2);
+        for (int i = 0; i < 20; ++i) app.updatePeerQuality();
+        assert(app.m_qualityLogStates.empty());
+        app.onPeerJoined(peer(2, "new session"));
+        assert(app.m_tunnel.peerById(2)->qualitySnapshot(TRAFFIC_TCP).replies == 0);
+        app.doLeaveRoom();
+        assert(app.m_qualityLogStates.empty());
+    }
+    static void udpSocketFailuresAreLocal() {
+        CliTunnelManager manager;
+        manager.setMyPeerId(1);
+        assert(manager.initUdpSocket());
+        const int noBroadcast = 0;
+        assert(setsockopt(manager.udpFd(), SOL_SOCKET, SO_BROADCAST,
+                          reinterpret_cast<const char*>(&noBroadcast), sizeof(noBroadcast)) == 0);
+        assert(manager.installSecureSession(1, Buffer(SECURE_KEY_SIZE, 'q')));
+        manager.m_dataPlaneState = DataPlaneState::Running; // Packet edge only, no TUN.
+        CliPeerConnection* remote = manager.addPeer(2, VNET_SUBNET | 2, "socket errors");
+        CliPeerConnection* other = manager.addPeer(3, VNET_SUBNET | 3, "unaffected");
+        CliRawUdpTunnel* raw = manager.createRawUdpTunnel(remote, 0xffffffffu, 54321,
+            FEC_NONE, ROOM_MTU_DEFAULT, TRAFFIC_TCP);
+        raw->setRelayMode(1, 2);
+        remote->sendLatencyPing(TRAFFIC_TCP); // SO_BROADCAST disabled: local access denied.
+        ProbeQualitySnapshot quality = remote->qualitySnapshot(TRAFFIC_TCP);
+        assert(quality.localSendFailure && quality.sendFailures == 1);
+        assert(!quality.outage && quality.timeouts == 0 && quality.pending == 0);
+        assert(!other->qualitySnapshot(TRAFFIC_TCP).localSendFailure);
+        assert(!remote->qualitySnapshot(TRAFFIC_UDP).localSendFailure);
+
+        CliKcpTunnel* kcp = manager.createKcpTunnel(remote, 0xffffffffu, 54321,
+            TRANSPORT_RELAY_KCP, FEC_NONE, ROOM_MTU_DEFAULT, KCP_PROFILE_REALTIME, TRAFFIC_UDP);
+        kcp->setRelayMode(1, 2);
+        remote->sendLatencyPing(TRAFFIC_UDP);
+        kcp->update();
+        quality = remote->qualitySnapshot(TRAFFIC_UDP);
+        assert(quality.localSendFailure && quality.sendFailures == 1 && quality.timeouts == 0);
+        remote->sendLatencyPing(TRAFFIC_UDP);
+        quality = remote->qualitySnapshot(TRAFFIC_UDP);
+        assert(quality.localSendFailure && quality.sendFailures == 2 && quality.pending == 0);
+
+        socket_t receiver = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+        assert(receiver != SOCK_INVALID);
+        sockaddr_in address = makeAddr(0x7f000001u, 0);
+        assert(bind(receiver, reinterpret_cast<sockaddr*>(&address), sizeof(address)) == 0);
+        socklen_t addressLen = sizeof(address);
+        assert(getsockname(receiver, reinterpret_cast<sockaddr*>(&address), &addressLen) == 0);
+        UdpRelayHeader header = {};
+        header.type = UDP_RELAY_DATA;
+        header.trafficClass = TRAFFIC_UDP;
+        header.srcPeerId = htonl(1);
+        header.dstPeerId = htonl(2);
+        manager.udpSend(reinterpret_cast<const uint8_t*>(&header), sizeof(header),
+                        0x7f000001u, ntohs(address.sin_port));
+        assert(!remote->qualitySnapshot(TRAFFIC_UDP).localSendFailure);
+        assert(remote->qualitySnapshot(TRAFFIC_TCP).localSendFailure); // Other path stays failed.
+        header.type = UDP_RAW_RELAY_DATA;
+        header.trafficClass = TRAFFIC_TCP;
+        manager.udpSend(reinterpret_cast<const uint8_t*>(&header), sizeof(header),
+                        0x7f000001u, ntohs(address.sin_port));
+        assert(!remote->qualitySnapshot(TRAFFIC_TCP).localSendFailure);
+        assert(remote->qualitySnapshot(TRAFFIC_TCP).timeouts == 0);
+        sock_close(receiver);
+        manager.stopDataPlane();
+    }
 public:
     static void run() {
         delayedReadyUsesCurrentMembersAndRelays();
@@ -189,13 +296,22 @@ public:
         oldPollResultCannotFinishNewRoom();
         cancellationDuringPrepareOrStartWins();
         pendingRuntimeFailureIsTerminalOnce();
+        qualitySoloMembershipAndResume();
+        udpSocketFailuresAreLocal();
     }
 };
 
 } // namespace VLan
 
 int main() {
+#ifdef _WIN32
+    WSADATA winsock;
+    assert(WSAStartup(MAKEWORD(2, 2), &winsock) == 0);
+#endif
     VLan::CliRoomReadinessTests::run();
+#ifdef _WIN32
+    WSACleanup();
+#endif
     std::puts("CLI room readiness orchestration: PASS");
     return 0;
 }
