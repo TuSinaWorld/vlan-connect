@@ -87,7 +87,7 @@ bool TunAdapter::configureIP(uint32_t ip, uint32_t mask, int mtu) {
         m_networkState.alias = alias;
         m_adapterName = QString::fromStdWString(m_networkState.alias);
     }
-    SystemWindowsNetworkCommands commands;
+    SystemWindowsNetworkCommands commands(m_setupControl);
     std::string error;
     const bool configured = configureWindowsNetwork(commands, m_networkState, ip, mask, mtu,
         [](const std::string& message) {

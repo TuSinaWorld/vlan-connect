@@ -87,6 +87,12 @@ vlan_test_output(gui_signal_tests)
 
 find_package(Qt5 COMPONENTS Core Network QUIET)
 if(Qt5Core_FOUND AND Qt5Network_FOUND)
+    add_executable(gui_log_thread_tests gui/log_thread_tests.cpp
+        "${VLAN_ROOT}/client/src/ui/log_manager.cpp")
+    target_link_libraries(gui_log_thread_tests PRIVATE Qt5::Core Threads::Threads)
+    set_target_properties(gui_log_thread_tests PROPERTIES AUTOMOC ON)
+    vlan_test_output(gui_log_thread_tests)
+    add_test(NAME gui_log_thread_tests COMMAND gui_log_thread_tests)
     target_sources(gui_signal_tests PRIVATE
         gui/policy_decode_tests.cpp
         "${VLAN_ROOT}/client/src/network/signal_client.cpp"
@@ -321,6 +327,11 @@ target_include_directories(probe_quality_tests PRIVATE ${VLAN_COMMON_INCLUDES})
 vlan_test_output(probe_quality_tests)
 add_test(NAME probe_quality_tests COMMAND probe_quality_tests)
 
+add_executable(room_operation_tests common/room_operation_tests.cpp)
+target_include_directories(room_operation_tests PRIVATE ${VLAN_COMMON_INCLUDES})
+vlan_test_output(room_operation_tests)
+add_test(NAME room_operation_tests COMMAND room_operation_tests)
+
 add_executable(probe_transport_tests
     cli/probe_transport_tests.cpp
     "${VLAN_ROOT}/client-cli/src/cli_peer.cpp"
@@ -362,6 +373,17 @@ if(Qt5Widgets_FOUND)
 endif()
 if(NOT WIN32)
     add_test(NAME linux_tun_netlink_tests COMMAND linux_tun_netlink_tests)
+    add_executable(server_control_response_tests
+        server/server_control_response_tests.cpp
+        "${VLAN_ROOT}/server/src/signal_server.cpp"
+        "${VLAN_ROOT}/server/src/relay_server.cpp"
+        "${VLAN_ROOT}/server/src/server_logger.cpp"
+        ${VLAN_MONOCYPHER})
+    target_include_directories(server_control_response_tests PRIVATE
+        ${VLAN_COMMON_INCLUDES} "${VLAN_ROOT}/server/src")
+    target_link_libraries(server_control_response_tests PRIVATE Threads::Threads)
+    vlan_test_output(server_control_response_tests)
+    add_test(NAME server_control_response_tests COMMAND server_control_response_tests)
     add_test(NAME cli_raw_fec_tests COMMAND cli_raw_fec_tests)
     add_test(NAME server_install_script_tests
         COMMAND "${BASH_EXECUTABLE}"

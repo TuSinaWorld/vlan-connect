@@ -7,6 +7,8 @@
 #include <mutex>
 #include <functional>
 #include "windows_network_readiness.h"
+#include "room_operation.h"
+#include <memory>
 #ifdef _WIN32
 #include "windows_network_config.h"
 #endif
@@ -60,6 +62,7 @@ public:
     std::string configurationError() const { return m_configurationError; }
     bool startSession();
     void shutdown();
+    void setSetupControl(const std::shared_ptr<RoomTaskControl>& control) { m_setupControl = control; }
 
     bool writePacket(const uint8_t* data, size_t len);
     bool writePacket(const Buffer& pkt) { return writePacket(pkt.data(), pkt.size()); }
@@ -86,6 +89,7 @@ private:
     uint32_t m_ip;
     uint32_t m_mask;
     std::string m_configurationError;
+    std::shared_ptr<RoomTaskControl> m_setupControl;
 
 #ifdef _WIN32
     void* m_dll;

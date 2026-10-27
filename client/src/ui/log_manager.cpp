@@ -64,12 +64,19 @@ void LogManager::logDetail(const QString& msg) {
 }
 
 void LogManager::addMaskedKeyword(const QString& keyword) {
+    QMutexLocker lock(&m_mutex);
     if (!keyword.isEmpty() && !m_maskedKeywords.contains(keyword))
         m_maskedKeywords.append(keyword);
 }
 
 void LogManager::clearMaskedKeywords() {
+    QMutexLocker lock(&m_mutex);
     m_maskedKeywords.clear();
+}
+
+QList<LogEntry> LogManager::allEntries() const {
+    QMutexLocker lock(&m_mutex);
+    return m_entries;
 }
 
 QString LogManager::maskSensitive(const QString& msg) const {
@@ -85,12 +92,12 @@ QString LogManager::maskSensitive(const QString& msg) const {
 void LogManager::appendEntry(const QString& msg, LogLevel level, LogColor color) {
     LogEntry e;
     e.timestamp = QDateTime::currentDateTime().toString("HH:mm:ss.zzz");
-    e.message   = maskSensitive(msg);
     e.level     = level;
     e.color     = color;
 
     {
         QMutexLocker lock(&m_mutex);
+        e.message = maskSensitive(msg);
         m_entries.append(e);
         if (m_entries.size() > MAX_ENTRIES)
             m_entries.removeFirst();

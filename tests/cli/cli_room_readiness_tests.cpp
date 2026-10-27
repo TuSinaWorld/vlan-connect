@@ -2,6 +2,8 @@
 #include <cassert>
 #include <cstdio>
 #include <functional>
+#include <chrono>
+#include <thread>
 
 namespace VLan {
 
@@ -18,6 +20,7 @@ public:
     std::function<void()> duringPoll;
     std::function<void()> duringStart;
 protected:
+    bool inlineTunSetupForTesting() const override { return true; }
     TunSetupResult setupTun() override {
         ++prepares;
         if (duringPrepare) duringPrepare();
@@ -41,7 +44,43 @@ protected:
     void cancelTunReadiness() override { ++cancels; }
 };
 
+class ControlledCliLifecycleBackend : public CliTunLifecycleBackend {
+public:
+    std::atomic<bool> entered{false}, release{false}, ready{true};
+    std::atomic<unsigned> cleaned{0}, starts{0};
+    std::thread::id owner;
+    bool initialize() override {
+        owner = std::this_thread::get_id(); entered = true;
+        while (!release) std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        return true;
+    }
+    bool configure(uint32_t, uint32_t, int) override { assert(owner == std::this_thread::get_id()); return true; }
+    bool start() override { ++starts; return true; }
+    void beginReadiness() override {}
+    WindowsReadinessResult pollReadiness() override { return WindowsReadinessResult(ready ? WindowsReadinessState::Ready : WindowsReadinessState::Pending); }
+    CliTunAdapter* adapter() override { return nullptr; }
+    std::string error() const override { return "controlled native call"; }
+    void cleanup() override { assert(owner == std::this_thread::get_id()); ++cleaned; }
+};
+
+class AsyncFakeCliApp : public CliApp {
+public:
+    std::shared_ptr<ControlledCliLifecycleBackend> backend = std::make_shared<ControlledCliLifecycleBackend>();
+    int dataStarts = 0;
+protected:
+    std::shared_ptr<CliTunLifecycleBackend> createTunLifecycleBackend(const std::shared_ptr<RoomTaskControl>&) override { return backend; }
+    TunSetupResult startTunDataPlane() override { ++dataStarts; return TunSetupResult(true); }
+};
+
 class CliRoomReadinessTests {
+    template<typename Predicate> static void until(Predicate condition, const std::function<void()>& pump = std::function<void()>()) {
+        const uint64_t deadline = roomMonotonicMs() + 3000;
+        while (!condition() && roomMonotonicMs() < deadline) {
+            if (pump) pump();
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+        assert(condition());
+    }
     static PeerInfo peer(uint32_t id, const char* name) {
         PeerInfo result;
         result.peerId = id;
@@ -57,6 +96,7 @@ class CliRoomReadinessTests {
     }
     static void begin(FakeCliApp& app, bool created,
                       const std::vector<PeerInfo>& members = std::vector<PeerInfo>()) {
+        assert(app.beginRoomRequest());
         if (created)
             app.onRoomCreated(10, VNET_SUBNET | 1, tcp(), tcp(), ROOM_MTU_DEFAULT, false, Buffer());
         else
@@ -287,6 +327,118 @@ class CliRoomReadinessTests {
         sock_close(receiver);
         manager.stopDataPlane();
     }
+    static void asynchronousOwnerRemainsResponsiveAndCancelsOnce() {
+        AsyncFakeCliApp app;
+        assert(app.beginRoomRequest());
+        app.onRoomCreated(42, VNET_SUBNET | 2, tcp(), tcp(), ROOM_MTU_DEFAULT, false, Buffer());
+        until([&]() { return app.backend->entered.load(); });
+        assert(app.backend->owner != std::this_thread::get_id());
+        const uint64_t before = roomMonotonicMs();
+        for (int i = 0; i < 20; ++i) { app.pollRoomOperation(); app.printStatus(); }
+        assert(roomMonotonicMs() - before < 1000 && !app.m_roomReady);
+        app.doLeaveRoom(); app.doLeaveRoom();
+        assert(app.m_tunJob && app.m_roomOperation.phase() == RoomOperationPhase::CleaningUp);
+        assert(!app.beginRoomRequest());
+        app.backend->release = true;
+        until([&]() { return !app.m_tunJob; }, [&]() { app.pollRoomOperation(); });
+        assert(app.backend->cleaned == 1 && app.backend->starts == 0);
+        assert(!app.m_roomReady && app.dataStarts == 0 && app.m_roomOperation.canStart());
+    }
+    static void asynchronousReadyAndLateResults() {
+        AsyncFakeCliApp app;
+        app.backend->release = true;
+        assert(app.beginRoomRequest());
+        app.onRoomCreated(43, VNET_SUBNET | 2, tcp(), tcp(), ROOM_MTU_DEFAULT, false, Buffer());
+        until([&]() { return app.m_roomReady; }, [&]() { app.pollRoomOperation(); });
+        assert(app.dataStarts == 1 && app.m_roomOperation.phase() == RoomOperationPhase::InRoom);
+        app.onRoomCreated(99, VNET_SUBNET | 3, tcp(), tcp(), ROOM_MTU_DEFAULT, false, Buffer());
+        assert(app.m_currentRoomId == 43 && app.dataStarts == 1);
+        app.doLeaveRoom();
+        until([&]() { return !app.m_tunJob; }, [&]() { app.pollRoomOperation(); });
+        assert(app.backend->cleaned == 1 && app.m_roomOperation.canStart());
+    }
+    static void requestDeadlineAndAmbiguousErrorRejectLateSuccess() {
+        FakeCliApp app;
+        assert(app.m_roomOperation.begin(roomMonotonicMs() - 15001, 1));
+        app.pollRoomOperation();
+        assert(app.m_roomOperation.canStart() && app.m_currentRoomId == 0);
+        app.onRoomCreated(99, VNET_SUBNET | 3, tcp(), tcp(), ROOM_MTU_DEFAULT, false, Buffer());
+        assert(app.prepares == 0 && !app.m_roomReady);
+        assert(app.beginRoomRequest());
+        app.setupCallbacks();
+        app.m_signal.onRoomOperationFailure("unrelated General error before success");
+        app.onRoomCreated(100, VNET_SUBNET | 3, tcp(), tcp(), ROOM_MTU_DEFAULT, false, Buffer());
+        assert(app.prepares == 0 && !app.m_roomReady && app.m_currentRoomId == 0);
+        app.doDisconnect();
+        assert(!app.m_roomRecoveryScheduled && !app.m_roomRecoveryAttempt);
+    }
+    static void heartbeatsCannotExtendRoomRequestDeadline() {
+        CliSignalClient signal;
+        signal.m_conn.connected = true;
+        signal.m_conn.lastRecvTime = currentTimeMs(); // Active heartbeat/list traffic.
+        signal.m_secureReady = true;
+        signal.m_roomOperationPending = true;
+        signal.m_roomRequestStarted = roomMonotonicMs() - 15001;
+        unsigned failures = 0;
+        signal.onRoomOperationFailure = [&](const std::string&) { ++failures; };
+        signal.checkTimeouts(); signal.checkTimeouts();
+        assert(failures == 1 && !signal.roomOperationPending() && signal.m_discardRoomResponses);
+    }
+    static void initializationTimeoutCannotAcceptLateReady() {
+        AsyncFakeCliApp app;
+        assert(app.beginRoomRequest());
+        app.onRoomCreated(44, VNET_SUBNET | 2, tcp(), tcp(), ROOM_MTU_DEFAULT, false, Buffer());
+        until([&]() { return app.backend->entered.load(); });
+        // Exercise a delayed deadline callback without a 30-second test sleep.
+        assert(app.m_roomOperation.beginReadiness(roomMonotonicMs() - 10001));
+        app.pollRoomOperation();
+        assert(!app.m_roomReady && app.m_roomOperation.phase() == RoomOperationPhase::CleaningUp);
+        app.backend->release = true;
+        until([&]() { return !app.m_tunJob; }, [&]() { app.pollRoomOperation(); });
+        assert(app.dataStarts == 0 && app.backend->cleaned == 1);
+    }
+    static void encryptedErrorThenLateSuccessCannotCreateRoom() {
+        CliSignalClient signal;
+        const Buffer key(SECURE_KEY_SIZE, 0x53);
+        signal.m_secureReady = true;
+        signal.m_conn.connected = true;
+        signal.m_secureCipher.init(key.data(), true, "signal");
+        SecureFrameCipher server;
+        server.init(key.data(), false, "signal");
+        signal.m_roomOperationPending = true;
+        signal.m_roomRequestStarted = roomMonotonicMs();
+        unsigned failed = 0, created = 0, fatal = 0;
+        signal.onRoomOperationFailure = [&](const std::string&) { ++failed; };
+        signal.onFatalAuthError = [&](uint16_t, const std::string&) { ++fatal; };
+        signal.onRoomCreated = [&](uint32_t, uint32_t, RoomTrafficPolicy, RoomTrafficPolicy, uint16_t, bool, const Buffer&) { ++created; };
+        auto deliver = [&](uint8_t type, const ByteBuffer& body) {
+            Buffer plain(1, type);
+            plain.insert(plain.end(), body.data(), body.data() + body.size());
+            const Buffer wire = server.encrypt(plain.data(), plain.size());
+            assert(signal.processMessage(MSG_ENCRYPTED, wire.data(), wire.size()));
+        };
+        ByteBuffer error;
+        error.writeU16(static_cast<uint16_t>(AuthErrorCode::General)); error.writeString("earlier unrelated request failed");
+        deliver(MSG_ERROR, error);
+        assert(failed == 1 && signal.m_discardRoomResponses && !signal.roomOperationPending());
+        ByteBuffer positive;
+        positive.writeU32(42); positive.writeU32(VNET_SUBNET | 2);
+        positive.writeU8(MODE_RELAY_RAW_UDP); positive.writeU8(FEC_NONE); positive.writeU8(KCP_PROFILE_REALTIME);
+        positive.writeU8(MODE_RELAY_KCP); positive.writeU8(FEC_NONE); positive.writeU8(KCP_PROFILE_REALTIME);
+        positive.writeU8(0); positive.writeU16(ROOM_MTU_DEFAULT);
+        Buffer lease(RECONNECT_TOKEN_SIZE, 0x74); positive.writeBytes(lease.data(), lease.size());
+        deliver(MSG_ROOM_CREATED, positive);
+        assert(created == 0 && failed == 1);
+        ByteBuffer challenge;
+        challenge.writeU8(AUTH_KDF_PROFILE);
+        Buffer salt(AUTH_SALT_SIZE, 1), nonce(32, 2);
+        challenge.writeBytes(salt.data(), salt.size()); challenge.writeBytes(nonce.data(), nonce.size());
+        deliver(MSG_AUTH_CHALLENGE, challenge);
+        ByteBuffer latePassword;
+        latePassword.writeU16(static_cast<uint16_t>(AuthErrorCode::RoomPassword)); latePassword.writeString("late room password rejection");
+        deliver(MSG_ERROR, latePassword);
+        assert(fatal == 0 && signal.m_authOperation == 0 && created == 0);
+    }
 public:
     static void run() {
         delayedReadyUsesCurrentMembersAndRelays();
@@ -298,6 +450,12 @@ public:
         pendingRuntimeFailureIsTerminalOnce();
         qualitySoloMembershipAndResume();
         udpSocketFailuresAreLocal();
+        asynchronousOwnerRemainsResponsiveAndCancelsOnce();
+        asynchronousReadyAndLateResults();
+        requestDeadlineAndAmbiguousErrorRejectLateSuccess();
+        heartbeatsCannotExtendRoomRequestDeadline();
+        initializationTimeoutCannotAcceptLateReady();
+        encryptedErrorThenLateSuccessCannotCreateRoom();
     }
 };
 

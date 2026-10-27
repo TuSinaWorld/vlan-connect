@@ -7,10 +7,15 @@
 #include "../../client/src/core/tun_adapter.h"
 #include "../../client/src/core/raw_udp_tunnel.h"
 #include "../../client/src/core/kcp_tunnel.h"
+#include "../../client/src/core/tun_lifecycle_task.h"
+#include "../../client/src/network/signal_client.h"
+#include "net_common.h"
+#include <QElapsedTimer>
 #include <cassert>
 #include <cstdio>
 #include <functional>
 #include <thread>
+#include <stdexcept>
 
 namespace VLan {
 
@@ -48,12 +53,52 @@ protected:
         return TunSetupResult(startOk, TunSetupStage::DataPlane,
                               startOk ? QString() : QStringLiteral("fake data-plane failure"));
     }
-    void cancelTunReadiness() override { ++cancels; }
+    void cancelTunReadiness() override {
+        ++cancels;
+        RoomManager::cancelTunReadiness();
+    }
+};
+
+class BlockingLifecycleBackend : public GuiTunLifecycleBackend {
+public:
+    std::atomic<bool> entered, releasePrepare, cleanupEntered, releaseCleanup;
+    std::atomic<int> cleanups;
+    std::atomic<bool> throwRuntime;
+    bool throws;
+    BlockingLifecycleBackend(bool exception = false)
+        : entered(false), releasePrepare(false), cleanupEntered(false), releaseCleanup(false), cleanups(0), throwRuntime(false), throws(exception) {}
+    bool initialize(QString*) override { return true; }
+    bool configure(uint32_t, uint32_t, int, QString*) override {
+        entered = true;
+        if (throws) throw std::runtime_error("injected configure error");
+        while (!releasePrepare) std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        return true;
+    }
+    bool start(QString*) override { return true; }
+    void beginReadiness() override {}
+    WindowsReadinessResult readiness() override { return WindowsReadinessResult(WindowsReadinessState::Ready); }
+    TunAdapter* adapter() const override { return nullptr; }
+    QString runtimeError() const override {
+        if (throwRuntime) throw std::runtime_error("injected runtime failure");
+        return QString();
+    }
+    void cleanup() override {
+        ++cleanups; cleanupEntered = true;
+        while (!releaseCleanup) std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
 };
 
 // Exercise the production orchestration with only adapter lifecycle effects
 // replaced. No server login, Wintun handle or real network configuration occurs.
 class RoomReadinessTests {
+    static bool spinUntil(const std::function<bool()>& done, int timeout = 3000) {
+        QElapsedTimer timer; timer.start();
+        while (!done() && timer.elapsed() < timeout) {
+            QCoreApplication::processEvents();
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+        return done();
+    }
     static PeerInfo peer(uint32_t id, const char* name) {
         PeerInfo result;
         result.peerId = id;
@@ -326,6 +371,133 @@ class RoomReadinessTests {
         manager.leaveRoom();
         assert(manager.m_qualityLogStates.isEmpty());
     }
+    static void operationDeadlineIgnoresUnrelatedTraffic() {
+        FakeRoomManager manager;
+        int errors = 0;
+        QObject::connect(&manager, &RoomManager::errorOccurred, [&]() { ++errors; });
+        manager.setRoomOperationPending(true);
+        manager.m_operation.finishCleanup();
+        assert(manager.m_operation.begin(roomMonotonicMs() - 15001u, manager.m_connectionGeneration));
+        // Signal traffic would refresh connection liveness, never this deadline.
+        manager.m_signal->m_lastRecvTime = currentTimeMs();
+        manager.pollRoomOperation();
+        assert(errors == 1 && !manager.roomOperationBusy() && manager.starts == 0);
+        manager.pollRoomOperation();
+        manager.onRoomCreated(10, VNET_SUBNET | 1, tcp(), tcp(), ROOM_MTU_DEFAULT, false, QByteArray());
+        assert(errors == 1 && manager.prepares == 0 && !manager.inRoom());
+    }
+    static void ambiguousErrorThenLateSuccessCannotStartAdapter() {
+        FakeRoomManager manager;
+        int errors = 0;
+        QObject::connect(&manager, &RoomManager::errorOccurred, [&]() { ++errors; });
+        manager.setRoomOperationPending(true);
+        SignalClient* signal = manager.m_signal;
+        uint8_t master[SECURE_KEY_SIZE] = {7};
+        signal->m_secureReady = true;
+        signal->m_roomOperationPending = true;
+        signal->m_secureCipher.init(master, true, "signal");
+        SecureFrameCipher server;
+        server.init(master, false, "signal");
+        const auto deliver = [&](uint8_t type, const ByteBuffer& body) {
+            std::vector<uint8_t> plain(1, type);
+            plain.insert(plain.end(), body.data(), body.data() + body.size());
+            const std::vector<uint8_t> wire = server.encrypt(plain.data(), plain.size());
+            assert(signal->processMessage(MSG_ENCRYPTED, wire.data(), wire.size()));
+        };
+        ByteBuffer error;
+        error.writeU16(static_cast<uint16_t>(AuthErrorCode::General));
+        error.writeString("injected earlier request error");
+        deliver(MSG_ERROR, error);
+        assert(errors == 1 && signal->m_blockRoomResponses && !manager.roomOperationBusy());
+        ByteBuffer created;
+        created.writeU32(10); created.writeU32(VNET_SUBNET | 1);
+        for (int path = 0; path < 2; ++path) {
+            const RoomTrafficPolicy policy = tcp();
+            created.writeU8(policy.transportMode); created.writeU8(policy.fecMode); created.writeU8(policy.kcpProfile);
+        }
+        created.writeU8(0); created.writeU16(ROOM_MTU_DEFAULT);
+        uint8_t token[RECONNECT_TOKEN_SIZE] = {1}; created.writeBytes(token, sizeof(token));
+        deliver(MSG_ROOM_CREATED, created);
+        assert(errors == 1 && manager.prepares == 0 && manager.starts == 0 && !manager.inRoom());
+    }
+    static void lifecycleBlockingAndCleanupKeepEventLoopResponsive() {
+        FakeRoomManager manager;
+        manager.setRoomOperationPending(true);
+        assert(manager.m_operation.beginPreparation(roomMonotonicMs()));
+        std::shared_ptr<RoomTaskControl> control(new RoomTaskControl(1, 0, roomMonotonicMs() + 30000));
+        std::shared_ptr<BlockingLifecycleBackend> backend(new BlockingLifecycleBackend());
+        manager.m_lifecycleControl = control;
+        manager.m_lifecycleTask.reset(new GuiTunLifecycleTask(control, VNET_SUBNET | 2, VNET_MASK, 1400, backend));
+        assert(spinUntil([&]() { return backend->entered.load(); }));
+        int ticks = 0;
+        QTimer heartbeat;
+        QObject::connect(&heartbeat, &QTimer::timeout, [&]() { ++ticks; });
+        heartbeat.start(5);
+        QElapsedTimer responsiveness; responsiveness.start();
+        manager.teardownTun(); // Must return while native preparation is blocked.
+        assert(responsiveness.elapsed() < 100 && manager.roomCleanupPending() && manager.roomOperationBusy());
+        assert(spinUntil([&]() { return ticks >= 5; }));
+        assert(!manager.m_operation.canStart());
+        backend->releasePrepare = true;
+        assert(spinUntil([&]() { return backend->cleanupEntered.load(); }));
+        assert(manager.roomOperationBusy() && !manager.inRoom());
+        const int before = ticks;
+        assert(spinUntil([&]() { return ticks >= before + 5; }));
+        backend->releaseCleanup = true;
+        assert(spinUntil([&]() { manager.pollRoomOperation(); return !manager.roomOperationBusy(); }));
+        assert(backend->cleanups == 1 && !manager.m_lifecycleTask && manager.starts == 0);
+    }
+    static void passwordRejectionAndRecoveryFailureAreTerminal() {
+        FakeRoomManager manager;
+        manager.setRoomOperationPending(true);
+        manager.m_signal->m_roomOperationPending = false; // Explicit password rejection, not ambiguous.
+        manager.m_signal->fatalAuthError(static_cast<uint16_t>(AuthErrorCode::RoomPassword), "wrong room password");
+        manager.m_signal->serverError("wrong room password");
+        assert(manager.m_authRetryBlocked && !manager.roomOperationBusy() && manager.m_operation.canStart());
+        manager.pollRoomOperation();
+        assert(!manager.m_recoveryActive && !manager.m_recoveryLoginScheduled);
+
+        manager.m_recoveryLoginAttempt = true;
+        manager.m_wantReconnect = true;
+        assert(!manager.roomOperationStatus().isEmpty());
+        manager.handleConnectionAttemptExhausted("injected DNS failure");
+        assert(!manager.m_recoveryLoginAttempt && !manager.m_recoveryLoginScheduled && !manager.m_wantReconnect);
+        assert(manager.roomOperationStatus().isEmpty());
+    }
+    static void manualDisconnectCancelsScheduledLobbyRecovery() {
+        FakeRoomManager manager;
+        manager.m_playerName = "fixture player";
+        manager.m_serverPassword = "fixture password";
+        manager.setRoomOperationPending(true);
+        manager.beginRoomRecovery("injected timeout");
+        assert(manager.m_recoveryLoginScheduled);
+        manager.disconnectFromServer();
+        assert(!manager.m_recoveryLoginScheduled && !manager.m_recoveryLoginAttempt && !manager.m_recoveryActive);
+        assert(manager.m_playerName.isEmpty() && manager.m_serverPassword.isEmpty());
+        assert(!manager.roomOperationBusy());
+    }
+    static void lifecycleExceptionIsReportedAndCleanedOnce() {
+        std::shared_ptr<RoomTaskControl> control(new RoomTaskControl(1, 0, roomMonotonicMs() + 30000));
+        std::shared_ptr<BlockingLifecycleBackend> backend(new BlockingLifecycleBackend(true));
+        backend->releaseCleanup = true;
+        GuiTunLifecycleTask task(control, VNET_SUBNET | 2, VNET_MASK, 1400, backend);
+        assert(spinUntil([&]() { return task.snapshot().done; }));
+        const GuiTunLifecycleTask::Snapshot result = task.snapshot();
+        assert(result.failed && result.error.contains("injected configure error") && backend->cleanups == 1 && !result.ready);
+    }
+    static void postReadyExceptionWaitsForOwnerDetach() {
+        std::shared_ptr<RoomTaskControl> control(new RoomTaskControl(1, 0, roomMonotonicMs() + 30000));
+        std::shared_ptr<BlockingLifecycleBackend> backend(new BlockingLifecycleBackend());
+        backend->releasePrepare = true; backend->releaseCleanup = true;
+        GuiTunLifecycleTask task(control, VNET_SUBNET | 2, VNET_MASK, 1400, backend);
+        assert(spinUntil([&]() { return task.snapshot().ready; }));
+        backend->throwRuntime = true;
+        assert(spinUntil([&]() { return task.snapshot().failed; }));
+        assert(!task.snapshot().done && backend->cleanups == 0);
+        task.requestCancel(); // Main-thread detach handshake, now safe to free.
+        assert(spinUntil([&]() { return task.snapshot().done; }));
+        assert(backend->cleanups == 1);
+    }
     static void udpSocketFailuresAreLocal() {
         TunnelManager manager;
         manager.setMyPeerId(1);
@@ -390,6 +562,13 @@ public:
         cancellationDuringPollWins();
         pendingTimerDoesNotBlockEventLoop();
         qualitySoloMembershipAndResume();
+        operationDeadlineIgnoresUnrelatedTraffic();
+        ambiguousErrorThenLateSuccessCannotStartAdapter();
+        lifecycleBlockingAndCleanupKeepEventLoopResponsive();
+        passwordRejectionAndRecoveryFailureAreTerminal();
+        manualDisconnectCancelsScheduledLobbyRecovery();
+        lifecycleExceptionIsReportedAndCleanedOnce();
+        postReadyExceptionWaitsForOwnerDetach();
         udpSocketFailuresAreLocal();
     }
 };

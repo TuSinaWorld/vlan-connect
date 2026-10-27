@@ -23,6 +23,7 @@ CliTunAdapter::~CliTunAdapter() {
 }
 
 bool CliTunAdapter::initialize(const std::string& adapterName) {
+    if (m_setupControl && !m_setupControl->allowed()) return false;
     if (m_dll || m_adapter || m_session || m_readThread.joinable())
         return false;
     HMODULE dll = LoadLibraryW(L"wintun.dll");
@@ -84,13 +85,13 @@ bool CliTunAdapter::initialize(const std::string& adapterName) {
         return false;
     }
     m_networkState.alias = alias;
-    return true;
+    return !m_setupControl || m_setupControl->allowed();
 }
 
 bool CliTunAdapter::configureIP(uint32_t ip, uint32_t mask, int mtu) {
     m_ip = ip;
     m_mask = mask;
-    SystemWindowsNetworkCommands commands;
+    SystemWindowsNetworkCommands commands(m_setupControl);
     const bool ok = configureWindowsNetwork(commands, m_networkState, ip, mask, mtu,
         [](const std::string& message) { LOG_INFO("%s", message.c_str()); }, &m_configurationError);
     if (!ok) LOG_ERR("Virtual adapter configuration failed: %s", m_configurationError.c_str());
@@ -120,6 +121,7 @@ bool CliTunAdapter::checkRoute(uint32_t destination, std::string* error) const {
 }
 
 bool CliTunAdapter::startSession() {
+    if (m_setupControl && !m_setupControl->allowed()) return false;
     if (!m_adapter || m_session || m_readThread.joinable() ||
         !m_fnStartSession || !m_fnEndSession ||
         !m_fnGetReadWaitEvent) {

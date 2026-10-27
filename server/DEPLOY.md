@@ -2,7 +2,7 @@
 
 本文说明如何把 VLan 服务端安装到 Linux 服务器，并用 systemd 管理服务。
 
-v0.3.1、v0.3.2 和 v0.3.3 均使用 **协议 v9**，彼此兼容；v0.3.3 的客户端探测超时率和链路提示不要求现有 v9 服务端重新安装。v8 与 v9 不兼容，从 v8 升级时必须同步升级服务端、Windows GUI 和所有 CLI。升级前通知房间成员保存当前会话，升级后重新连接；安装器保留密码和端口不会使旧协议恢复兼容。`vlan-server --version` 无需 `--auth-file` 即可打印软件版本、协议版本和构建提交并退出。
+v0.3.1 至 v0.3.4 均使用 **协议 v9**，彼此兼容；v0.3.4 的客户端等待/取消修复不强制要求现有 v9 服务端重新安装。新版服务端修复关键控制响应发送失败后仍继续提交房间状态的问题，建议更新。v8 与 v9 不兼容，从 v8 升级时必须同步升级服务端、Windows GUI 和所有 CLI。升级前通知房间成员保存当前会话，升级后重新连接；安装器保留密码和端口不会使旧协议恢复兼容。`vlan-server --version` 无需 `--auth-file` 即可打印软件版本、协议版本和构建提交并退出。
 
 ## 相关文档
 
@@ -63,7 +63,7 @@ curl -fsSL https://raw.githubusercontent.com/TuSinaWorld/vlan-connect/main/serve
 
 # 安装指定正式 tag；显式指定旧 tag 时允许降级
 curl -fsSL https://raw.githubusercontent.com/TuSinaWorld/vlan-connect/main/server/install.sh \
-  | sudo bash -s -- update --version v0.3.3
+  | sudo bash -s -- update --version v0.3.4
 
 # 更新程序并重新进入配置流程
 curl -fsSL https://raw.githubusercontent.com/TuSinaWorld/vlan-connect/main/server/install.sh \

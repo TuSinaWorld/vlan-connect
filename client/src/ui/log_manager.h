@@ -41,7 +41,7 @@ public:
     void addMaskedKeyword(const QString& keyword);
     void clearMaskedKeywords();
 
-    const QList<LogEntry>& allEntries() const { return m_entries; }
+    QList<LogEntry> allEntries() const;
     static QString formatHtml(const LogEntry& e);
 
 signals:
@@ -58,7 +58,7 @@ private:
 
     QList<LogEntry> m_entries;
     QStringList     m_maskedKeywords;
-    QMutex          m_mutex;
+    mutable QMutex  m_mutex;
     QString         m_logPath;
 
     static const int MAX_ENTRIES = 2000;

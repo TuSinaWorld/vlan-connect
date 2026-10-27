@@ -45,6 +45,9 @@ int main(int argc, char** argv) {
     QLabel* banner = widget.findChild<QLabel*>("MemberQualityBanner");
     QTableWidget* table = widget.findChild<QTableWidget*>("MemberQualityTable");
     assert(banner && table && table->columnCount() == 7);
+    widget.setOperationStatus(QString::fromUtf8("服务端已确认房间，正在准备本机网络（12 秒），可取消。"));
+    assert(!banner->isHidden() && banner->text().contains(QString::fromUtf8("正在准备")));
+    widget.setOperationStatus(QString());
     assert(!banner->isHidden() && banner->text() == UiStrings::text("quality.solo"));
 
     // The production view normally lists remote peers only. Defensively ignore

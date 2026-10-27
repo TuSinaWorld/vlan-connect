@@ -196,6 +196,43 @@ static void testInvalidMaskNoCommandsAndBoundedLog() {
     assert(windowsLogValue("x\n\"y\r") == "x 'y ");
 }
 
+class ControlledCommands : public FakeCommands {
+public:
+    bool cancelled = false;
+    bool cleaning = false;
+    bool cancelAfterFirewall = false;
+    std::vector<unsigned long> timeouts;
+    bool shouldContinue() const override { return cleaning || !cancelled; }
+    unsigned long commandTimeout(unsigned long cap) const override {
+        return (std::min)(cap, cleaning ? 5000ul : 1234ul);
+    }
+    void beginCleanup() override { cleaning = true; }
+    WindowsCommandResult execute(const std::vector<std::wstring>& args, unsigned long timeout) override {
+        timeouts.push_back(timeout);
+        WindowsCommandResult result = FakeCommands::execute(args, 10000);
+        if (cancelAfterFirewall && operation(args) == "firewall-add") cancelled = true;
+        return result;
+    }
+};
+
+static void testCancellationBudgetAndOwnedCleanup() {
+    ControlledCommands before;
+    before.cancelled = true;
+    WindowsNetworkState value = state();
+    std::string error;
+    assert(!configureWindowsNetwork(before, value, 0x0a0a0002, 0xffffff00, 1400,
+                                    WindowsNetworkLogger(), &error));
+    assert(before.calls.empty() && !error.empty());
+    ControlledCommands during;
+    during.cancelAfterFirewall = true;
+    value = state();
+    assert(!configureWindowsNetwork(during, value, 0x0a0a0002, 0xffffff00, 1400,
+                                    WindowsNetworkLogger(), &error));
+    assert(!during.firewall && !value.firewallActive && during.cleaning);
+    assert(during.timeouts.front() == 1234 && during.timeouts.back() == 5000);
+    assert(!value.broadcastActive);
+}
+
 #ifdef _WIN32
 static void testReadOnlySystemRunner() {
     SystemWindowsNetworkCommands commands;
@@ -208,6 +245,15 @@ static void testReadOnlySystemRunner() {
            L"\"name=adapter with \\\"quotes\\\"\\\\\"");
     result = commands.broadcastRouteExists(L"VLan-configuration-test-nonexistent-adapter");
     assert(!result.ok() || result.absent);
+    std::shared_ptr<RoomTaskControl> control(new RoomTaskControl);
+    control->cancelRequested = true;
+    SystemWindowsNetworkCommands stopped(control);
+    result = stopped.execute({L"help"}, 10000);
+    assert(!result.ok() && result.systemError == ERROR_CANCELLED);
+    control->cancelRequested = false;
+    control->deadlineMs = roomMonotonicMs() - 1;
+    result = stopped.execute({L"help"}, 10000);
+    assert(result.timedOut && result.systemError == ERROR_TIMEOUT);
 }
 #endif
 
@@ -217,6 +263,7 @@ int main() {
     testRetryAndTimeoutReconciliation();
     testAbsentVersusFailedCleanup();
     testInvalidMaskNoCommandsAndBoundedLog();
+    testCancellationBudgetAndOwnedCleanup();
 #ifdef _WIN32
     testReadOnlySystemRunner();
 #endif

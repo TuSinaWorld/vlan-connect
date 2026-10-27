@@ -20,8 +20,11 @@ const int CLIENT_HELLO_TIMEOUT_SEC = 10;
 const char* tcpMsgName(uint8_t msgType) {
     switch (msgType) {
     case MSG_LOGIN: return "LOGIN";
+    case MSG_LOGIN_RESP: return "LOGIN_RESP";
     case MSG_CREATE_ROOM: return "CREATE_ROOM";
+    case MSG_ROOM_CREATED: return "ROOM_CREATED";
     case MSG_JOIN_ROOM: return "JOIN_ROOM";
+    case MSG_JOIN_RESP: return "JOIN_RESP";
     case MSG_RESUME_ROOM: return "RESUME_ROOM";
     case MSG_LEAVE_ROOM: return "LEAVE_ROOM";
     case MSG_LOGOUT: return "LOGOUT";
@@ -38,6 +41,7 @@ const char* tcpMsgName(uint8_t msgType) {
     case MSG_SERVER_AUTH_OK: return "SERVER_AUTH_OK";
     case MSG_ENCRYPTED: return "ENCRYPTED";
     case MSG_AUTH_RESPONSE: return "AUTH_RESPONSE";
+    case MSG_AUTH_CHALLENGE: return "AUTH_CHALLENGE";
     case MSG_PING: return "PING";
     case MSG_PONG: return "PONG";
     case MSG_ERROR: return "ERROR";
@@ -50,6 +54,20 @@ bool tokenIsZero(const uint8_t token[RECONNECT_TOKEN_SIZE]) {
     for (int i = 0; i < RECONNECT_TOKEN_SIZE; ++i)
         acc |= token[i];
     return acc == 0;
+}
+
+bool isRequiredControlResponse(uint8_t msgType) {
+    switch (msgType) {
+    case MSG_LOGIN_RESP:
+    case MSG_ROOM_CREATED:
+    case MSG_JOIN_RESP:
+    case MSG_AUTH_CHALLENGE:
+    case MSG_LOGOUT_ACK:
+    case MSG_ERROR:
+        return true;
+    default:
+        return false;
+    }
 }
 
 bool tokenEquals(const uint8_t a[RECONNECT_TOKEN_SIZE],
@@ -332,7 +350,7 @@ bool SignalServer::validateResumeLease(uint32_t roomId, uint32_t peerId,
     return true;
 }
 
-void SignalServer::sendJoinResponse(ClientSession& c, Room* room,
+bool SignalServer::sendJoinResponse(ClientSession& c, Room* room,
                                     const uint8_t token[RECONNECT_TOKEN_SIZE]) {
     ByteBuffer resp;
     resp.writeU32(room->id);
@@ -353,7 +371,27 @@ void SignalServer::sendJoinResponse(ClientSession& c, Room* room,
         resp.writeString(lease.name);
     }
     resp.writeBytes(token, RECONNECT_TOKEN_SIZE);
-    sendClientMsg(c, MSG_JOIN_RESP, resp);
+    return sendClientMsg(c, MSG_JOIN_RESP, resp);
+}
+
+void SignalServer::rollbackNewMembership(ClientSession& c, uint32_t roomId) {
+    // The response has not been accepted by the transport. No member or room
+    // notification has been published yet, so undo only this new membership.
+    Room* room = m_rooms.getRoom(roomId);
+    if (room) {
+        room->removeLease(c.peerId);
+        if (room->leases.empty())
+            m_rooms.eraseRoom(roomId);
+    }
+    c.roomId = 0;
+    c.virtualIP = 0;
+    c.resumeRoomId = 0;
+    c.resumePeerId = 0;
+    crypto_wipe(c.resumeToken, sizeof(c.resumeToken));
+    c.state = SessionState::LoggedIn;
+    c.alive = false;
+    LOG_ERROR("[server] Membership rolled back after required response failure peer=%u room=%u fd=%d",
+              c.peerId, roomId, c.tcpFd);
 }
 
 void SignalServer::markSessionOffline(ClientSession& c) {
@@ -1315,7 +1353,8 @@ void SignalServer::onClientHello(ClientSession& c, const uint8_t* p, size_t len)
     resp.writeBytes(c.serverPubKey, 32);
     c.state = SessionState::AwaitServerAuth;
 
-    sendMsg(c.tcpFd, MSG_SERVER_HELLO, resp);
+    if (!sendMsg(c.tcpFd, MSG_SERVER_HELLO, resp))
+        failRequiredControl(c, MSG_SERVER_HELLO);
 }
 
 void SignalServer::onServerAuth(ClientSession& c, const uint8_t* p, size_t len) {
@@ -1408,9 +1447,12 @@ void SignalServer::onServerAuth(ClientSession& c, const uint8_t* p, size_t len) 
     ByteBuffer ok;
     ok.writeU32(c.secureSessionId);
     ok.writeBytes(serverProof, 32);
-    sendMsg(c.tcpFd, MSG_SERVER_AUTH_OK, ok);
-    LOG_INFO("[server] Server auth OK session=%u fd=%d authPayloadLen=%zu",
-             c.secureSessionId, c.tcpFd, len);
+    const bool responseSent = sendMsg(c.tcpFd, MSG_SERVER_AUTH_OK, ok);
+    if (!responseSent)
+        failRequiredControl(c, MSG_SERVER_AUTH_OK);
+    else
+        LOG_INFO("[server] Server auth OK session=%u fd=%d authPayloadLen=%zu",
+                 c.secureSessionId, c.tcpFd, len);
 
     crypto_wipe(shared, sizeof(shared));
     crypto_wipe(master, sizeof(master));
@@ -1498,7 +1540,7 @@ void SignalServer::onLogin(ClientSession& c, const uint8_t* p, size_t len) {
         resp.writeU32(c.peerId);
         resp.writeU16(PROTOCOL_VERSION);
         resp.writeU8(1);
-        sendClientMsg(c, MSG_LOGIN_RESP, resp);
+        if (!sendClientMsg(c, MSG_LOGIN_RESP, resp)) return;
         LOG_INFO("[server] Resume login accepted: peer=%u room=%u name='%s' fd=%d",
                  c.peerId, resumeRoomId, c.name.c_str(), c.tcpFd);
         return;
@@ -1533,7 +1575,7 @@ void SignalServer::onLogin(ClientSession& c, const uint8_t* p, size_t len) {
     resp.writeU32(c.peerId);
     resp.writeU16(PROTOCOL_VERSION);
     resp.writeU8(0);
-    sendClientMsg(c, MSG_LOGIN_RESP, resp);
+    if (!sendClientMsg(c, MSG_LOGIN_RESP, resp)) return;
     LOG_INFO("[server] Login: peer=%u name='%s' fd=%d version=%u",
              c.peerId, c.name.c_str(), c.tcpFd, clientVersion);
 }
@@ -1612,6 +1654,7 @@ void SignalServer::onCreateRoom(ClientSession& c, const uint8_t* p, size_t len) 
     RoomLease* lease = room->addLease(c.peerId, c.name, leaseToken);
     if (!lease) {
         m_rooms.eraseRoom(room->id);
+        crypto_wipe(leaseToken, sizeof(leaseToken));
         sendError(c.tcpFd, "Cannot allocate virtual IP");
         return;
     }
@@ -1634,7 +1677,13 @@ void SignalServer::onCreateRoom(ClientSession& c, const uint8_t* p, size_t len) 
     resp.writeU8(room->passwordProtected);
     resp.writeU16(room->mtu);
     resp.writeBytes(leaseToken, RECONNECT_TOKEN_SIZE);
-    sendClientMsg(c, MSG_ROOM_CREATED, resp);
+    if (!sendClientMsg(c, MSG_ROOM_CREATED, resp)) {
+        const uint32_t failedRoomId = room->id;
+        rollbackNewMembership(c, failedRoomId);
+        crypto_wipe(leaseToken, sizeof(leaseToken));
+        return;
+    }
+    crypto_wipe(leaseToken, sizeof(leaseToken));
     LOG_INFO("[server] Room created: id=%u name='%s' tcp=(%u,%u,%u) udp=(%u,%u,%u) mtu=%u password=%u maxPlayers=%u by peer=%u vip=%s",
              room->id, roomName.c_str(),
              room->tcpPolicy.transportMode, room->tcpPolicy.fecMode, room->tcpPolicy.kcpProfile,
@@ -1736,6 +1785,7 @@ void SignalServer::completeJoin(ClientSession& c, Room* room) {
     }
     RoomLease* lease = room->addLease(c.peerId, c.name, leaseToken);
     if (!lease) {
+        crypto_wipe(leaseToken, sizeof(leaseToken));
         sendError(c.tcpFd, "Cannot join room");
         return;
     }
@@ -1747,7 +1797,12 @@ void SignalServer::completeJoin(ClientSession& c, Room* room) {
     memcpy(c.resumeToken, leaseToken, RECONNECT_TOKEN_SIZE);
     c.state = SessionState::InRoom;
 
-    sendJoinResponse(c, room, leaseToken);
+    if (!sendJoinResponse(c, room, leaseToken)) {
+        rollbackNewMembership(c, roomId);
+        crypto_wipe(leaseToken, sizeof(leaseToken));
+        return;
+    }
+    crypto_wipe(leaseToken, sizeof(leaseToken));
 
     ByteBuffer notify;
     notify.writeU32(c.peerId);
@@ -1782,7 +1837,13 @@ void SignalServer::completeResume(ClientSession& c, Room* room, RoomLease* lease
         return;
     }
 
-    sendJoinResponse(c, room, lease->token);
+    if (!sendJoinResponse(c, room, lease->token)) {
+        // This lease existed before the request. A failed resume response is
+        // an offline connection, not a new lease that may be rolled back.
+        room->markLeaseOffline(c.peerId, time(nullptr));
+        c.alive = false;
+        return;
+    }
     LOG_INFO("[server] Peer %u resumed room %u, vip=%s members=%u/%u",
              c.peerId, room->id, ipToString(c.virtualIP).c_str(),
              (unsigned)room->leases.size(), room->maxPlayers);
@@ -2407,26 +2468,39 @@ void SignalServer::sendMsg(int fd, uint8_t msgType) {
     sendMsg(fd, msgType, empty);
 }
 
-void SignalServer::sendClientMsg(ClientSession& c, uint8_t msgType, const ByteBuffer& body) {
-    if (c.secureEnabled && c.serverAuthOk) {
-        ByteBuffer wrapped = encryptForClient(c, msgType, body);
-        if (!c.alive || wrapped.size() == 0) return;
-        sendMsg(c.tcpFd, MSG_ENCRYPTED, wrapped);
-        return;
-    }
-    if (msgType == MSG_SERVER_HELLO || msgType == MSG_SERVER_AUTH_OK ||
-        msgType == MSG_ERROR) {
-        sendMsg(c.tcpFd, msgType, body);
-        return;
-    }
-    LOG_ERROR("[server] Refusing plaintext business response type=0x%02X fd=%d",
-              msgType, c.tcpFd);
+void SignalServer::failRequiredControl(ClientSession& c, uint8_t msgType) {
+    // Do not destroy the session from inside message dispatch: callers still
+    // hold references into m_clients and may need to undo new membership.
+    // Preserve its state so network teardown retains an existing resume lease.
+    LOG_ERROR("[server] Required control response failed type=%s(0x%02X) peer=%u room=%u fd=%d queued=%zu global=%zu; closing session",
+              tcpMsgName(msgType), msgType, c.peerId, c.roomId, c.tcpFd,
+              c.sendBuf.size(), m_globalSendBytes);
     c.alive = false;
 }
 
-void SignalServer::sendClientMsg(ClientSession& c, uint8_t msgType) {
+bool SignalServer::sendClientMsg(ClientSession& c, uint8_t msgType, const ByteBuffer& body) {
+    if (!c.alive) return false;
+    bool sent = false;
+    if (c.secureEnabled && c.serverAuthOk) {
+        ByteBuffer wrapped = encryptForClient(c, msgType, body);
+        if (c.alive && wrapped.size() != 0)
+            sent = sendMsg(c.tcpFd, MSG_ENCRYPTED, wrapped);
+    } else if (msgType == MSG_SERVER_HELLO || msgType == MSG_SERVER_AUTH_OK ||
+        msgType == MSG_ERROR) {
+        sent = sendMsg(c.tcpFd, msgType, body);
+    } else {
+        LOG_ERROR("[server] Refusing plaintext business response type=0x%02X fd=%d",
+                  msgType, c.tcpFd);
+        c.alive = false;
+    }
+    if (!sent && isRequiredControlResponse(msgType))
+        failRequiredControl(c, msgType);
+    return sent;
+}
+
+bool SignalServer::sendClientMsg(ClientSession& c, uint8_t msgType) {
     ByteBuffer empty;
-    sendClientMsg(c, msgType, empty);
+    return sendClientMsg(c, msgType, empty);
 }
 
 void SignalServer::sendError(int fd, const std::string& text, AuthErrorCode code) {

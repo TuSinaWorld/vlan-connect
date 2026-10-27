@@ -6,6 +6,8 @@
 #include <QString>
 #include <QMutex>
 #include <atomic>
+#include <memory>
+#include "room_operation.h"
 #include "wintun_api.h"
 #include "windows_network_config.h"
 #include "windows_network_readiness.h"
@@ -37,6 +39,7 @@ public:
     QString configurationError() const { return m_configurationError; }
     bool startSession();
     void shutdown();
+    void setSetupControl(const std::shared_ptr<RoomTaskControl>& control) { m_setupControl = control; }
 
     bool writePacket(const QByteArray& packet);
 
@@ -70,6 +73,7 @@ private:
     uint32_t m_mask;
     QString m_adapterName;
     QString m_configurationError;
+    std::shared_ptr<RoomTaskControl> m_setupControl;
 
 };
 

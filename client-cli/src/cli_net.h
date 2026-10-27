@@ -55,6 +55,7 @@ public:
     void resumeRoom(uint32_t roomId, uint32_t peerId, const uint8_t* resumeToken);
     void leaveRoom();
     void logout();
+    void abandonRoomOperation();
     void listRooms();
     void requestRelay(uint32_t targetPeerId);
     void sendRelayData(uint32_t srcPeerId, uint32_t dstPeerId,
@@ -92,6 +93,7 @@ public:
     std::function<void()> onServerPasswordRequired;
     std::function<void(uint32_t sessionId, const Buffer& master)> onSecureSessionEstablished;
     std::function<void(const std::string&)> onServerError;
+    std::function<void(const std::string&)> onRoomOperationFailure;
     std::function<void(uint16_t, const std::string&)> onFatalAuthError;
     std::function<void(int rttMs)> onServerRtt;
     std::function<void(const uint8_t* challenge)> onAuthChallenge;
@@ -99,6 +101,7 @@ public:
     void sendAuthResponse(const uint8_t* response);
 
 private:
+    friend class CliRoomReadinessTests;
     void sendMsg(uint8_t msgType, const ByteBuffer& body);
     void sendMsg(uint8_t msgType);
     bool processMessage(uint8_t msgType, const uint8_t* payload, size_t len);
@@ -130,6 +133,8 @@ private:
     uint8_t       m_roomChallenge[32];
     bool          m_hasPendingAuth;
     bool          m_roomOperationPending;
+    bool          m_discardRoomResponses;
+    uint64_t      m_roomRequestStarted;
     bool          m_sendFailurePending;
     std::string   m_serverPassword;
     bool          m_serverAuthRequired;
