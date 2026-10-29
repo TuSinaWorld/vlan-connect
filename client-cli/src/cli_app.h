@@ -8,6 +8,7 @@
 #include "probe_quality.h"
 #include "room_operation.h"
 #include "cli_tun_lifecycle.h"
+#include "cli_machine.h"
 #include <atomic>
 #include <thread>
 #include <string>
@@ -41,10 +42,19 @@ public:
 
     int run(const volatile sig_atomic_t* stopRequested = nullptr);
     void requestStop();
+    void setMachine(CliMachine* machine) { m_machine = machine; }
 
 private:
     friend class CliRoomReadinessTests;
     void setupCallbacks();
+    void pollMachine();
+    void machineCommand(const std::string& line);
+    void machineStatus(const std::string& requestId = "");
+    void machineError(const std::string& code);
+    CliMachine* m_machine = nullptr;
+    uint64_t m_machineLastStatus = 0;
+    bool m_machineStopping = false;
+    std::string m_machineRequest;
     void eventLoop();
     void processCommand(const std::string& line);
     void printHelp();

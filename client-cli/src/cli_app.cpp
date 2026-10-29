@@ -357,6 +357,7 @@ void CliApp::setupCallbacks() {
     m_signal.onConnected     = [this]() { onSignalConnected(); };
     m_signal.onDisconnected  = [this]() { onSignalDisconnected(); };
     m_signal.onConnectFailed = [this](const std::string& reason) {
+        machineError("SERVER_UNREACHABLE");
         fprintf(stdout, "* Connection failed: %s\n", reason.c_str());
         fflush(stdout);
         if (m_roomRecoveryAttempt) { m_roomRecoveryAttempt = false; m_wantReconnect = false; return; }
@@ -427,6 +428,7 @@ void CliApp::setupCallbacks() {
             LOG_ERR("Failed to install secure data-plane session");
     };
     m_signal.onFatalAuthError = [this](uint16_t code, const std::string& msg) {
+        machineError(code == static_cast<uint16_t>(AuthErrorCode::RoomPassword) ? "ROOM_PASSWORD_INVALID" : "AUTHENTICATION_FAILED");
         m_authRetryBlocked = true;
         m_wantReconnect = false;
         m_pendingResumeRoom = false;
@@ -438,6 +440,7 @@ void CliApp::setupCallbacks() {
         LOG_ERR("Automatic reconnect stopped: code=%u reason=%s", code, msg.c_str());
     };
     m_signal.onServerError   = [this](const std::string& msg) {
+        machineError(msg == "Room not found" ? "ROOM_NOT_FOUND" : msg == "Room is full" ? "ROOM_FULL" : msg == "Invalid room password" ? "ROOM_PASSWORD_INVALID" : "SERVER_ERROR");
         fprintf(stdout, "* Server error: %s\n> ", msg.c_str());
         fflush(stdout);
         if (m_signal.myPeerId() == 0) {
@@ -448,6 +451,7 @@ void CliApp::setupCallbacks() {
         }
     };
     m_signal.onRoomOperationFailure = [this](const std::string& reason) {
+        machineError(reason == "Room not found" ? "ROOM_NOT_FOUND" : reason == "Room is full" ? "ROOM_FULL" : "ROOM_OPERATION_FAILED");
         recoverRoomOperation(reason);
     };
     m_signal.onServerRtt     = [this](int rtt) {
@@ -474,7 +478,7 @@ int CliApp::run(const volatile sig_atomic_t* stopRequested) {
     m_stopRequested = stopRequested;
     sock_init();
 
-    if (!startStdinReader()) {
+    if (!m_machine && !startStdinReader()) {
         fprintf(stderr, "Failed to start stdin reader\n");
         stopStdinReader();
         sock_cleanup();
@@ -515,7 +519,7 @@ int CliApp::run(const volatile sig_atomic_t* stopRequested) {
     setupCallbacks();
     m_running = true;
 
-    doConnect();
+    if (!m_machine) doConnect();
 
     fprintf(stdout, "VLan CLI Client - Type 'help' for commands.\n> ");
     fflush(stdout);
@@ -668,6 +672,7 @@ void CliApp::stdinReadLoop(
 void CliApp::eventLoop() {
     bool stopHandled = false;
     while (m_running) {
+        pollMachine();
         if (!stopHandled && m_stopRequested && *m_stopRequested) {
             stopHandled = true;
             requestStop();
@@ -827,6 +832,7 @@ void CliApp::eventLoop() {
         if (!m_authRetryBlocked && m_wantReconnect && !m_tunJob && m_signal.fd() == SOCK_INVALID
             && now >= m_nextReconnectTime) {
             if (m_reconnectAttempts >= MAX_RECONNECT_ATTEMPTS) {
+                machineError("RECONNECT_EXHAUSTED");
                 m_wantReconnect = false;
                 m_pendingResumeRoom = false;
                 expireResumeLeaseIfNeeded();
@@ -1638,6 +1644,7 @@ void CliApp::onJoinResponse(uint32_t roomId, uint32_t virtualIP,
 }
 
 void CliApp::onPeerJoined(PeerInfo info) {
+    if(m_machine)m_machine->send("{\"v\":1,\"event\":\"peer_joined\",\"peerId\":"+std::to_string(info.peerId)+"}");
     if (m_tunSetupPending) {
         if (info.peerId != m_signal.myPeerId()) m_pendingRoomMembers[info.peerId] = info;
         return;
@@ -1669,6 +1676,7 @@ void CliApp::rebuildPeerTransports(uint32_t peerId) {
 }
 
 void CliApp::onPeerResumed(PeerInfo info) {
+    if(m_machine)m_machine->send("{\"v\":1,\"event\":\"peer_joined\",\"peerId\":"+std::to_string(info.peerId)+"}");
     if (m_tunSetupPending) {
         if (info.peerId != m_signal.myPeerId()) m_pendingRoomMembers[info.peerId] = info;
         m_pendingRoomRelays.erase(info.peerId);
@@ -1731,6 +1739,7 @@ void CliApp::onLogoutAck() {
 }
 
 void CliApp::onPeerLeft(uint32_t peerId) {
+    if(m_machine)m_machine->send("{\"v\":1,\"event\":\"peer_left\",\"peerId\":"+std::to_string(peerId)+"}");
     if (m_tunSetupPending) {
         m_pendingRoomMembers.erase(peerId);
         m_pendingRoomRelays.erase(peerId);
@@ -2043,6 +2052,7 @@ void CliApp::resetRoomRuntimeState(bool clearSavedRoom) {
 }
 
 void CliApp::rollbackRoomAfterTunFailure(const TunSetupResult& result) {
+    machineError("ADAPTER_FAILED");
     if (m_signal.isConnected() && m_currentRoomId != 0)
         m_signal.leaveRoom();
     teardownTun();
@@ -2145,6 +2155,7 @@ void CliApp::setupTcpRelayTunnel(uint32_t peerId, TrafficClass cls) {
 }
 
 void CliApp::handleReconnectRoomList(const std::vector<CliRoomListItem>& rooms) {
+    if (m_machine) { m_wantReconnect=false; m_wasInRoom=false; machineError("ROOM_EXPIRED"); return; }
     m_wantReconnect = false;
 
     std::vector<uint32_t> matches;

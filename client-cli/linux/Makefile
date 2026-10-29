@@ -31,6 +31,7 @@ CM256_DIR  = ../../3rdparty/cm256cc
 
 SOURCES = $(SHARED_SRC)/main.cpp          \
           $(SHARED_SRC)/cli_app.cpp        \
+          $(SHARED_SRC)/cli_machine_app.cpp \
           $(SHARED_SRC)/cli_net.cpp        \
           $(SHARED_SRC)/cli_tunnel.cpp     \
           $(SHARED_SRC)/cli_peer.cpp       \

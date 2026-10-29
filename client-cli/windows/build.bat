@@ -33,14 +33,14 @@ for %%f in (cm256 gf256) do (
     cl %CFLAGS% /c "%CM256%\%%f.cpp" /Fo:%%f.obj
     if errorlevel 1 goto failed
 )
-for %%f in (cli_fec cli_peer cli_net cli_tunnel cli_tun_win cli_app main) do (
+for %%f in (cli_fec cli_peer cli_net cli_tunnel cli_tun_win cli_app cli_machine_app main) do (
     cl %CFLAGS% /c "%SRC%\%%f.cpp" /Fo:%%f.obj
     if errorlevel 1 goto failed
 )
 
 echo Linking...
 link /nologo /OUT:vlan-cli.exe ^
-    main.obj cli_app.obj cli_net.obj cli_tunnel.obj cli_peer.obj ^
+    main.obj cli_app.obj cli_machine_app.obj cli_net.obj cli_tunnel.obj cli_peer.obj ^
     cli_fec.obj cli_tun_win.obj ^
     ikcp.obj monocypher.obj cm256.obj gf256.obj ^
     ws2_32.lib iphlpapi.lib bcrypt.lib ole32.lib oleaut32.lib

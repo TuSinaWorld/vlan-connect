@@ -135,6 +135,7 @@ vlan_test_output(auth_v9_integration_tests)
 add_executable(cli_room_readiness_tests
     cli/cli_room_readiness_tests.cpp
     "${VLAN_ROOT}/client-cli/src/cli_app.cpp"
+    "${VLAN_ROOT}/client-cli/src/cli_machine_app.cpp"
     "${VLAN_ROOT}/client-cli/src/cli_net.cpp"
     "${VLAN_ROOT}/client-cli/src/cli_peer.cpp"
     "${VLAN_ROOT}/client-cli/src/cli_tunnel.cpp"
@@ -395,3 +396,7 @@ if(NOT WIN32)
         COMMAND "${BASH_EXECUTABLE}"
             "${VLAN_ROOT}/tests/server/service_state_tests.sh")
 endif()
+
+add_executable(machine_codec_tests cli/machine_codec_tests.cpp)
+vlan_test_output(machine_codec_tests)
+add_test(NAME machine_codec_tests COMMAND machine_codec_tests)

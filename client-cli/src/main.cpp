@@ -62,7 +62,7 @@ int main(int argc, char* argv[]) {
     // Version checks must work without credentials, elevation or network side effects.
     for (int i = 1; i < argc; ++i) {
         if (strcmp(argv[i], "--version") == 0) {
-            printf("%s\n", VLan::releaseBuildDescription("VLan CLI").c_str());
+            printf("%s machine=1\n", VLan::releaseBuildDescription("VLan CLI").c_str());
             return 0;
         }
     }
@@ -72,6 +72,8 @@ int main(int argc, char* argv[]) {
     std::string serverPassword;
     bool        verbose = false;
     std::string logFile;
+    std::string machinePipe;
+    uint32_t parentId = 0;
 
     for (int i = 1; i < argc; ++i) {
         if (strcmp(argv[i], "-s") == 0 && i + 1 < argc) {
@@ -99,6 +101,11 @@ int main(int argc, char* argv[]) {
                 fprintf(stderr, "Error: --log-file requires a nonempty path\n");
                 return 1;
             }
+        } else if (strcmp(argv[i], "--machine-pipe") == 0 && i + 1 < argc) {
+            machinePipe = argv[++i];
+        } else if (strcmp(argv[i], "--parent-pid") == 0 && i + 1 < argc) {
+            try { parentId = VLan::machineNumber(argv[++i], 0xffffffffu); }
+            catch (...) { return 2; }
         } else if (strcmp(argv[i], "-v") == 0) {
             verbose = true;
         } else if (strcmp(argv[i], "-h") == 0 || strcmp(argv[i], "--help") == 0) {
@@ -117,6 +124,14 @@ int main(int argc, char* argv[]) {
     }
     LOG_INFO("%s", VLan::releaseBuildDescription("VLan CLI").c_str());
     VLan::CliApp app;
+    VLan::CliMachine machine;
+    if (!machinePipe.empty() || parentId) {
+        if (!parentId || !machine.open(machinePipe,parentId)) return 3;
+        app.setMachine(&machine);
+        playerName="PCLMachine"+std::to_string(parentId);
+        // Human-oriented output remains separate from the bounded machine pipe.
+        FILE* ignored = freopen("NUL", "w", stdout); (void)ignored;
+    }
 #ifdef _WIN32
     signal(SIGINT, signalHandler);
     signal(SIGTERM, signalHandler);
