@@ -31,6 +31,8 @@ Important errors: `ROOM_NOT_FOUND`, `ROOM_FULL`, `ROOM_PASSWORD_REQUIRED`, `ROOM
 
 No-password rooms still require server authentication. Machine mode never silently creates a substitute room after resume failure. The launcher must verify its game-host session separately because room IDs can be reused and v9 does not carry application metadata.
 
+`reconnecting` is emitted immediately on signal disconnection, before any resume. PCL stops the game bridge on this event and revalidates the original room/host session before restoring it, including for unprotected rooms.
+
 Pipe closure, parent exit and shutdown trigger graceful cleanup using the existing lifecycle worker. Writes have a 3 s deadline. The helper does not kill an outstanding driver thread; PCL prevents starting a second instance until the previous one exits. Human stdout is suppressed in Windows machine mode; normal diagnostic logs remain separate and contain no credentials.
 
 ## Validation

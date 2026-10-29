@@ -1459,6 +1459,7 @@ void CliApp::onSignalConnected() {
 }
 
 void CliApp::onSignalDisconnected() {
+    if(m_machine)m_machine->send("{\"v\":1,\"event\":\"reconnecting\"}");
     if (m_roomRecovery) { completeRoomRecovery(); return; }
     if (m_roomRecoveryAttempt) {
         m_roomRecoveryAttempt = false; m_wantReconnect = false;
